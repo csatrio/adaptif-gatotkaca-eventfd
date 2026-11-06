@@ -6,7 +6,8 @@
 //! the sender) and a head line (written by the receiver), each on its own
 //! cache line with the side's "I am waiting" flag.
 //!
-//! A record is `[len: u32][flags: u32][payload][padding to 8 bytes]` and is
+//! A record is `[len: u32][flags: u16][kind: u16][payload][padding to 8
+//! bytes]` (`kind`: the application's payload type, 0 = unspecified) and is
 //! always contiguous: if it doesn't fit before the end of the ring, a PAD
 //! record fills the rest and the record starts at index 0. Bulk records
 //! begin their payload with `[transfer id: u64][chunk seq: u64][total: u64]`.
@@ -15,9 +16,9 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// "GKC" + layout version 2 (two lanes).
-pub(super) const MAGIC: u32 = 0x474B_4302;
-/// Record header: `len: u32`, `flags: u32`.
+/// "GKC" + layout version 3 (two lanes, 16-bit kinds).
+pub(super) const MAGIC: u32 = 0x474B_4303;
+/// Record header: `len: u32`, `flags: u16`, `kind: u16`.
 pub(super) const REC_HDR: u64 = 8;
 /// Bulk record sub-header: transfer id, chunk sequence, total length.
 pub(super) const BULK_HDR: u64 = 24;
@@ -92,6 +93,8 @@ pub(super) struct Rec {
     pub(super) ptr: *const u8,
     pub(super) len: usize,
     pub(super) flags: u32,
+    /// The application's payload type (0: unspecified).
+    pub(super) kind: u16,
     /// The head after this record.
     pub(super) next: u64,
 }
@@ -152,12 +155,14 @@ impl Lane {
 
     /// # Safety
     /// `idx` must be 8-aligned and leave room for a record header.
-    unsafe fn write_header(&self, idx: u64, len: u32, flags: u32) {
+    unsafe fn write_header(&self, idx: u64, len: u32, flags: u32, kind: u16) {
+        debug_assert!(flags <= u32::from(u16::MAX));
         // SAFETY: forwarded; the area is the sender's until published.
         unsafe {
-            let p = self.data.as_ptr().add(idx as usize).cast::<u32>();
-            p.write(len);
-            p.add(1).write(flags);
+            let p = self.data.as_ptr().add(idx as usize);
+            p.cast::<u32>().write(len);
+            p.add(4).cast::<u16>().write(flags as u16);
+            p.add(6).cast::<u16>().write(kind);
         }
     }
 
@@ -174,13 +179,14 @@ impl Lane {
         idx: u64,
         len: u64,
         flags: u32,
+        kind: u16,
     ) -> u64 {
         // SAFETY: forwarded; headers lie inside the reserved space.
         unsafe {
             if pad > 0 {
-                self.write_header(tail & (self.cap - 1), 0, flag::PAD);
+                self.write_header(tail & (self.cap - 1), 0, flag::PAD, 0);
             }
-            self.write_header(idx, len as u32, flags);
+            self.write_header(idx, len as u32, flags, kind);
         }
         let new_tail = tail + pad + record_len(len);
         self.tail_line().pos.store(new_tail, Ordering::Release);
@@ -202,9 +208,13 @@ impl Lane {
             let idx = head & (self.cap - 1);
             // SAFETY: `idx` is 8-aligned and inside the ring; the record was
             // published (Acquire above) and is not reused until released.
-            let (len, flags) = unsafe {
-                let p = self.data.as_ptr().add(idx as usize).cast::<u32>();
-                (u64::from(p.read()), p.add(1).read())
+            let (len, flags, kind) = unsafe {
+                let p = self.data.as_ptr().add(idx as usize);
+                (
+                    u64::from(p.cast::<u32>().read()),
+                    u32::from(p.add(4).cast::<u16>().read()),
+                    p.add(6).cast::<u16>().read(),
+                )
             };
             if flags & flag::PAD != 0 {
                 head += self.cap - idx;
@@ -218,6 +228,7 @@ impl Lane {
                 ptr: self.payload(idx),
                 len: len as usize,
                 flags,
+                kind,
                 next: head + rec,
             }));
         }
@@ -400,7 +411,7 @@ pub(super) mod tests {
                 // SAFETY: reserved space of at least msg.len() bytes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(msg.as_ptr(), l.payload(idx), msg.len());
-                    *tail = l.publish(*tail, pad, idx, msg.len() as u64, 0);
+                    *tail = l.publish(*tail, pad, idx, msg.len() as u64, 0, 0);
                 }
                 true
             }
@@ -485,6 +496,26 @@ pub(super) mod tests {
         assert_eq!(take(l, &mut head).unwrap(), vec![2; 24]);
         assert_eq!(take(l, &mut head).unwrap(), vec![3; 8]);
         assert!(take(l, &mut head).is_none());
+    }
+
+    #[test]
+    fn kinds_and_flags_round_trip_across_the_wrap() {
+        let h = heap_layout(sizes(256, 64));
+        let l = &h.layout.msg;
+        let (mut tail, mut head) = (0u64, 0u64);
+        for i in 0..500u32 {
+            let len = u64::from(i * 13 % 57);
+            let kind = (i.wrapping_mul(40503) & 0xffff) as u16;
+            let flags = i & 0xfff0; // high bits; PAD (1) stays reserved
+            let (pad, idx) = l.reserve(tail, len).expect("ring drained each round");
+            // SAFETY: `len` bytes reserved at `idx`.
+            tail = unsafe { l.publish(tail, pad, idx, len, flags, kind) };
+            let r = l.peek(head).unwrap().expect("published");
+            assert_eq!((r.len as u64, r.flags, r.kind), (len, flags, kind));
+            head = r.next;
+            l.release(head);
+        }
+        assert_eq!(head, tail);
     }
 
     #[test]

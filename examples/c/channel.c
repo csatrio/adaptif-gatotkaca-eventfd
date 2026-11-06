@@ -4,10 +4,10 @@
  * Linux, macOS and Windows; only the spawning differs.
  *
  *   parent: gk_channel_new -> gk_process_for_child -> spawn ->
- *           gk_process_send_receiver -> gk_sender_send x N ->
- *           gk_sender_send_bulk (BULK bytes) -> gk_sender_free
+ *           gk_process_send_receiver -> gk_sender_send(_kind) x N ->
+ *           gk_sender_send_bulk_kind (BULK bytes) -> gk_sender_free
  *   child:  gk_process_from_parent -> gk_process_recv_receiver ->
- *           gk_receiver_recv x N -> gk_receiver_bulk_begin/read ->
+ *           gk_receiver_recv(_kind) x N -> gk_receiver_bulk_begin_kind/read ->
  *           gk_receiver_recv fails with EPIPE
  *
  * Run it without arguments; it re-runs itself with "child".
@@ -36,6 +36,7 @@
 #define MESSAGES 1000
 #define MAX_MESSAGE 2048
 #define BULK (24u << 20) /* 24 MiB through a 1 MiB bulk ring */
+#define BULK_KIND 0x1234 /* the application's tag for the transfer */
 
 static unsigned char bulk_byte(size_t i) {
     return (unsigned char)((i * 2654435761u) >> 7);
@@ -69,9 +70,12 @@ static int child(void) {
     CHECK(rx != NULL);
     if (rx == NULL) return 1;
     for (i = 0; i < MESSAGES; i++) {
-        intptr_t n = gk_receiver_recv(rx, got, sizeof got);
+        uint16_t kind = 0xffff;
+        intptr_t n = i % 2 ? gk_receiver_recv_kind(rx, &kind, got, sizeof got)
+                           : gk_receiver_recv(rx, got, sizeof got);
         size_t len = fill(want, i);
         CHECK(n == (intptr_t)len);
+        if (i % 2) CHECK(kind == (uint16_t)(i & 0xffff));
         if (n != (intptr_t)len || memcmp(got, want, len) != 0) {
             fprintf(stderr, "message %u differs\n", i);
             failures++;
@@ -82,10 +86,12 @@ static int child(void) {
         /* The bulk transfer, read in pieces. */
         int64_t len = 0;
         uint64_t id = 0;
+        uint16_t kind = 0;
         size_t total = 0, k;
         intptr_t n;
-        CHECK(gk_receiver_bulk_begin(rx, &len, &id) == 0);
+        CHECK(gk_receiver_bulk_begin_kind(rx, &kind, &len, &id) == 0);
         CHECK(len == (int64_t)BULK);
+        CHECK(kind == BULK_KIND);
         while ((n = gk_receiver_bulk_read(rx, got, sizeof got)) > 0) {
             for (k = 0; k < (size_t)n; k++) {
                 if (got[k] != bulk_byte(total + k)) {
@@ -151,7 +157,9 @@ int main(int argc, char **argv) {
     CHECK(errno == EMSGSIZE);
     for (i = 0; i < MESSAGES; i++) {
         size_t len = fill(msg, i);
-        CHECK(gk_sender_send(tx, msg, len) == 0);
+        /* Odd messages carry their number as the kind; even ones none. */
+        CHECK((i % 2 ? gk_sender_send_kind(tx, (uint16_t)i, msg, len)
+                     : gk_sender_send(tx, msg, len)) == 0);
     }
     {
         unsigned char *big = malloc(BULK);
@@ -160,7 +168,7 @@ int main(int argc, char **argv) {
         CHECK(big != NULL);
         if (big != NULL) {
             for (k = 0; k < BULK; k++) big[k] = bulk_byte(k);
-            CHECK(gk_sender_send_bulk(tx, big, BULK, &id) == 0);
+            CHECK(gk_sender_send_bulk_kind(tx, BULK_KIND, big, BULK, &id) == 0);
             CHECK(id != 0);
             free(big);
         }

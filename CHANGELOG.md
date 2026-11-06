@@ -22,6 +22,11 @@ Planned as 0.2.0.
     `resume_bulk`) and `BulkReader` (`io::Read`, `for_each_chunk`,
     `pause`). Each transfer has an id; lost/out-of-order chunks, length
     mismatches and abandoned transfers (`ConnectionAborted`) are detected.
+  - a 16-bit kind on every message and transfer, chosen by the application
+    to say what the payload is: `send_kind`, `reserve_kind`, `recv_kind`,
+    `recv_vec_kind`, `recv_with_kind`, `next_kind`, `send_bulk_kind`,
+    `bulk_writer_kind`, `recv_bulk_vec_kind`, `BulkReader::kind`. The plain
+    calls send `KIND_UNSPECIFIED` (0).
   `ChannelOptions` defaults: message ring 1 MiB, bulk ring 4 MiB, 64 KiB
   messages and chunks (Windows: 256 KiB and 1 MiB rings). Blocking and
   non-blocking modes, polling (`AsFd`/`AsSocket`, mio) with one doorbell
@@ -37,7 +42,10 @@ Planned as 0.2.0.
   `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
   `gk_receiver_next_len`, bulk `gk_sender_send_bulk`,
   `gk_sender_bulk_begin`/`_write`/`_finish`/`_abort`,
-  `gk_receiver_bulk_begin`/`_read`/`_end`,
+  `gk_receiver_bulk_begin`/`_read`/`_end`, kind variants
+  `gk_sender_send_kind`, `gk_receiver_recv_kind`, `gk_receiver_next_kind`,
+  `gk_sender_send_bulk_kind`, `gk_sender_bulk_begin_kind`,
+  `gk_receiver_bulk_begin_kind` (`GK_KIND_UNSPECIFIED`),
   `gk_sender_/gk_receiver_set_nonblocking`,
   `_claim`, `_detach`, `_free`, `gk_sender_fd`/`gk_receiver_fd` (unix),
   `gk_sender_socket`/`gk_receiver_socket` (Windows),

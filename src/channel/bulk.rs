@@ -13,7 +13,7 @@
 use std::io;
 
 use super::lane::{BULK_HDR, Rec, flag};
-use super::{BULK, GkReceiver, GkSender, broken};
+use super::{BULK, GkReceiver, GkSender, KIND_UNSPECIFIED, broken};
 use crate::error;
 
 /// Sender side state of the bulk lane.
@@ -26,6 +26,7 @@ pub(super) struct TxState {
 #[derive(Debug)]
 struct Tx {
     id: u64,
+    kind: u16,
     seq: u64,
     written: u64,
     total: Option<u64>,
@@ -44,6 +45,7 @@ pub(super) struct RxState {
 #[derive(Debug)]
 struct Rx {
     id: u64,
+    kind: u16,
     next_seq: u64,
     received: u64,
     total: Option<u64>,
@@ -96,7 +98,14 @@ impl GkSender {
     /// ended by [`BulkWriter::finish`]. Fails with
     /// [`io::ErrorKind::InvalidInput`] if a transfer is already in progress.
     pub fn bulk_writer(&mut self, len: Option<u64>) -> io::Result<BulkWriter<'_>> {
-        let id = self.bulk_begin(len)?;
+        self.bulk_writer_kind(KIND_UNSPECIFIED, len)
+    }
+
+    /// Like [`bulk_writer`](Self::bulk_writer), for a transfer of the given
+    /// `kind` (the receiver gets it from [`BulkReader::kind`] before
+    /// reading any data).
+    pub fn bulk_writer_kind(&mut self, kind: u16, len: Option<u64>) -> io::Result<BulkWriter<'_>> {
+        let id = self.bulk_begin(kind, len)?;
         Ok(BulkWriter {
             sender: self,
             id,
@@ -126,15 +135,23 @@ impl GkSender {
     /// not until it is received. Fails with [`io::ErrorKind::BrokenPipe`]
     /// once the receiver is gone.
     pub fn send_bulk(&mut self, data: &[u8]) -> io::Result<u64> {
+        self.send_bulk_kind(KIND_UNSPECIFIED, data)
+    }
+
+    /// Like [`send_bulk`](Self::send_bulk), for a transfer of the given
+    /// `kind`.
+    pub fn send_bulk_kind(&mut self, kind: u16, data: &[u8]) -> io::Result<u64> {
         let nonblocking = std::mem::replace(&mut self.end.nonblocking, false);
-        let r = self.bulk_begin(Some(data.len() as u64)).and_then(|id| {
-            let mut off = 0;
-            while off < data.len() {
-                off += self.bulk_write(&data[off..])?;
-            }
-            self.bulk_finish()?;
-            Ok(id)
-        });
+        let r = self
+            .bulk_begin(kind, Some(data.len() as u64))
+            .and_then(|id| {
+                let mut off = 0;
+                while off < data.len() {
+                    off += self.bulk_write(&data[off..])?;
+                }
+                self.bulk_finish()?;
+                Ok(id)
+            });
         if r.is_err() {
             let _ = self.bulk_abort();
         }
@@ -143,7 +160,7 @@ impl GkSender {
     }
 
     /// Starts a transfer (see [`bulk_writer`](Self::bulk_writer)).
-    pub(crate) fn bulk_begin(&mut self, len: Option<u64>) -> io::Result<u64> {
+    pub(crate) fn bulk_begin(&mut self, kind: u16, len: Option<u64>) -> io::Result<u64> {
         self.end.check_owner()?;
         if self.bulk.cur.is_some() {
             return Err(invalid("a bulk transfer is already in progress"));
@@ -152,6 +169,7 @@ impl GkSender {
         let id = self.bulk.next_id;
         self.bulk.cur = Some(Tx {
             id,
+            kind,
             seq: 0,
             written: 0,
             total: len,
@@ -165,7 +183,7 @@ impl GkSender {
     /// and the ring is full.
     fn bulk_record(&mut self, data: &[u8], flags: u32, nonblocking: bool) -> io::Result<bool> {
         let tx = self.bulk.cur.as_ref().expect("transfer in progress");
-        let (id, seq, total) = (tx.id, tx.seq, tx.total);
+        let (id, kind, seq, total) = (tx.id, tx.kind, tx.seq, tx.total);
         let len = BULK_HDR + data.len() as u64;
         loop {
             if self.end.peer_closed() {
@@ -186,7 +204,7 @@ impl GkSender {
                         p.add(BULK_HDR as usize),
                         data.len(),
                     );
-                    self.bulk_tail = lane.publish(self.bulk_tail, pad, idx, len, flags);
+                    self.bulk_tail = lane.publish(self.bulk_tail, pad, idx, len, flags, kind);
                 }
                 if let Some(tx) = self.bulk.cur.as_mut() {
                     tx.seq += 1;
@@ -374,7 +392,18 @@ impl GkReceiver {
     /// returns its id. Fails with [`io::ErrorKind::InvalidInput`] if it is
     /// longer than `limit` bytes (the transfer is then discarded).
     pub fn recv_bulk_vec(&mut self, out: &mut Vec<u8>, limit: usize) -> io::Result<u64> {
+        self.recv_bulk_vec_kind(out, limit).map(|(_, id)| id)
+    }
+
+    /// Like [`recv_bulk_vec`](Self::recv_bulk_vec), also returning the
+    /// transfer's kind: `(kind, id)`.
+    pub fn recv_bulk_vec_kind(
+        &mut self,
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> io::Result<(u16, u64)> {
         let (id, total) = self.bulk_begin()?;
+        let kind = self.bulk_info().map_or(KIND_UNSPECIFIED, |i| i.3);
         out.clear();
         if let Some(total) = total {
             if total > limit as u64 {
@@ -393,7 +422,7 @@ impl GkReceiver {
                     return Err(invalid("bulk transfer larger than the limit"));
                 }
             }
-            Ok(id)
+            Ok((kind, id))
         })();
         self.bulk_end();
         r
@@ -441,6 +470,7 @@ impl GkReceiver {
         let total = (rec.flags & flag::LEN_KNOWN != 0).then_some(c.total);
         self.bulk.cur = Some(Rx {
             id: c.id,
+            kind: rec.kind,
             next_seq: 0,
             received: 0,
             total,
@@ -459,7 +489,7 @@ impl GkReceiver {
         if rx.done {
             return Ok(None);
         }
-        let (id, seq) = (rx.id, rx.next_seq);
+        let (id, kind, seq) = (rx.id, rx.kind, rx.next_seq);
         let rec = match self.bulk_rec() {
             Ok(rec) => rec,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
@@ -469,7 +499,7 @@ impl GkReceiver {
             }
         };
         let c = parse(&rec)?;
-        if c.id != id || c.seq != seq {
+        if c.id != id || c.seq != seq || rec.kind != kind {
             self.bulk.cur = None;
             return Err(corrupt("bulk chunk out of sequence"));
         }
@@ -563,12 +593,12 @@ impl GkReceiver {
         }
     }
 
-    /// The current transfer: `(id, declared length, bytes read so far)`.
-    pub(crate) fn bulk_info(&self) -> Option<(u64, Option<u64>, u64)> {
+    /// The current transfer: `(id, declared length, bytes read, kind)`.
+    pub(crate) fn bulk_info(&self) -> Option<(u64, Option<u64>, u64, u16)> {
         self.bulk
             .cur
             .as_ref()
-            .map(|rx| (rx.id, rx.total, rx.received))
+            .map(|rx| (rx.id, rx.total, rx.received, rx.kind))
     }
 }
 
@@ -594,6 +624,12 @@ impl BulkReader<'_> {
     /// The transfer's id (as returned to the sender).
     pub fn id(&self) -> u64 {
         self.rx.bulk_info().map_or(0, |i| i.0)
+    }
+
+    /// The transfer's kind (`0` = unspecified), known before any data is
+    /// read, e.g. to pick a handler.
+    pub fn kind(&self) -> u16 {
+        self.rx.bulk_info().map_or(KIND_UNSPECIFIED, |i| i.3)
     }
 
     /// The declared total length, if the sender declared one.

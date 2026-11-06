@@ -432,11 +432,12 @@ fn channel_child(role: &str) {
         "channel_bulk" => {
             let mut rx: GkReceiver = parent.recv_as().expect("recv_as::<GkReceiver>");
             let mut data = Vec::new();
-            let id = rx.recv_bulk_vec(&mut data, 64 << 20).unwrap();
+            let (kind, id) = rx.recv_bulk_vec_kind(&mut data, 64 << 20).unwrap();
+            assert_eq!(kind, 0xb01c);
             assert_eq!(data.len(), BULK_LEN);
             assert!(data == bulk_data(), "bulk data differs");
             let mut buf = [0u8; 8];
-            assert_eq!(rx.recv(&mut buf).unwrap(), 8);
+            assert_eq!(rx.recv_kind(&mut buf).unwrap(), (0xfffe, 8));
             assert_eq!(u64::from_le_bytes(buf), id);
         }
         other => panic!("unknown role {other}"),
@@ -503,7 +504,8 @@ fn channel_bulk_to_child() {
     let (child, mut peer) = spawn_channel_child("channel_bulk");
     peer.send(&rx).unwrap();
     drop(rx);
-    let id = tx.send_bulk(&bulk_data()).unwrap(); // 12 MiB through the default ring
-    tx.send(&id.to_le_bytes()).unwrap();
+    // 12 MiB through the default ring, then its id as a message.
+    let id = tx.send_bulk_kind(0xb01c, &bulk_data()).unwrap();
+    tx.send_kind(0xfffe, &id.to_le_bytes()).unwrap();
     join(Spawned(child, Some(peer)));
 }

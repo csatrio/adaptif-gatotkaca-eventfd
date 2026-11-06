@@ -299,6 +299,13 @@ The lanes are not ordered relative to each other: a message sent during a
 1 GB transfer arrives at once instead of waiting behind it. Mention a
 transfer's id in a message to link the two.
 
+Every message and transfer carries a 16-bit **kind** that you choose, to
+say what the payload is: `send_kind(kind, msg)` / `recv_kind(&mut buf)`
+(`next_kind()` peeks it, to pick a handler first), `send_bulk_kind`,
+`bulk_writer_kind`, and `BulkReader::kind()` before any data is read. The
+plain calls send `KIND_UNSPECIFIED` (0). How you use the 16 bits is up to
+you, e.g. a type in the high bits and a sequence number in the low ones.
+
 While both sides are busy, a message or chunk costs a few atomic operations
 and one copy, with no system call; blocking calls spin for a few
 microseconds before sleeping, so quick replies cost none either.
@@ -317,8 +324,10 @@ fn main() -> std::io::Result<()> {
     drop(rx); // our copy now belongs to the child: dropping it doesn't close
 
     // ...then send messages and bulk data.
-    tx.send(b"job 1")?;
-    let id = tx.send_bulk(&vec![0u8; 200 << 20])?; // 200 MiB, any size
+    const JOB: u16 = 1;
+    const IMAGE: u16 = 2;
+    tx.send_kind(JOB, b"job 1")?;
+    let id = tx.send_bulk_kind(IMAGE, &vec![0u8; 200 << 20])?; // 200 MiB, any size
     tx.send(&id.to_le_bytes())?;
 
     // Or stream (length known or not), e.g. a file:
@@ -336,9 +345,12 @@ fn main() -> std::io::Result<()> {
 fn worker() -> std::io::Result<()> {
     let mut rx: GkReceiver = GkProcess::from_parent()?.recv_as()?;
     let mut msg = Vec::new();
-    rx.recv_vec(&mut msg)?;                         // "job 1"
+    match rx.recv_vec_kind(&mut msg)? {
+        (1, _) => { /* a job: "job 1" */ }
+        (kind, _) => eprintln!("unexpected kind {kind}"),
+    }
     let mut data = Vec::new();
-    rx.recv_bulk_vec(&mut data, 1 << 30)?;          // reassembled, limit 1 GiB
+    rx.recv_bulk_vec_kind(&mut data, 1 << 30)?;     // (2, id), limit 1 GiB
     let mut file = Vec::new();
     rx.bulk_reader()?.read_to_end(&mut file)?;      // or stream it
     Ok(())
@@ -371,7 +383,8 @@ fn worker() -> std::io::Result<()> {
   `claim()`, the other `detach()`es its copy).
 - **C:** `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
   `gk_sender_send_bulk`, `gk_sender_bulk_begin`/`_write`/`_finish`,
-  `gk_receiver_bulk_begin`/`_read`/`_end`, ... (see the header and
+  `gk_receiver_bulk_begin`/`_read`/`_end`, and `_kind` variants of the
+  send, receive and begin calls, ... (see the header and
   [`examples/c/channel.c`](examples/c/channel.c)).
 
 Rough numbers between two threads (`cargo run --release --example

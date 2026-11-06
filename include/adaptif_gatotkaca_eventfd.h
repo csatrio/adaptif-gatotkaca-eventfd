@@ -404,6 +404,10 @@ void gk_process_free(gk_process *process);
  * sender's when space may have been freed (read/write until EAGAIN, then
  * poll).
  *
+ * Every message and transfer carries a 16-bit kind chosen by the
+ * application to say what the payload is (the *_kind functions); the plain
+ * functions send GK_KIND_UNSPECIFIED (0) and ignore it on receipt.
+ *
  * Errors: -1 (or NULL) with errno EAGAIN (non-blocking and empty/full),
  * EPIPE (the other end is gone; the receiver gets it after draining),
  * EMSGSIZE (message larger than max_message, or a receive buffer too small:
@@ -413,6 +417,9 @@ void gk_process_free(gk_process *process);
  */
 typedef struct gk_sender gk_sender;
 typedef struct gk_receiver gk_receiver;
+
+/* The kind of messages and transfers sent without one. */
+#define GK_KIND_UNSPECIFIED 0
 
 /*
  * Channel sizes. Defaults (gk_channel_options_default): message ring 1 MiB,
@@ -440,14 +447,27 @@ int gk_channel_new(const gk_channel_options *opts, gk_sender **tx,
 /* Sends one message of len bytes (blocks while full unless non-blocking). */
 int gk_sender_send(gk_sender *tx, const void *buf, size_t len);
 
+/* gk_sender_send with a kind. */
+int gk_sender_send_kind(gk_sender *tx, uint16_t kind, const void *buf,
+                        size_t len);
+
 /*
  * Receives one message into buf (cap bytes) and returns its length, which
  * may be 0. Blocks while empty unless non-blocking.
  */
 intptr_t gk_receiver_recv(gk_receiver *rx, void *buf, size_t cap);
 
+/* gk_receiver_recv that also stores the message's kind in *kind (if not
+ * NULL). */
+intptr_t gk_receiver_recv_kind(gk_receiver *rx, uint16_t *kind, void *buf,
+                               size_t cap);
+
 /* Length of the next message without waiting; -1 + EAGAIN if empty. */
 intptr_t gk_receiver_next_len(gk_receiver *rx);
+
+/* gk_receiver_next_len that also stores the next message's kind in *kind
+ * (if not NULL), e.g. to pick a handler before receiving. */
+intptr_t gk_receiver_next_kind(gk_receiver *rx, uint16_t *kind);
 
 /*
  * Bulk transfers. Errors as above, plus ECONNABORTED (the sender abandoned
@@ -459,9 +479,13 @@ intptr_t gk_receiver_next_len(gk_receiver *rx);
  * the ring (even in non-blocking mode). *id (if not NULL) gets its id. */
 int gk_sender_send_bulk(gk_sender *tx, const void *buf, size_t len,
                         uint64_t *id);
+int gk_sender_send_bulk_kind(gk_sender *tx, uint16_t kind, const void *buf,
+                             size_t len, uint64_t *id);
 
 /* Starts a streamed transfer; len < 0 means unknown (ended by finish). */
 int gk_sender_bulk_begin(gk_sender *tx, int64_t len, uint64_t *id);
+int gk_sender_bulk_begin_kind(gk_sender *tx, uint16_t kind, int64_t len,
+                              uint64_t *id);
 
 /* Writes data of the transfer; returns the bytes taken (may be fewer than
  * len in non-blocking mode), or -1 with errno (EAGAIN when full). */
@@ -476,6 +500,9 @@ int gk_sender_bulk_abort(gk_sender *tx);
 /* Waits for the next transfer (or continues an unfinished one): *len gets
  * its declared length or -1, *id its id (either pointer may be NULL). */
 int gk_receiver_bulk_begin(gk_receiver *rx, int64_t *len, uint64_t *id);
+/* gk_receiver_bulk_begin that also stores the transfer's kind in *kind. */
+int gk_receiver_bulk_begin_kind(gk_receiver *rx, uint16_t *kind,
+                                int64_t *len, uint64_t *id);
 
 /* Reads data of the transfer into buf; returns the bytes read, 0 at its
  * end, or -1 with errno (EAGAIN, ECONNABORTED, EPIPE, ...). */

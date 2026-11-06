@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
 
-use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel, GkReceiver, GkSender};
+use adaptif_gatotkaca_eventfd::{
+    ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED,
+};
 
 fn small() -> (GkSender, GkReceiver) {
     GkChannel::with_options(ChannelOptions {
@@ -297,6 +299,77 @@ fn mio_receiver_events() {
 // ---------------------------------------------------------------------------
 // Bulk lane
 // ---------------------------------------------------------------------------
+
+#[test]
+fn message_kinds() {
+    let (mut tx, mut rx) = small();
+    let mut buf = [0u8; 1000];
+    // Plain sends are kind 0; plain receives ignore the kind.
+    tx.send(b"plain").unwrap();
+    assert_eq!(rx.next_kind().unwrap(), Some((KIND_UNSPECIFIED, 5)));
+    assert_eq!(rx.recv_kind(&mut buf).unwrap(), (0, 5));
+    tx.send_kind(7, b"seven").unwrap();
+    assert_eq!(rx.recv(&mut buf).unwrap(), 5);
+    // The full 16-bit range, every receive form, zero-length messages.
+    for kind in [1, 0x00ff, 0x8000, 0xabcd, u16::MAX] {
+        tx.send_kind(kind, b"").unwrap();
+        assert_eq!(rx.next_kind().unwrap(), Some((kind, 0)));
+        assert_eq!(rx.recv_kind(&mut buf).unwrap(), (kind, 0));
+    }
+    tx.send_kind(0x1234, b"vec").unwrap();
+    let mut v = Vec::new();
+    assert_eq!(rx.recv_vec_kind(&mut v).unwrap(), (0x1234, 3));
+    assert_eq!(v, b"vec");
+    let mut slot = tx.reserve_kind(42, 4).unwrap();
+    slot[..4].copy_from_slice(b"slot");
+    slot.commit(4);
+    let got = rx.recv_with_kind(|k, m| (k, m.to_vec())).unwrap();
+    assert_eq!(got, (42, b"slot".to_vec()));
+    // A too-small buffer leaves the message (and its kind) queued.
+    tx.send_kind(9, b"long").unwrap();
+    assert_eq!(kind(rx.recv_kind(&mut buf[..2])), ErrorKind::InvalidInput);
+    assert_eq!(rx.recv_kind(&mut buf).unwrap(), (9, 4));
+    assert_eq!(rx.next_kind().unwrap(), None);
+}
+
+#[test]
+fn bulk_kinds() {
+    let (mut tx, mut rx) = small_bulk();
+    let big = pattern(300_000, 9); // many chunks, each tagged
+    let expect = big.clone();
+    let t = thread::spawn(move || {
+        let a = tx.send_bulk(b"untagged").unwrap();
+        let b = tx.send_bulk_kind(0xbeef, &big).unwrap();
+        let mut w = tx.bulk_writer_kind(u16::MAX, None).unwrap();
+        w.write_all(b"streamed").unwrap();
+        w.finish().unwrap();
+        let c = w.id();
+        drop(w);
+        tx.send_kind(3, &c.to_le_bytes()).unwrap();
+        (a, b, c)
+    });
+    let mut out = Vec::new();
+    let (k, a) = rx.recv_bulk_vec_kind(&mut out, 1 << 20).unwrap();
+    assert_eq!((k, out.as_slice()), (KIND_UNSPECIFIED, &b"untagged"[..]));
+    let mut r = rx.bulk_reader().unwrap();
+    assert_eq!(r.kind(), 0xbeef); // known before reading any data
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    let b = r.id();
+    drop(r);
+    assert!(got == expect);
+    let mut r = rx.bulk_reader().unwrap();
+    assert_eq!(r.kind(), u16::MAX);
+    got.clear();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"streamed");
+    drop(r);
+    // Link the lanes: a message of its own kind names the transfer id.
+    let mut idb = [0u8; 8];
+    assert_eq!(rx.recv_kind(&mut idb).unwrap(), (3, 8));
+    let c = u64::from_le_bytes(idb);
+    assert_eq!(t.join().unwrap(), (a, b, c));
+}
 
 /// A channel with a small bulk ring, so transfers wrap many times.
 fn small_bulk() -> (GkSender, GkReceiver) {

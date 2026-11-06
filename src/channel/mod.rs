@@ -12,6 +12,12 @@
 //!   reassembled, or streamed with `io::Write` / `io::Read`. Transfers are
 //!   delivered in order, each identified by an id.
 //!
+//! Every message and transfer also carries a 16-bit *kind* chosen by the
+//! application to say what the payload is ([`GkSender::send_kind`],
+//! [`GkReceiver::recv_kind`], [`GkSender::bulk_writer_kind`],
+//! [`BulkReader::kind`]); the plain calls use [`KIND_UNSPECIFIED`] (0). It
+//! costs nothing: it lives in the record header next to the length.
+//!
 //! The lanes are not ordered relative to each other: a message sent while a
 //! transfer is in progress is delivered at once, without waiting behind the
 //! transfer. Mention a transfer's id in a message to link the two.
@@ -86,6 +92,9 @@ use std::time::Duration;
 use crate::sys::{SharedRegion, current_pid, process_alive};
 use crate::{EfdFlags, GkEventFd};
 use lane::{Lane, Layout, Line, Sizes};
+
+/// The kind of messages and transfers sent without one: "unspecified".
+pub const KIND_UNSPECIFIED: u16 = 0;
 
 /// How long a blocking call sleeps before checking that the peer is alive.
 const LIVENESS_PERIOD: Duration = Duration::from_millis(250);
@@ -492,6 +501,7 @@ pub struct SendSlot<'a> {
     pad: u64,
     idx: u64,
     len: usize,
+    kind: u16,
 }
 
 impl GkSender {
@@ -513,7 +523,14 @@ impl GkSender {
     /// [`send_bulk`](Self::send_bulk) for large data), and
     /// [`io::ErrorKind::BrokenPipe`] once the receiver is gone.
     pub fn send(&mut self, msg: &[u8]) -> io::Result<()> {
-        let mut slot = self.reserve(msg.len())?;
+        self.send_kind(KIND_UNSPECIFIED, msg)
+    }
+
+    /// Like [`send`](Self::send), tagging the message with `kind` (the
+    /// application's payload type; the receiver gets it from
+    /// [`GkReceiver::recv_kind`]).
+    pub fn send_kind(&mut self, kind: u16, msg: &[u8]) -> io::Result<()> {
+        let mut slot = self.reserve_kind(kind, msg.len())?;
         slot.copy_from_slice(msg);
         slot.commit(msg.len());
         Ok(())
@@ -522,6 +539,11 @@ impl GkSender {
     /// Reserves `len` bytes for a message written in place (no extra copy).
     /// Waits for space like [`send`](Self::send).
     pub fn reserve(&mut self, len: usize) -> io::Result<SendSlot<'_>> {
+        self.reserve_kind(KIND_UNSPECIFIED, len)
+    }
+
+    /// Like [`reserve`](Self::reserve), for a message of the given `kind`.
+    pub fn reserve_kind(&mut self, kind: u16, len: usize) -> io::Result<SendSlot<'_>> {
         self.end.check_owner()?;
         if len as u64 > self.end.lane(MSG).max {
             return Err(io::Error::new(
@@ -539,6 +561,7 @@ impl GkSender {
                     pad,
                     idx,
                     len,
+                    kind,
                 });
             }
             let (lane, tail, nb) = (*self.end.lane(MSG), self.msg_tail, self.end.nonblocking);
@@ -609,7 +632,7 @@ impl SendSlot<'_> {
         s.msg_tail = unsafe {
             s.end
                 .lane(MSG)
-                .publish(s.msg_tail, self.pad, self.idx, n as u64, 0)
+                .publish(s.msg_tail, self.pad, self.idx, n as u64, 0, self.kind)
         };
         s.end.wake_peer(MSG);
     }
@@ -672,6 +695,12 @@ impl GkReceiver {
     /// [`io::ErrorKind::BrokenPipe`] once the sender is gone and every
     /// message was received.
     pub fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_kind(buf).map(|(_, len)| len)
+    }
+
+    /// Like [`recv`](Self::recv), also returning the message's kind
+    /// (`0` = [`KIND_UNSPECIFIED`]): `(kind, len)`.
+    pub fn recv_kind(&mut self, buf: &mut [u8]) -> io::Result<(u16, usize)> {
         let rec = self.next()?;
         if rec.len > buf.len() {
             return Err(io::Error::new(
@@ -682,25 +711,38 @@ impl GkReceiver {
         // SAFETY: `rec` points to `len` published bytes we own until consumed.
         buf[..rec.len].copy_from_slice(unsafe { std::slice::from_raw_parts(rec.ptr, rec.len) });
         self.consume(rec.next);
-        Ok(rec.len)
+        Ok((rec.kind, rec.len))
     }
 
     /// Like [`recv`](Self::recv), replacing the contents of `out` with the
     /// message (any length).
     pub fn recv_vec(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
-        self.recv_with(|msg| {
+        self.recv_vec_kind(out).map(|(_, len)| len)
+    }
+
+    /// Like [`recv_vec`](Self::recv_vec), also returning the kind:
+    /// `(kind, len)`.
+    pub fn recv_vec_kind(&mut self, out: &mut Vec<u8>) -> io::Result<(u16, usize)> {
+        self.recv_with_kind(|kind, msg| {
             out.clear();
             out.extend_from_slice(msg);
-            msg.len()
+            (kind, msg.len())
         })
     }
 
     /// Like [`recv`](Self::recv), but lends the message in place (no copy)
     /// to `f`; its space is freed when `f` returns.
     pub fn recv_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
+        self.recv_with_kind(|_, msg| f(msg))
+    }
+
+    /// Like [`recv_with`](Self::recv_with), also passing the kind to `f`.
+    pub fn recv_with_kind<R>(&mut self, f: impl FnOnce(u16, &[u8]) -> R) -> io::Result<R> {
         let rec = self.next()?;
         // SAFETY: as in `recv`; the sender does not reuse it before `consume`.
-        let r = f(unsafe { std::slice::from_raw_parts(rec.ptr, rec.len) });
+        let r = f(rec.kind, unsafe {
+            std::slice::from_raw_parts(rec.ptr, rec.len)
+        });
         self.consume(rec.next);
         Ok(r)
     }
@@ -709,10 +751,17 @@ impl GkReceiver {
     /// if the message ring is empty. Fails with
     /// [`io::ErrorKind::BrokenPipe`] if it is empty and the sender is gone.
     pub fn next_len(&mut self) -> io::Result<Option<usize>> {
+        Ok(self.next_kind()?.map(|(_, len)| len))
+    }
+
+    /// Kind and length of the next message without receiving it or
+    /// waiting, e.g. to pick a handler: `Some((kind, len))`, or `None` if the
+    /// message ring is empty. Fails like [`next_len`](Self::next_len).
+    pub fn next_kind(&mut self) -> io::Result<Option<(u16, usize)>> {
         self.end.check_owner()?;
         let closed = self.end.peer_closed();
         match self.end.lane(MSG).peek(self.msg_head)? {
-            Some(rec) => Ok(Some(rec.len)),
+            Some(rec) => Ok(Some((rec.kind, rec.len))),
             None if closed => Err(broken()),
             None => Ok(None),
         }

@@ -52,7 +52,8 @@ mod ffi;
 pub mod process;
 
 pub use channel::{
-    BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, SendSlot,
+    BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED,
+    SendSlot,
 };
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
 pub use process::{GkListener, GkProcess, Shareable};

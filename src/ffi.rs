@@ -596,12 +596,28 @@ pub unsafe extern "C" fn gk_channel_new(
 }
 
 /// `int gk_sender_send(gk_sender *tx, const void *buf, size_t len);`
+/// (kind 0, unspecified)
 ///
 /// # Safety
 /// `tx` must be a live handle; `buf` valid for reading `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_sender_send(
     tx: *mut GkSender,
+    buf: *const c_void,
+    len: usize,
+) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_sender_send_kind(tx, 0, buf, len) }
+}
+
+/// `int gk_sender_send_kind(gk_sender *tx, uint16_t kind, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_send_kind(
+    tx: *mut GkSender,
+    kind: u16,
     buf: *const c_void,
     len: usize,
 ) -> c_int {
@@ -616,7 +632,7 @@ pub unsafe extern "C" fn gk_sender_send(
                 // SAFETY: the caller guarantees `len` readable bytes.
                 unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) }
             };
-            match tx.send(msg) {
+            match tx.send_kind(kind, msg) {
                 Ok(()) => 0,
                 Err(e) => {
                     channel_errno(&e);
@@ -637,6 +653,22 @@ pub unsafe extern "C" fn gk_receiver_recv(
     buf: *mut c_void,
     cap: usize,
 ) -> isize {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_receiver_recv_kind(rx, std::ptr::null_mut(), buf, cap) }
+}
+
+/// `intptr_t gk_receiver_recv_kind(gk_receiver *rx, uint16_t *kind, void *buf, size_t cap);`
+///
+/// # Safety
+/// `rx` must be a live handle; `kind` null or writable; `buf` valid for
+/// writing `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_recv_kind(
+    rx: *mut GkReceiver,
+    kind: *mut u16,
+    buf: *mut c_void,
+    cap: usize,
+) -> isize {
     guard(-1, || {
         with(rx, -1, |rx| {
             let out = if cap == 0 {
@@ -648,8 +680,12 @@ pub unsafe extern "C" fn gk_receiver_recv(
                 // SAFETY: the caller guarantees `cap` writable bytes.
                 unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), cap) }
             };
-            match rx.recv(out) {
-                Ok(n) => n as isize,
+            match rx.recv_kind(out) {
+                Ok((k, n)) => {
+                    // SAFETY: forwarded to the caller.
+                    unsafe { put(kind, k) };
+                    n as isize
+                }
                 Err(e) => {
                     channel_errno(&e);
                     -1
@@ -665,9 +701,24 @@ pub unsafe extern "C" fn gk_receiver_recv(
 /// `rx` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_receiver_next_len(rx: *mut GkReceiver) -> isize {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_receiver_next_kind(rx, std::ptr::null_mut()) }
+}
+
+/// `intptr_t gk_receiver_next_kind(gk_receiver *rx, uint16_t *kind);`
+/// Like `gk_receiver_next_len`, also storing the next message's kind.
+///
+/// # Safety
+/// `rx` must be a live handle; `kind` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_next_kind(rx: *mut GkReceiver, kind: *mut u16) -> isize {
     guard(-1, || {
-        with(rx, -1, |rx| match rx.next_len() {
-            Ok(Some(n)) => n as isize,
+        with(rx, -1, |rx| match rx.next_kind() {
+            Ok(Some((k, n))) => {
+                // SAFETY: forwarded to the caller.
+                unsafe { put(kind, k) };
+                n as isize
+            }
             Ok(None) => {
                 compat::set_errno(crate::error::errno::EAGAIN);
                 -1
@@ -882,13 +933,29 @@ pub unsafe extern "C" fn gk_sender_send_bulk(
     len: usize,
     id: *mut u64,
 ) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_sender_send_bulk_kind(tx, 0, buf, len, id) }
+}
+
+/// `int gk_sender_send_bulk_kind(gk_sender *tx, uint16_t kind, const void *buf, size_t len, uint64_t *id);`
+///
+/// # Safety
+/// As `gk_sender_send_bulk`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_send_bulk_kind(
+    tx: *mut GkSender,
+    kind: u16,
+    buf: *const c_void,
+    len: usize,
+    id: *mut u64,
+) -> c_int {
     guard(-1, || {
         with(tx, -1, |tx| {
             // SAFETY: forwarded to the caller.
             let Some(data) = (unsafe { c_bytes(buf, len) }) else {
                 return -1;
             };
-            match tx.send_bulk(data) {
+            match tx.send_bulk_kind(kind, data) {
                 Ok(v) => {
                     // SAFETY: forwarded to the caller.
                     unsafe { put(id, v) };
@@ -910,16 +977,33 @@ pub unsafe extern "C" fn gk_sender_send_bulk(
 /// `tx` live; `id` null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_sender_bulk_begin(tx: *mut GkSender, len: i64, id: *mut u64) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_sender_bulk_begin_kind(tx, 0, len, id) }
+}
+
+/// `int gk_sender_bulk_begin_kind(gk_sender *tx, uint16_t kind, int64_t len, uint64_t *id);`
+///
+/// # Safety
+/// As `gk_sender_bulk_begin`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_bulk_begin_kind(
+    tx: *mut GkSender,
+    kind: u16,
+    len: i64,
+    id: *mut u64,
+) -> c_int {
     guard(-1, || {
-        with(tx, -1, |tx| match tx.bulk_begin(u64::try_from(len).ok()) {
-            Ok(v) => {
-                // SAFETY: forwarded to the caller.
-                unsafe { put(id, v) };
-                0
-            }
-            Err(e) => {
-                bulk_errno(&e);
-                -1
+        with(tx, -1, |tx| {
+            match tx.bulk_begin(kind, u64::try_from(len).ok()) {
+                Ok(v) => {
+                    // SAFETY: forwarded to the caller.
+                    unsafe { put(id, v) };
+                    0
+                }
+                Err(e) => {
+                    bulk_errno(&e);
+                    -1
+                }
             }
         })
     })
@@ -997,11 +1081,28 @@ pub unsafe extern "C" fn gk_receiver_bulk_begin(
     len: *mut i64,
     id: *mut u64,
 ) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_receiver_bulk_begin_kind(rx, std::ptr::null_mut(), len, id) }
+}
+
+/// `int gk_receiver_bulk_begin_kind(gk_receiver *rx, uint16_t *kind, int64_t *len, uint64_t *id);`
+///
+/// # Safety
+/// `rx` live; `kind`, `len`, `id` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_bulk_begin_kind(
+    rx: *mut GkReceiver,
+    kind: *mut u16,
+    len: *mut i64,
+    id: *mut u64,
+) -> c_int {
     guard(-1, || {
         with(rx, -1, |rx| match rx.bulk_begin() {
             Ok((v, total)) => {
+                let k = rx.bulk_info().map_or(0, |i| i.3);
                 // SAFETY: forwarded to the caller.
                 unsafe {
+                    put(kind, k);
                     put(id, v);
                     put(
                         len,

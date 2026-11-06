@@ -256,6 +256,13 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
     `rx.recv_bulk_vec(&mut vec, limit)? -> id`, `rx.bulk_reader()?`
     (`io::Read`, `id()`, `len()`, `for_each_chunk`). Link lanes by sending
     the transfer id as a message.
+  - kinds: every message and transfer has a `u16` kind chosen by the
+    application (`0` = `KIND_UNSPECIFIED`, what the plain calls send).
+    `tx.send_kind(k, msg)`, `tx.reserve_kind(k, len)`,
+    `rx.recv_kind(&mut buf) -> (k, len)`, `rx.recv_vec_kind`,
+    `rx.recv_with_kind(|k, msg| ..)`, `rx.next_kind() -> Option<(k, len)>`;
+    bulk: `tx.send_bulk_kind(k, &data)`, `tx.bulk_writer_kind(k, len)`,
+    `rx.recv_bulk_vec_kind(..) -> (k, id)`, `BulkReader::kind()`.
 - One sender, one receiver; ends are not `Clone`.
 - Errors: `WouldBlock` (non-blocking; bulk writes may be partial),
   `BrokenPipe` (other end gone, or its process died; after draining),
@@ -277,7 +284,11 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - C: `gk_channel_options_default`, `gk_channel_new(&opts | NULL, &tx, &rx)`,
   `gk_sender_send`, `gk_receiver_recv`, `gk_receiver_next_len`,
   `gk_sender_send_bulk`, `gk_sender_bulk_begin`/`_write`/`_finish`/`_abort`,
-  `gk_receiver_bulk_begin`/`_read`/`_end`, `gk_*_set_nonblocking`,
+  `gk_receiver_bulk_begin`/`_read`/`_end`, kind variants
+  `gk_sender_send_kind`, `gk_receiver_recv_kind(rx, &kind, ..)`,
+  `gk_receiver_next_kind`, `gk_sender_send_bulk_kind`,
+  `gk_sender_bulk_begin_kind`, `gk_receiver_bulk_begin_kind`
+  (`GK_KIND_UNSPECIFIED` = 0), `gk_*_set_nonblocking`,
   `gk_*_claim`, `gk_*_detach`, `gk_*_free`, `gk_sender_fd`/`gk_receiver_fd`
   (unix), `gk_*_socket` (Windows), `gk_process_send_sender`/`_receiver`,
   `gk_process_recv_sender`/`_receiver`; errno `EAGAIN`, `EPIPE`, `EMSGSIZE`,
