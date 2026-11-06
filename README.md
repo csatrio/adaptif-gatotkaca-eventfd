@@ -6,8 +6,8 @@
 
 **A cross-platform `eventfd(2)` with full Linux semantics on every OS.**
 
-`GkEventFd` is a 64-bit kernel-style event counter you can poll. On Linux and
-Android it *is* the kernel eventfd. On macOS, iOS, the BSDs and Windows it is a
+`GkEventFd` is a 64-bit kernel-style event counter you can poll. On Linux, Android, FreeBSD 13+, NetBSD 10+ and illumos
+it *is* the kernel eventfd. On macOS, iOS, OpenBSD, DragonFly and Windows it is a
 faithful shim: a user-space counter paired with a pollable descriptor that is
 readable exactly while the counter is non-zero. So it plugs into `poll`,
 `kqueue`, `select`, `WSAPoll`, mio and tokio.
@@ -19,8 +19,8 @@ C code written for Linux eventfd can be ported with almost no changes.
 
 | Platform | Backend | Pollable object | Raw-fd conversions |
 |---|---|---|---|
-| Linux, Android | the kernel `eventfd(2)` (no shim) | the eventfd itself (`AsFd`, `AsRawFd`) | `From<OwnedFd>`, `Into<OwnedFd>`, `IntoRawFd`, `FromRawFd` |
-| macOS, iOS, FreeBSD/NetBSD/OpenBSD/DragonFly | counter (`Mutex` + `Condvar`) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
+| Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself (`AsFd`, `AsRawFd`) | `From<OwnedFd>`, `Into<OwnedFd>`, `IntoRawFd`, `FromRawFd` |
+| macOS, iOS, OpenBSD, DragonFly | counter (`Mutex` + `Condvar`) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
 | Windows | counter (`Mutex` + `Condvar`) + loopback TCP socket pair | read socket (`AsSocket`, `AsRawSocket`) | — |
 
 On the shim backends the pipe or socket holds exactly one byte iff the counter
@@ -206,7 +206,7 @@ From Rust, the same functions are available without the `ffi` feature in
 |---|---|---|
 | `mio` | off | `impl mio::event::Source for GkEventFd` |
 | `ffi` | off | Export the C ABI (`gk_eventfd*`), matching `include/adaptif_gatotkaca_eventfd.h` |
-| `force-shim` | off | Use the portable Unix shim even on Linux/Android. Meant for differential testing against the kernel, not production. Has no effect on other platforms. |
+| `force-shim` | off | Use the portable Unix shim even where a native eventfd exists. Meant for differential testing against the kernel, not production. Has no effect on other platforms. |
 
 ## Semantics
 
@@ -223,17 +223,19 @@ These match Linux `eventfd(2)` on every backend:
 | `io::Read` / `io::Write` with a buffer under 8 bytes | Fails with `EINVAL` (`InvalidInput`) |
 | Readiness | Readable iff counter > 0 |
 
-Flags use the Linux numeric values on all platforms: `EFD_SEMAPHORE = 1`,
-`EFD_NONBLOCK = 0o4000`, `EFD_CLOEXEC = 0o2000000`. On Linux/Android they
-come from `libc`, so they always match the target's kernel ABI. On Windows,
-`EFD_CLOEXEC` makes the handle non-inheritable. The counter type is
+On the native platforms (Linux, Android, FreeBSD 13+, NetBSD 10+ and illumos) the flag values come
+from `libc`, so they always match that kernel's ABI (FreeBSD's `EFD_NONBLOCK`
+is `0x4`, for example). Always use the `EFD_*` constants or `EfdFlags`, never
+hard-coded numbers. On the shim platforms they use the Linux x86/arm values:
+`EFD_SEMAPHORE = 1`, `EFD_NONBLOCK = 0o4000`, `EFD_CLOEXEC = 0o2000000`. On
+Windows the sockets are always non-inheritable, with or without `EFD_CLOEXEC`. The counter type is
 `eventfd_t = u64`.
 
 ## Limitations
 
-None of these apply on Linux/Android, where the descriptor is the kernel
-eventfd. They apply to the shim backends (macOS, iOS, BSDs, Windows, and Linux
-with `force-shim`):
+None of these apply on Linux, Android, FreeBSD 13+, NetBSD 10+ and illumos, where the descriptor is
+the kernel eventfd. They apply to the shim backends (macOS, iOS, OpenBSD,
+DragonFly, Windows, and any platform built with `force-shim`):
 
 - **Raw I/O has no eventfd semantics.** `read(2)`, `write(2)` or `recv` on
   the shim descriptor reach the internal signalling pipe or socket, not the

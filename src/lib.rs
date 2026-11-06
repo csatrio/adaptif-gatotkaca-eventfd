@@ -6,8 +6,8 @@
 //!
 //! | Platform | Backend | Pollable object |
 //! |---|---|---|
-//! | Linux, Android | the kernel `eventfd(2)` (no shim) | the eventfd itself |
-//! | macOS, iOS, BSDs | user-space counter + pipe | read end of the pipe (`AsFd`) |
+//! | Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself |
+//! | macOS, iOS, OpenBSD, DragonFly | user-space counter + pipe | read end of the pipe (`AsFd`) |
 //! | Windows | user-space counter + loopback socket pair | read socket (`AsSocket`) |
 //!
 //! On the shim platforms the pollable object is readable exactly while the
@@ -36,13 +36,7 @@ use core::ffi::c_int;
 use std::fmt;
 use std::io;
 
-#[cfg_attr(
-    all(
-        any(target_os = "linux", target_os = "android"),
-        not(feature = "force-shim")
-    ),
-    allow(dead_code)
-)]
+#[cfg_attr(gk_native, allow(dead_code))]
 mod counter;
 mod error;
 mod flags;
@@ -213,10 +207,7 @@ mod unix_impls {
 }
 
 /// Raw-descriptor conversions only exist where the descriptor *is* the eventfd.
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    not(feature = "force-shim")
-))]
+#[cfg(gk_native)]
 mod native_impls {
     use super::GkEventFd;
     use crate::sys::Inner;

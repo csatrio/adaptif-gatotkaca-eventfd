@@ -1,8 +1,10 @@
 //! `eventfd` flag constants and the [`EfdFlags`] type.
 //!
-//! On Linux/Android the constants are taken from `libc`, so they always match
-//! the kernel ABI of the target architecture. On every other platform they use
-//! the x86/arm Linux values, so C code ported from Linux keeps working.
+//! Where the kernel has a native eventfd (Linux, Android, FreeBSD, NetBSD,
+//! illumos) the constants are taken from `libc`, so they always match that
+//! kernel's ABI (e.g. FreeBSD's `EFD_NONBLOCK` is `0x4`). On the shim
+//! platforms they use the x86/arm Linux values, so C code ported from Linux
+//! keeps working.
 
 use core::ffi::c_int;
 use core::fmt;
@@ -12,10 +14,7 @@ use core::ops::{BitAnd, BitOr, BitOrAssign};
 #[allow(non_camel_case_types)]
 pub type eventfd_t = u64;
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    not(feature = "force-shim")
-))]
+#[cfg(gk_native)]
 mod values {
     use core::ffi::c_int;
     pub const EFD_SEMAPHORE: c_int = libc::EFD_SEMAPHORE;
@@ -23,10 +22,7 @@ mod values {
     pub const EFD_NONBLOCK: c_int = libc::EFD_NONBLOCK;
 }
 
-#[cfg(not(all(
-    any(target_os = "linux", target_os = "android"),
-    not(feature = "force-shim")
-)))]
+#[cfg(not(gk_native))]
 mod values {
     use core::ffi::c_int;
     pub const EFD_SEMAPHORE: c_int = 0o1;

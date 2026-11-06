@@ -1,5 +1,5 @@
-//! Native backend for Linux and Android: a thin wrapper around the kernel
-//! `eventfd(2)` object. No shim, no extra validation: every error (`EAGAIN`,
+//! Native backend for kernels with `eventfd(2)`: Linux, Android, FreeBSD 13+,
+//! NetBSD 10+ and illumos. A thin wrapper around the kernel object. No shim, no extra validation: every error (`EAGAIN`,
 //! `EINVAL`, ...) comes straight from the kernel, so semantics are exactly the
 //! kernel's.
 

@@ -14,9 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GkEventFd`: a cross-platform eventfd with Linux `eventfd(2)` semantics
   (`new`, `with_raw_flags`, `read`, `write`, `try_clone`, `set_nonblocking`,
   `is_nonblocking`, and 8-byte `io::Read`/`io::Write`).
-- Linux/Android backend: the kernel eventfd, with `AsFd`/`AsRawFd` and
+- Native backend for Linux, Android, FreeBSD 13+, NetBSD 10+ and illumos: the kernel eventfd, with `AsFd`/`AsRawFd` and
   `OwnedFd`/`RawFd` conversions.
-- macOS/iOS/BSD backend: user-space counter plus a pipe that is readable while
+- macOS/iOS/OpenBSD/DragonFly backend: user-space counter plus a pipe that is readable while
   the counter is non-zero.
 - Windows backend: user-space counter plus a loopback socket pair whose read
   socket (`AsSocket`) is readable while the counter is non-zero.

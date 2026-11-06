@@ -165,6 +165,8 @@ jobs:
         include:
           - { os: ubuntu-latest, target: aarch64-linux-android }
           - { os: ubuntu-latest, target: x86_64-unknown-freebsd }
+          - { os: ubuntu-latest, target: x86_64-unknown-netbsd }
+          - { os: ubuntu-latest, target: x86_64-unknown-illumos }
           - { os: macos-latest, target: aarch64-apple-ios }
     steps:
       - uses: actions/checkout@v4
