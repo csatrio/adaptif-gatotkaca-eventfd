@@ -142,15 +142,18 @@ impl From<Inner> for OwnedFd {
 
 use super::unix_share::{self, InheritableExport};
 
+/// Tag of this backend's eventfds in tokens and socket messages.
+pub(crate) const TAG: &str = "gkefd1:n";
+
 impl Inner {
     pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
-        InheritableExport::new('n', &[self.fd.as_fd()])
+        InheritableExport::new(TAG, &[self.fd.as_fd()])
     }
 
     /// # Safety
     /// See `GkEventFd::import`.
     pub(crate) unsafe fn import(token: &str) -> io::Result<Self> {
-        let fd = unix_share::parse(token, 'n', 1)?[0];
+        let fd = unix_share::parse(token, TAG, 1)?[0];
         if !unix_share::is_open(fd) {
             return Err(unix_share::invalid_token());
         }
@@ -162,17 +165,36 @@ impl Inner {
     }
 
     pub(crate) fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
-        unix_share::send(sock, 'n', &[self.fd.as_fd()])
+        unix_share::send(sock, TAG, &[self.fd.as_fd()])
     }
 
     pub(crate) fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
-        let fd = unix_share::recv(sock, 'n', 1)?
-            .pop()
-            .expect("one descriptor");
+        Self::from_share_fds(unix_share::recv(sock, TAG, SHARE_FDS)?)
+    }
+
+    /// The descriptors that make up this eventfd when it is passed along
+    /// inside a larger object (a channel end).
+    pub(crate) fn share_fds(&self) -> Vec<BorrowedFd<'_>> {
+        vec![self.fd.as_fd()]
+    }
+
+    /// Rebuilds an eventfd from [`SHARE_FDS`] received descriptors (ours;
+    /// closed on failure).
+    pub(crate) fn from_share_fds(mut fds: Vec<OwnedFd>) -> io::Result<Self> {
+        let fd = match (fds.pop(), fds.is_empty()) {
+            (Some(fd), true) => fd,
+            _ => return Err(unix_share::invalid_token()),
+        };
         check_is_eventfd(fd.as_raw_fd())?;
+        unix_share::set_cloexec(fd.as_fd())?;
         Ok(Self { fd })
     }
 }
+
+/// Descriptors per eventfd in [`Inner::share_fds`].
+pub(crate) const SHARE_FDS: usize = 1;
+
+impl Inner {}
 
 /// On Linux/Android, checks through `/proc` that `fd` is an eventfd (skipped
 /// if `/proc` is unavailable). Other native platforms only check it is open.

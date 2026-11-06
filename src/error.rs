@@ -30,6 +30,12 @@ pub(crate) mod errno {
     pub const ENOENT: c_int = libc::ENOENT;
     #[cfg(unix)]
     pub const EADDRINUSE: c_int = libc::EADDRINUSE;
+    #[cfg(unix)]
+    pub const EPIPE: c_int = libc::EPIPE;
+    #[cfg(unix)]
+    pub const EMSGSIZE: c_int = libc::EMSGSIZE;
+    #[cfg(unix)]
+    pub const EACCES: c_int = libc::EACCES;
 
     #[cfg(windows)]
     pub const EAGAIN: c_int = 11;
@@ -51,6 +57,12 @@ pub(crate) mod errno {
     pub const ENOENT: c_int = 2;
     #[cfg(windows)]
     pub const EADDRINUSE: c_int = 100;
+    #[cfg(windows)]
+    pub const EPIPE: c_int = 32;
+    #[cfg(windows)]
+    pub const EMSGSIZE: c_int = 115;
+    #[cfg(windows)]
+    pub const EACCES: c_int = 13;
 }
 
 /// `EAGAIN`: the operation would block on a non-blocking eventfd.
@@ -111,6 +123,8 @@ pub(crate) fn to_errno(e: &io::Error) -> c_int {
         io::ErrorKind::Interrupted => errno::EINTR,
         io::ErrorKind::NotFound => errno::ENOENT,
         io::ErrorKind::AddrInUse => errno::EADDRINUSE,
+        io::ErrorKind::BrokenPipe => errno::EPIPE,
+        io::ErrorKind::PermissionDenied => errno::EACCES,
         #[cfg(windows)]
         _ if e.raw_os_error() == Some(6) => errno::EBADF,
         _ => errno::EIO,

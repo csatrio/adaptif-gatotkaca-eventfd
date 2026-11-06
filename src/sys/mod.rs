@@ -21,24 +21,28 @@
 #[cfg(gk_native)]
 mod native;
 #[cfg(gk_native)]
-pub(crate) use native::Inner;
+pub(crate) use native::{Inner, SHARE_FDS, TAG};
 
 #[cfg(unix)]
-mod unix_share;
+pub(crate) mod unix_share;
 #[cfg(unix)]
 pub(crate) use unix_share::{InheritableExport, is_open};
 
 #[cfg(any(windows, all(unix, not(gk_native))))]
 mod shm;
+
+/// Shared memory regions (eventfd shims, channels).
+mod region;
+pub(crate) use region::{SharedRegion, current_pid, process_alive};
 #[cfg(all(unix, not(gk_native)))]
 mod unix_shim;
 #[cfg(all(unix, not(gk_native)))]
-pub(crate) use unix_shim::{Core, Inner, PipeId, pipe_id};
+pub(crate) use unix_shim::{Core, Inner, PipeId, SHARE_FDS, TAG, pipe_id};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::{InheritableExport, Inner};
+pub(crate) use windows::{InheritableExport, Inner, duplicate_from};
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("adaptif-gatotkaca-eventfd supports unix and windows targets only");

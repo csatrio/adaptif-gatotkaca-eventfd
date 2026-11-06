@@ -15,6 +15,10 @@
 //! and mio. Always read and write the counter through this crate, never with
 //! raw `read(2)`/`recv`.
 //!
+//! [`GkChannel`] builds on it: a one-way message channel between threads or
+//! processes through shared memory, with the eventfds as doorbells (see the
+//! [`channel`] module).
+//!
 //! The [`compat`] module offers the `<sys/eventfd.h>` functions with C
 //! semantics, and the `ffi` feature exports them as a C ABI.
 //!
@@ -41,13 +45,15 @@ mod error;
 mod flags;
 mod sys;
 
+pub mod channel;
 pub mod compat;
 #[cfg(feature = "ffi")]
 mod ffi;
 pub mod process;
 
+pub use channel::{ChannelOptions, GkChannel, GkReceiver, GkSender, SendSlot};
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
-pub use process::{GkListener, GkProcess};
+pub use process::{GkListener, GkProcess, Shareable};
 
 /// A cross-platform eventfd. See the [crate docs](crate).
 ///

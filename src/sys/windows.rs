@@ -570,32 +570,7 @@ impl Inner {
         if parts.next().is_some() {
             return Err(bad());
         }
-        // SAFETY: plain call; the handle is owned right below.
-        let peer = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, peer_pid) };
-        if peer.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a fresh process handle that we own.
-        let peer = unsafe { OwnedHandle::from_raw_handle(peer) };
-        let mut ours: HANDLE = ptr::null_mut();
-        // SAFETY: duplicates a handle *out of* the peer into a fresh handle
-        // of ours; a bogus value just makes the call fail.
-        let ok = unsafe {
-            DuplicateHandle(
-                peer.as_raw_handle(),
-                section as HANDLE,
-                GetCurrentProcess(),
-                &mut ours,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a fresh handle we own.
-        let page = SharedPage::from_owned(unsafe { OwnedHandle::from_raw_handle(ours) })?;
+        let page = SharedPage::from_owned(duplicate_from(peer_pid, section)?)?;
         let reader = socket_from_info(&r)?;
         let writer = socket_from_info(&w)?;
         check_pair(reader.as_raw_socket(), writer.as_raw_socket())?;
@@ -608,6 +583,37 @@ impl Inner {
             pair: SocketPair { reader, writer },
         }))
     }
+}
+
+/// Duplicates the handle `value` *out of* process `pid` into a fresh handle
+/// of ours (needs `PROCESS_DUP_HANDLE` on `pid`). A bogus value just fails.
+pub(crate) fn duplicate_from(pid: u32, value: usize) -> io::Result<OwnedHandle> {
+    // SAFETY: plain call; the handle is owned right below.
+    let peer = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    if peer.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh process handle that we own.
+    let peer = unsafe { OwnedHandle::from_raw_handle(peer) };
+    let mut ours: HANDLE = ptr::null_mut();
+    // SAFETY: duplicates a handle out of the peer into a fresh handle of
+    // ours; a bogus value just makes the call fail.
+    let ok = unsafe {
+        DuplicateHandle(
+            peer.as_raw_handle(),
+            value as HANDLE,
+            GetCurrentProcess(),
+            &mut ours,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh handle we own.
+    Ok(unsafe { OwnedHandle::from_raw_handle(ours) })
 }
 
 /// `WSADuplicateSocketW` of `sock` for process `pid`, as raw bytes.

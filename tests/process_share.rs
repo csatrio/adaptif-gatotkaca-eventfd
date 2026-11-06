@@ -19,7 +19,9 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd, GkListener, GkProcess};
+use adaptif_gatotkaca_eventfd::{
+    ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkProcess, GkReceiver, GkSender,
+};
 
 /// How the child gets the eventfd.
 enum Via<'a> {
@@ -162,6 +164,10 @@ fn child_entry() {
     let Ok(role) = std::env::var("GK_CHILD_ROLE") else {
         return;
     };
+    if role.starts_with("channel_") {
+        channel_child(&role);
+        return;
+    }
     let efd = if let Ok(token) = std::env::var("GK_TOKEN") {
         // SAFETY: the parent made this token for this process, once.
         unsafe { GkEventFd::import(&token) }.expect("import")
@@ -375,4 +381,98 @@ fn from_parent_without_parent_fails() {
     }
     let err = GkProcess::from_parent().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// Channel ends handed to another process through GkProcess
+// ---------------------------------------------------------------------------
+
+const MESSAGES: u32 = 500;
+
+fn message(i: u32) -> Vec<u8> {
+    (0..(i * 37 % 3000) as usize)
+        .map(|k| (k as u32 ^ i) as u8)
+        .collect()
+}
+
+fn channel() -> (GkSender, GkReceiver) {
+    GkChannel::with_options(ChannelOptions {
+        capacity: 1 << 16,
+        max_message: 4000,
+    })
+    .unwrap()
+}
+
+fn channel_child(role: &str) {
+    let mut parent = GkProcess::from_parent().unwrap();
+    match role {
+        // Receive the receiver and read everything the parent sends.
+        "channel_recv" => {
+            let mut rx: GkReceiver = parent.recv_as().expect("recv_as::<GkReceiver>");
+            let mut buf = Vec::new();
+            for i in 0..MESSAGES {
+                rx.recv_vec(&mut buf).unwrap();
+                assert_eq!(buf, message(i), "message {i}");
+            }
+            // The parent drops its sender after the last message.
+            assert_eq!(
+                rx.recv_vec(&mut buf).unwrap_err().kind(),
+                ErrorKind::BrokenPipe
+            );
+        }
+        // Receive the sender and write to the parent.
+        "channel_send" => {
+            let mut tx: GkSender = parent.recv_as().expect("recv_as::<GkSender>");
+            for i in 0..MESSAGES {
+                tx.send(&message(i)).unwrap();
+            }
+        }
+        other => panic!("unknown role {other}"),
+    }
+}
+
+fn spawn_channel_child(role: &str) -> (Child, GkProcess) {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+        .env("GK_CHILD_ROLE", role);
+    GkProcess::spawn(&mut cmd).unwrap()
+}
+
+#[test]
+fn channel_parent_sends_child_receives() {
+    let (mut tx, rx) = channel();
+    let (child, mut peer) = spawn_channel_child("channel_recv");
+    peer.send(&rx).unwrap();
+    // Our copy now belongs to the child: unusable here, and dropping it
+    // doesn't close the channel.
+    let mut rx = rx;
+    assert_eq!(
+        rx.next_len().unwrap_err().kind(),
+        ErrorKind::PermissionDenied
+    );
+    drop(rx);
+    for i in 0..MESSAGES {
+        tx.send(&message(i)).unwrap();
+    }
+    drop(tx);
+    join(Spawned(child, Some(peer)));
+}
+
+#[test]
+fn channel_child_sends_parent_receives() {
+    let (tx, mut rx) = channel();
+    let (child, mut peer) = spawn_channel_child("channel_send");
+    peer.send(&tx).unwrap();
+    drop(tx);
+    let mut buf = Vec::new();
+    for i in 0..MESSAGES {
+        rx.recv_vec(&mut buf).unwrap();
+        assert_eq!(buf, message(i), "message {i}");
+    }
+    // The child exits after its last message: its sender is dropped.
+    assert_eq!(
+        rx.recv_vec(&mut buf).unwrap_err().kind(),
+        ErrorKind::BrokenPipe
+    );
+    join(Spawned(child, Some(peer)));
 }

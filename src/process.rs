@@ -131,15 +131,20 @@ impl GkProcess {
         Self::connect(&name)
     }
 
-    /// Hands `efd` to the other process, which receives it with
-    /// [`recv`](Self::recv); both then share the counter. Don't interleave
-    /// other traffic on the same connection.
+    /// Hands `obj` (a [`GkEventFd`], [`GkSender`](crate::GkSender) or
+    /// [`GkReceiver`](crate::GkReceiver)) to the other process, which
+    /// receives it with [`recv`](Self::recv) (eventfd) or
+    /// [`recv_as`](Self::recv_as); both then share it. Don't interleave other
+    /// traffic on the same connection.
+    ///
+    /// A channel end sent this way now belongs to the other process: this
+    /// process's copy is detached (dropping it doesn't close the channel).
     ///
     /// Windows: the other process pulls the handles out of this one, so a
-    /// copy of the eventfd's section stays open in this `GkProcess` until it
-    /// is dropped (one small handle per `send`).
-    pub fn send(&mut self, efd: &GkEventFd) -> io::Result<()> {
-        self.0.send(efd)
+    /// copy of the shared memory section stays open in this `GkProcess` until
+    /// it is dropped (one small handle per object per `send`).
+    pub fn send<T: Shareable>(&mut self, obj: &T) -> io::Result<()> {
+        self.0.send(obj)
     }
 
     /// Receives an eventfd sent with [`send`](Self::send). Fails with
@@ -150,10 +155,65 @@ impl GkProcess {
         self.0.recv()
     }
 
+    /// Receives an object of type `T` sent with [`send`](Self::send), e.g.
+    /// `peer.recv_as::<GkReceiver>()`. Fails like [`recv`](Self::recv) if
+    /// something else was sent.
+    pub fn recv_as<T: Shareable>(&mut self) -> io::Result<T> {
+        self.0.recv()
+    }
+
     /// Windows: the other process's id, once connected.
     #[cfg(windows)]
     pub fn pid(&self) -> Option<u32> {
         self.0.pid()
+    }
+}
+
+/// Objects [`GkProcess`] can hand to other processes: [`GkEventFd`],
+/// [`GkSender`](crate::GkSender) and [`GkReceiver`](crate::GkReceiver).
+/// Sealed: it can't be implemented outside this crate.
+pub trait Shareable: private::Sealed {}
+
+pub(crate) mod private {
+    use std::io;
+
+    /// How an object travels: as descriptors over a unix socket, or on
+    /// Windows as an offer the receiving process pulls into itself.
+    pub trait Sealed: Sized {
+        #[cfg(unix)]
+        fn send_over(&self, sock: std::os::fd::BorrowedFd<'_>) -> io::Result<()>;
+        #[cfg(unix)]
+        fn recv_over(sock: std::os::fd::BorrowedFd<'_>) -> io::Result<Self>;
+        #[cfg(windows)]
+        fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)>;
+        #[cfg(windows)]
+        fn take(token: &str, pid: u32) -> io::Result<Self>;
+    }
+}
+
+impl Shareable for GkEventFd {}
+
+impl private::Sealed for GkEventFd {
+    #[cfg(unix)]
+    fn send_over(&self, sock: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        self.inner.send_to(sock)
+    }
+    #[cfg(unix)]
+    fn recv_over(sock: std::os::fd::BorrowedFd<'_>) -> io::Result<Self> {
+        Ok(Self {
+            inner: crate::sys::Inner::recv_from(sock)?,
+        })
+    }
+    #[cfg(windows)]
+    fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
+        let (token, keep) = self.inner.offer_to(pid)?;
+        Ok((token, vec![keep]))
+    }
+    #[cfg(windows)]
+    fn take(token: &str, pid: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: crate::sys::Inner::take_offer(token, pid)?,
+        })
     }
 }
 
@@ -187,8 +247,8 @@ fn unique_name() -> String {
 
 #[cfg(unix)]
 mod imp {
+    use super::private::Sealed;
     use super::unique_name;
-    use crate::GkEventFd;
     use std::io;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
@@ -312,12 +372,12 @@ mod imp {
             }
         }
 
-        pub(super) fn send(&mut self, efd: &GkEventFd) -> io::Result<()> {
-            efd.send_to(self.stream()?)
+        pub(super) fn send<T: Sealed>(&mut self, obj: &T) -> io::Result<()> {
+            obj.send_over(std::os::fd::AsFd::as_fd(self.stream()?))
         }
 
-        pub(super) fn recv(&mut self) -> io::Result<GkEventFd> {
-            GkEventFd::recv_from(self.stream()?)
+        pub(super) fn recv<T: Sealed>(&mut self) -> io::Result<T> {
+            T::recv_over(std::os::fd::AsFd::as_fd(self.stream()?))
         }
     }
 }
@@ -328,8 +388,8 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    use super::private::Sealed;
     use super::unique_name;
-    use crate::GkEventFd;
     use crate::compat::TOKEN_MAX;
     use std::fs::File;
     use std::io::{self, Read, Write};
@@ -545,17 +605,17 @@ mod imp {
             }
         }
 
-        pub(super) fn send(&mut self, efd: &GkEventFd) -> io::Result<()> {
+        pub(super) fn send<T: Sealed>(&mut self, obj: &T) -> io::Result<()> {
             let (_, pid) = self.connection()?;
-            let (token, keep) = efd.inner.offer_to(pid)?;
-            self.offered.push(keep);
+            let (token, keep) = obj.offer(pid)?;
+            self.offered.extend(keep);
             let (pipe, _) = self.connection()?;
             pipe.write_all(&(token.len() as u32).to_le_bytes())?;
             pipe.write_all(token.as_bytes())?;
             pipe.flush()
         }
 
-        pub(super) fn recv(&mut self) -> io::Result<GkEventFd> {
+        pub(super) fn recv<T: Sealed>(&mut self) -> io::Result<T> {
             let (pipe, pid) = self.connection()?;
             let mut len = [0u8; 4];
             pipe.read_exact(&mut len)?;
@@ -570,9 +630,7 @@ mod imp {
             pipe.read_exact(&mut token)?;
             let token = String::from_utf8(token)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "eventfd message"))?;
-            Ok(GkEventFd {
-                inner: crate::sys::Inner::take_offer(&token, pid)?,
-            })
+            T::take(&token, pid)
         }
     }
 }

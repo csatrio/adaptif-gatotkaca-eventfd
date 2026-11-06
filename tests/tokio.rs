@@ -156,3 +156,54 @@ mod windows {
         assert_eq!(sum, expected);
     }
 }
+
+/// A `GkReceiver` driven by tokio's reactor (unix): await readability, then
+/// receive until `WouldBlock` (which re-arms the doorbell).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_receiver_with_asyncfd() {
+    use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel};
+    use std::io::ErrorKind;
+    use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
+
+    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
+        capacity: 4096,
+        max_message: 64,
+    })
+    .unwrap();
+    rx.set_nonblocking(true);
+    // SAFETY: the receiver owns its pollable descriptor until dropped, and
+    // `as_raw_fd` always returns that same descriptor.
+    let mut rx = unsafe { AsyncFd::register_with_interest(rx, Interest::READABLE) }.unwrap();
+    let writer = std::thread::spawn(move || {
+        for i in 0..200u32 {
+            tx.send(&i.to_le_bytes()).unwrap();
+            if i % 10 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+    let mut next = 0u32;
+    let mut buf = [0u8; 4];
+    'outer: loop {
+        let mut guard = rx.readable_mut().await.unwrap();
+        loop {
+            match guard.get_inner_mut().recv(&mut buf) {
+                Ok(4) => {
+                    assert_eq!(u32::from_le_bytes(buf), next);
+                    next += 1;
+                }
+                Ok(n) => panic!("unexpected length {n}"),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => break 'outer,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(next, 200);
+}

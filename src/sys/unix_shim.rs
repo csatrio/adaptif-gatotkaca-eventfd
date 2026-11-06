@@ -364,17 +364,23 @@ impl Inner {
 
 use super::unix_share::{self, InheritableExport};
 
+/// Tag of this backend's eventfds in tokens and socket messages.
+pub(crate) const TAG: &str = "gkefd1:u";
+
+/// Descriptors per eventfd in [`Inner::share_fds`].
+pub(crate) const SHARE_FDS: usize = 3;
+
 impl Shared {
     fn fds(&self) -> [BorrowedFd<'_>; 3] {
         [self.page.fd(), self.pipe_r.as_fd(), self.pipe_w.as_fd()]
     }
 
     fn export_inheritable(&self) -> io::Result<InheritableExport> {
-        InheritableExport::new('u', &self.fds())
+        InheritableExport::new(TAG, &self.fds())
     }
 
     fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
-        unix_share::send(sock, 'u', &self.fds())
+        unix_share::send(sock, TAG, &self.fds())
     }
 
     /// Builds from the three descriptors once `page` validated; the pipe
@@ -399,7 +405,7 @@ impl Shared {
     /// # Safety
     /// See `GkEventFd::import`.
     unsafe fn import(token: &str) -> io::Result<Self> {
-        let fds = unix_share::parse(token, 'u', 3)?;
+        let fds = unix_share::parse(token, TAG, 3)?;
         check_pipe_ends(fds[1], fds[2])?;
         // SAFETY: the caller guarantees the token's descriptors may be ours;
         // `adopt` only takes the page over if it validates.
@@ -410,12 +416,14 @@ impl Shared {
     }
 
     fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
-        let mut fds = unix_share::recv(sock, 'u', 3)?.into_iter();
-        let (shm, r, w) = (
-            fds.next().unwrap(),
-            fds.next().unwrap(),
-            fds.next().unwrap(),
-        );
+        Self::from_fds(unix_share::recv(sock, TAG, SHARE_FDS)?)
+    }
+
+    /// Rebuilds from `[shared memory, pipe read end, pipe write end]` (ours;
+    /// closed on failure).
+    fn from_fds(fds: Vec<OwnedFd>) -> io::Result<Self> {
+        let [shm, r, w]: [OwnedFd; SHARE_FDS] =
+            fds.try_into().map_err(|_| unix_share::invalid_token())?;
         check_pipe_ends(r.as_raw_fd(), w.as_raw_fd())?;
         Self::assemble(SharedPage::from_owned(shm)?, r, w)
     }
@@ -472,6 +480,18 @@ impl Inner {
 
     pub(crate) fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
         Self::from_shared(Shared::recv_from(sock)?)
+    }
+
+    /// The descriptors that make up this eventfd when it is passed along
+    /// inside a larger object (a channel end).
+    pub(crate) fn share_fds(&self) -> Vec<BorrowedFd<'_>> {
+        self.shared.fds().to_vec()
+    }
+
+    /// Rebuilds an eventfd from [`SHARE_FDS`] received descriptors (ours;
+    /// closed on failure).
+    pub(crate) fn from_share_fds(fds: Vec<OwnedFd>) -> io::Result<Self> {
+        Self::from_shared(Shared::from_fds(fds)?)
     }
 }
 
@@ -809,7 +829,7 @@ mod tests {
     fn import_validates_before_taking_ownership() {
         let e = Inner::new(1, nb()).unwrap();
         let export = e.export_inheritable().unwrap();
-        let fds = unix_share::parse(export.token(), 'u', 3).unwrap();
+        let fds = unix_share::parse(export.token(), TAG, 3).unwrap();
         let (shm, r, w) = (fds[0], fds[1], fds[2]);
         for (token, kind) in [
             // Pipe ends swapped.

@@ -612,7 +612,7 @@ mod imp {
 
     pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> std::io::Result<()> {
         let efd = view(fd)?;
-        process.send(&efd)
+        process.send(&*efd)
     }
 
     pub(super) fn adopt(efd: crate::GkEventFd) -> std::io::Result<c_int> {
@@ -1056,7 +1056,7 @@ mod imp {
     #[cfg(windows)]
     pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> io::Result<()> {
         let efd = lookup(fd).ok_or_else(crate::error::bad_descriptor)?;
-        process.send(&efd)
+        process.send(&*efd)
     }
 
     #[cfg(windows)]

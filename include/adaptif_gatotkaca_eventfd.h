@@ -391,6 +391,84 @@ int gk_process_recv(gk_process *process);
 /* Closes the connection. NULL is ignored. */
 void gk_process_free(gk_process *process);
 
+/*
+ * Channels: one-way message passing between threads or processes through
+ * shared memory (the C form of the Rust GkChannel / GkSender / GkReceiver).
+ * Messages keep their boundaries, may be empty, and are read in order. The
+ * eventfd doorbells make each end pollable: the receiver's descriptor is
+ * readable when a message may be waiting, the sender's when space may have
+ * been freed (read/write until EAGAIN, then poll).
+ *
+ * Errors: -1 (or NULL) with errno EAGAIN (non-blocking and empty/full),
+ * EPIPE (the other end is gone; the receiver gets it after draining),
+ * EMSGSIZE (message larger than max_message, or a receive buffer too small:
+ * the message stays queued, see gk_receiver_next_len), EACCES (the end
+ * belongs to another process; after fork call gk_*_claim in the process
+ * that keeps it, and gk_*_detach in the other).
+ */
+typedef struct gk_sender gk_sender;
+typedef struct gk_receiver gk_receiver;
+
+/* Default sizes: a 16 MiB ring and 1 MiB messages. */
+#define GK_CHANNEL_DEFAULT_CAPACITY (16u << 20)
+#define GK_CHANNEL_DEFAULT_MAX_MESSAGE (1u << 20)
+
+/*
+ * Creates a channel. capacity is a power of two >= 64; max_message is at
+ * most capacity / 2 - 8 (EINVAL otherwise). Returns 0 and the two ends.
+ */
+int gk_channel_new(size_t capacity, size_t max_message, gk_sender **tx,
+                   gk_receiver **rx);
+
+/* Sends one message of len bytes (blocks while full unless non-blocking). */
+int gk_sender_send(gk_sender *tx, const void *buf, size_t len);
+
+/*
+ * Receives one message into buf (cap bytes) and returns its length, which
+ * may be 0. Blocks while empty unless non-blocking.
+ */
+intptr_t gk_receiver_recv(gk_receiver *rx, void *buf, size_t cap);
+
+/* Length of the next message without waiting; -1 + EAGAIN if empty. */
+intptr_t gk_receiver_next_len(gk_receiver *rx);
+
+/* Non-zero: fail with EAGAIN instead of blocking. Returns 0. */
+int gk_sender_set_nonblocking(gk_sender *tx, int nonblocking);
+int gk_receiver_set_nonblocking(gk_receiver *rx, int nonblocking);
+
+/* After fork: make this process the owner of the end. Returns 0. */
+int gk_sender_claim(gk_sender *tx);
+int gk_receiver_claim(gk_receiver *rx);
+
+#ifdef _WIN32
+/* The SOCKET to WSAPoll/select on (readable as described above). */
+uintptr_t gk_sender_socket(gk_sender *tx);
+uintptr_t gk_receiver_socket(gk_receiver *rx);
+#else
+/* The descriptor to poll/kqueue on (readable as described above). */
+int gk_sender_fd(gk_sender *tx);
+int gk_receiver_fd(gk_receiver *rx);
+#endif
+
+/* Closes the end (the other side then gets EPIPE). NULL is ignored. */
+void gk_sender_free(gk_sender *tx);
+void gk_receiver_free(gk_receiver *rx);
+
+/* Frees this process's copy without closing the channel (after fork). */
+void gk_sender_detach(gk_sender *tx);
+void gk_receiver_detach(gk_receiver *rx);
+
+/*
+ * Hands a channel end to the process at the other end of `process`, which
+ * receives it with gk_process_recv_sender / gk_process_recv_receiver. This
+ * process's copy is detached (free it with gk_*_free; it won't close the
+ * channel). On Windows keep `process` until the peer has received.
+ */
+int gk_process_send_sender(gk_process *process, gk_sender *tx);
+int gk_process_send_receiver(gk_process *process, gk_receiver *rx);
+gk_sender *gk_process_recv_sender(gk_process *process);
+gk_receiver *gk_process_recv_receiver(gk_process *process);
+
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)
 
 /* <sys/eventfd.h> names, mapped onto the gk_* functions. */

@@ -490,6 +490,382 @@ pub unsafe extern "C" fn gk_process_free(process: *mut GkProcess) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Channels (GkSender / GkReceiver as opaque C handles)
+// ---------------------------------------------------------------------------
+
+use crate::{ChannelOptions, GkChannel, GkReceiver, GkSender};
+
+/// Sets `errno` for a channel error: size problems are `EMSGSIZE`.
+fn channel_errno(e: &std::io::Error) {
+    use crate::error::errno::EMSGSIZE;
+    compat::set_errno(if e.kind() == std::io::ErrorKind::InvalidInput {
+        EMSGSIZE
+    } else {
+        crate::error::to_errno(e)
+    });
+}
+
+/// Runs `f` on a live handle, or sets `errno = EINVAL` for null.
+fn with<T, R>(p: *mut T, err: R, f: impl FnOnce(&mut T) -> R) -> R {
+    // SAFETY: callers pass handles from this API (or null).
+    match unsafe { p.as_mut() } {
+        Some(v) => f(v),
+        None => {
+            compat::set_errno(crate::error::errno::EINVAL);
+            err
+        }
+    }
+}
+
+/// `int gk_channel_new(size_t capacity, size_t max_message, gk_sender **tx, gk_receiver **rx);`
+///
+/// # Safety
+/// `tx` and `rx` must be valid for writing a pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_channel_new(
+    capacity: usize,
+    max_message: usize,
+    tx: *mut *mut GkSender,
+    rx: *mut *mut GkReceiver,
+) -> c_int {
+    guard(-1, || {
+        if tx.is_null() || rx.is_null() {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        }
+        match GkChannel::with_options(ChannelOptions {
+            capacity,
+            max_message,
+        }) {
+            Ok((s, r)) => {
+                // SAFETY: checked non-null; the caller guarantees validity.
+                unsafe {
+                    *tx = Box::into_raw(Box::new(s));
+                    *rx = Box::into_raw(Box::new(r));
+                }
+                0
+            }
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        }
+    })
+}
+
+/// `int gk_sender_send(gk_sender *tx, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_send(
+    tx: *mut GkSender,
+    buf: *const c_void,
+    len: usize,
+) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| {
+            let msg = if len == 0 {
+                &[][..]
+            } else if buf.is_null() {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return -1;
+            } else {
+                // SAFETY: the caller guarantees `len` readable bytes.
+                unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) }
+            };
+            match tx.send(msg) {
+                Ok(()) => 0,
+                Err(e) => {
+                    channel_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `intptr_t gk_receiver_recv(gk_receiver *rx, void *buf, size_t cap);`
+///
+/// # Safety
+/// `rx` must be a live handle; `buf` valid for writing `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_recv(
+    rx: *mut GkReceiver,
+    buf: *mut c_void,
+    cap: usize,
+) -> isize {
+    guard(-1, || {
+        with(rx, -1, |rx| {
+            let out = if cap == 0 {
+                &mut [][..]
+            } else if buf.is_null() {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return -1;
+            } else {
+                // SAFETY: the caller guarantees `cap` writable bytes.
+                unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), cap) }
+            };
+            match rx.recv(out) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    channel_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `intptr_t gk_receiver_next_len(gk_receiver *rx);` (-1 + `EAGAIN` if empty)
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_next_len(rx: *mut GkReceiver) -> isize {
+    guard(-1, || {
+        with(rx, -1, |rx| match rx.next_len() {
+            Ok(Some(n)) => n as isize,
+            Ok(None) => {
+                compat::set_errno(crate::error::errno::EAGAIN);
+                -1
+            }
+            Err(e) => {
+                channel_errno(&e);
+                -1
+            }
+        })
+    })
+}
+
+/// `int gk_sender_set_nonblocking(gk_sender *tx, int nonblocking);`
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_set_nonblocking(tx: *mut GkSender, nonblocking: c_int) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| {
+            tx.set_nonblocking(nonblocking != 0);
+            0
+        })
+    })
+}
+
+/// `int gk_receiver_set_nonblocking(gk_receiver *rx, int nonblocking);`
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_set_nonblocking(
+    rx: *mut GkReceiver,
+    nonblocking: c_int,
+) -> c_int {
+    guard(-1, || {
+        with(rx, -1, |rx| {
+            rx.set_nonblocking(nonblocking != 0);
+            0
+        })
+    })
+}
+
+/// `int gk_sender_claim(gk_sender *tx);` (after `fork`)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_claim(tx: *mut GkSender) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| {
+            tx.claim();
+            0
+        })
+    })
+}
+
+/// `int gk_receiver_claim(gk_receiver *rx);` (after `fork`)
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_claim(rx: *mut GkReceiver) -> c_int {
+    guard(-1, || {
+        with(rx, -1, |rx| {
+            rx.claim();
+            0
+        })
+    })
+}
+
+/// `int gk_sender_fd(gk_sender *tx);` (unix: readable when space was freed)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_fd(tx: *mut GkSender) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| std::os::fd::AsRawFd::as_raw_fd(&*tx))
+    })
+}
+
+/// `int gk_receiver_fd(gk_receiver *rx);` (unix: readable when a message may wait)
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_fd(rx: *mut GkReceiver) -> c_int {
+    guard(-1, || {
+        with(rx, -1, |rx| std::os::fd::AsRawFd::as_raw_fd(&*rx))
+    })
+}
+
+/// `uintptr_t gk_sender_socket(gk_sender *tx);` (Windows)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_socket(tx: *mut GkSender) -> usize {
+    guard(usize::MAX, || {
+        with(tx, usize::MAX, |tx| {
+            std::os::windows::io::AsRawSocket::as_raw_socket(&*tx) as usize
+        })
+    })
+}
+
+/// `uintptr_t gk_receiver_socket(gk_receiver *rx);` (Windows)
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_socket(rx: *mut GkReceiver) -> usize {
+    guard(usize::MAX, || {
+        with(rx, usize::MAX, |rx| {
+            std::os::windows::io::AsRawSocket::as_raw_socket(&*rx) as usize
+        })
+    })
+}
+
+/// `void gk_sender_free(gk_sender *tx);` (closes the sending side; NULL ok)
+///
+/// # Safety
+/// `tx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_free(tx: *mut GkSender) {
+    if !tx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(tx) }));
+    }
+}
+
+/// `void gk_receiver_free(gk_receiver *rx);` (closes the receiving side; NULL ok)
+///
+/// # Safety
+/// `rx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_free(rx: *mut GkReceiver) {
+    if !rx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(rx) }));
+    }
+}
+
+/// `void gk_sender_detach(gk_sender *tx);` (frees without closing; after `fork`)
+///
+/// # Safety
+/// `tx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_detach(tx: *mut GkSender) {
+    if !tx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || unsafe { Box::from_raw(tx) }.detach());
+    }
+}
+
+/// `void gk_receiver_detach(gk_receiver *rx);` (frees without closing; after `fork`)
+///
+/// # Safety
+/// `rx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_detach(rx: *mut GkReceiver) {
+    if !rx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || unsafe { Box::from_raw(rx) }.detach());
+    }
+}
+
+/// `int gk_process_send_sender(gk_process *p, gk_sender *tx);`
+///
+/// # Safety
+/// Both must be live handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_sender(p: *mut GkProcess, tx: *mut GkSender) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let Some(tx) = (unsafe { tx.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(p, -1, |p| match p.send(tx) {
+            Ok(()) => 0,
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `int gk_process_send_receiver(gk_process *p, gk_receiver *rx);`
+///
+/// # Safety
+/// Both must be live handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_receiver(p: *mut GkProcess, rx: *mut GkReceiver) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let Some(rx) = (unsafe { rx.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(p, -1, |p| match p.send(rx) {
+            Ok(()) => 0,
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `gk_sender *gk_process_recv_sender(gk_process *p);`
+///
+/// # Safety
+/// `p` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_sender(p: *mut GkProcess) -> *mut GkSender {
+    guard(core::ptr::null_mut(), || {
+        with(p, core::ptr::null_mut(), |p| boxed(p.recv_as::<GkSender>()))
+    })
+}
+
+/// `gk_receiver *gk_process_recv_receiver(gk_process *p);`
+///
+/// # Safety
+/// `p` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_receiver(p: *mut GkProcess) -> *mut GkReceiver {
+    guard(core::ptr::null_mut(), || {
+        with(p, core::ptr::null_mut(), |p| {
+            boxed(p.recv_as::<GkReceiver>())
+        })
+    })
+}
+
 #[cfg(windows)]
 unsafe extern "C" {
     fn _dup(fd: c_int) -> c_int;

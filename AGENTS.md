@@ -240,6 +240,37 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 
+## 6a. Message channels (`GkChannel`)
+
+- `let (mut tx, mut rx) = GkChannel::new()?;` (16 MiB ring, 1 MiB max
+  message) or `GkChannel::with_options(ChannelOptions { capacity, max_message })`
+  (capacity a power of two >= 64, `max_message <= capacity / 2 - 8`).
+- One sender, one receiver; the ends are not `Clone`. Messages keep their
+  boundaries, may be empty, arrive in order.
+- `tx.send(&[u8])`, `tx.reserve(len)?` + write + `slot.commit(n)` (in place);
+  `rx.recv(&mut buf)` (`InvalidInput` if `buf` is too small, the message
+  stays queued; `rx.next_len()` peeks), `rx.recv_vec(&mut vec)`,
+  `rx.recv_with(|msg| ...)` (in place).
+- Errors: `WouldBlock` (non-blocking, empty/full), `BrokenPipe` (other end
+  dropped or its process died; the receiver gets it after draining),
+  `InvalidInput` (sizes), `PermissionDenied` (end owned by another process).
+- Polling: register the end itself (mio `Source`, `AsFd`/`AsSocket`, tokio
+  `AsyncFd` on unix) for READABLE; drain until `WouldBlock`, then wait.
+- Across processes: `GkProcess::send(&end)` + `recv_as::<GkReceiver>()` /
+  `recv_as::<GkSender>()` (all OS); unix also `end.send_to(&stream)` /
+  `GkReceiver::recv_from(&stream)`. The sending process's copy is detached
+  (unusable, and dropping it does not close the channel). After `fork()`: the
+  process that keeps an end calls `claim()`; the other calls `detach()` on
+  its copy (dropping the owner's copy would close the channel).
+- Channel ends are not shared with `export_inheritable`/`import`; use
+  `GkProcess::spawn` for children.
+- C: `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
+  `gk_receiver_next_len`, `gk_*_set_nonblocking`, `gk_*_claim`,
+  `gk_*_detach`, `gk_*_free`, `gk_sender_fd`/`gk_receiver_fd` (unix),
+  `gk_*_socket` (Windows), `gk_process_send_sender`/`_receiver`,
+  `gk_process_recv_sender`/`_receiver`; errno `EAGAIN`, `EPIPE`, `EMSGSIZE`,
+  `EACCES`. See `examples/c/channel.c`.
+
 ## 7. Per-platform checklists
 
 **Linux / Android / FreeBSD 13+ / NetBSD 10+ / illumos (native)**
@@ -302,6 +333,9 @@ docker run --rm -v "$(pwd)":/w -w /w -v cargo-cache:/usr/local/cargo/registry \
   compares it against the kernel eventfd with random operation sequences.
   Run this after any change to `src/sys/shm.rs` (shared by the unix and
   Windows shims) or `src/sys/unix_shim.rs`.
+- Channel ring logic under Miri (nightly):
+  `cargo +nightly miri test --lib channel::ring_tests`.
+- Channel benchmark: `cargo run --release --example channel_bench`.
 - Windows tests only run on a Windows machine:
   `cargo test --features mio,ffi`. `tests/windows_share.rs` and the
   sharing tests in `src/sys/windows.rs` re-run the test binary as a child

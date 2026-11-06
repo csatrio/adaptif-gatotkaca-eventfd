@@ -283,6 +283,81 @@ without closing anything. In C: `gk_eventfd_export_inheritable`,
 `gk_eventfd_recv` (unix) and `gk_eventfd_export_to` (Windows); see the
 header.
 
+## Message channels: `GkChannel`
+
+A one-way, one-sender/one-receiver message channel between threads or
+processes, through shared memory, with two eventfds as doorbells. Messages
+keep their boundaries (any length up to the maximum, including zero) and
+arrive in order. While both sides are busy, a message costs a few atomic
+operations and one copy, with no system call; a blocking call spins for a
+few microseconds before sleeping, so quick replies cost none either.
+
+```rust,no_run
+use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel, GkProcess, GkReceiver};
+use std::process::Command;
+
+fn main() -> std::io::Result<()> {
+    // Default: 16 MiB ring, 1 MiB maximum message (both configurable).
+    let (mut tx, rx) = GkChannel::with_options(ChannelOptions::default())?;
+
+    // Hand the receiving end to a child process...
+    let (mut child, mut worker) = GkProcess::spawn(&mut Command::new("./worker"))?;
+    worker.send(&rx)?;
+    drop(rx); // our copy now belongs to the child: dropping it doesn't close
+
+    // ...and stream messages to it.
+    tx.send(b"job 1")?;
+    let mut slot = tx.reserve(1024)?; // or write in place, without a copy
+    slot[..5].copy_from_slice(b"job 2");
+    slot.commit(5);
+    drop(tx); // the worker gets BrokenPipe after the last message
+    child.wait()?;
+    Ok(())
+}
+
+// In ./worker:
+fn worker() -> std::io::Result<()> {
+    let mut rx: GkReceiver = GkProcess::from_parent()?.recv_as()?;
+    let mut buf = Vec::new();
+    while let Ok(n) = rx.recv_vec(&mut buf) {
+        println!("got {n} bytes");
+    }
+    Ok(())
+}
+```
+
+- `send` / `recv` block by default; `set_nonblocking(true)` makes them fail
+  with `WouldBlock`. `recv_with(|msg| ...)` reads a message in place.
+- Polling: a `GkReceiver` is readable (`AsFd`/`AsSocket`, mio, tokio's
+  `AsyncFd` on unix) when a message may be waiting, a `GkSender` when space
+  may have been freed. Read/write until `WouldBlock`, then wait for the next
+  event.
+- Closing: dropping one end makes the other side fail with `BrokenPipe` (the
+  receiver after draining). A peer *process* that dies is detected by
+  blocking calls within about a quarter second.
+- Sharing: `GkProcess::send(&end)` / `recv_as::<GkSender>()` /
+  `recv_as::<GkReceiver>()` on every OS, `send_to`/`recv_from` over a
+  `UnixStream` on unix, and `fork()` (the process that keeps an end calls
+  `claim()`, the other `detach()`es its copy).
+- Memory: the ring is `capacity` bytes of shared memory; on unix it is only
+  allocated as it is first written, on Windows it counts against the commit
+  limit from the start.
+- C: `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
+  `gk_process_send_receiver`, ... (see the header and
+  [`examples/c/channel.c`](examples/c/channel.c)).
+
+Rough numbers between two threads (`cargo run --release --example
+channel_bench`), messages per second, macOS on Apple Silicon:
+
+| message | `GkChannel` | pipe | unix socket |
+|---|---|---|---|
+| 64 B | ~14.6 M | ~1.2 M | ~0.9 M |
+| 1 KiB | ~15.9 M | ~1.0 M | ~0.8 M |
+| 64 KiB | ~0.49 M | ~0.14 M | ~0.04 M |
+
+Ping-pong round trip: ~0.24 µs for `GkChannel` against ~3.5 µs for a unix
+socket. Your numbers will differ; run the benchmark on your machine.
+
 ## C usage
 
 Build with the `ffi` feature to export a C ABI that matches

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Planned as 0.2.0.
+
+### Added
+
+- `GkChannel` (module `channel`): a one-way message channel between threads
+  or processes through shared memory, with `GkSender` / `GkReceiver` ends,
+  `ChannelOptions` (default 16 MiB ring, 1 MiB maximum message), zero-length
+  messages, in-place `reserve`/`commit` (`SendSlot`) and `recv_with`,
+  blocking and non-blocking modes, polling (`AsFd`/`AsSocket`, mio), closing
+  with `BrokenPipe`, dead-peer detection, and ownership across `fork`
+  (`claim`, `detach`). A lock-free single-producer/single-consumer ring with
+  this crate's eventfds as doorbells; blocking calls spin briefly before
+  sleeping.
+- `GkProcess::send` takes any `Shareable` object (`GkEventFd`, `GkSender`,
+  `GkReceiver`), and `GkProcess::recv_as::<T>()` receives one; `recv()`
+  still returns a `GkEventFd`. Unix: `GkSender`/`GkReceiver::send_to` /
+  `recv_from` over a `UnixStream`.
+- C: `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
+  `gk_receiver_next_len`, `gk_sender_/gk_receiver_set_nonblocking`,
+  `_claim`, `_detach`, `_free`, `gk_sender_fd`/`gk_receiver_fd` (unix),
+  `gk_sender_socket`/`gk_receiver_socket` (Windows),
+  `gk_process_send_sender`/`_receiver`, `gk_process_recv_sender`/`_receiver`.
+  Example: `examples/c/channel.c`.
+- `examples/channel_bench.rs`: channel against a pipe and a unix socket.
+
 ## [0.1.0] - 2026-11-06
 
 First release.
