@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["eventfd", "event", "notify", "mio", "cross-platform"]
 categories = ["os", "asynchronous", "concurrency", "api-bindings"]
-include = ["build.rs", "src/**", "include/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-*"]
+include = ["build.rs", "src/**", "include/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "AGENTS.md", "CHANGELOG.md", "LICENSE-*"]
 
 [lib]
 name = "adaptif_gatotkaca_eventfd"
