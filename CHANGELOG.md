@@ -32,6 +32,14 @@ Planned as 0.2.0.
   Example: `examples/c/channel.c`.
 - `examples/channel_bench.rs`: channel against a pipe and a unix socket.
 
+### Fixed
+
+- Windows: `GkProcess::recv_as::<GkSender>` / `<GkReceiver>` failed with
+  "eventfd message too long". A channel end's offer is about 5 KB (two
+  eventfds, each with two socket protocol infos, plus a section handle), over
+  the pipe transport's 4096-byte receive cap. The cap is now 16 KiB, still a
+  bound on the allocation.
+
 ## [0.1.0] - 2026-11-06
 
 First release.

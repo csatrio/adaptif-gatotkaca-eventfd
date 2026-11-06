@@ -392,6 +392,11 @@ mod imp {
     use super::unique_name;
     use crate::compat::TOKEN_MAX;
     use std::fs::File;
+
+    /// Upper bound for one offer on the pipe. A single eventfd offer is under
+    /// `TOKEN_MAX`, but a channel end carries two eventfds plus a section
+    /// (about 5 KB), so allow a few of them.
+    const OFFER_MAX: usize = 4 * TOKEN_MAX;
     use std::io::{self, Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::Mutex;
@@ -620,7 +625,7 @@ mod imp {
             let mut len = [0u8; 4];
             pipe.read_exact(&mut len)?;
             let len = u32::from_le_bytes(len) as usize;
-            if len > TOKEN_MAX {
+            if len > OFFER_MAX {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "eventfd message too long",
