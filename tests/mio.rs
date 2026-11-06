@@ -127,6 +127,9 @@ fn clones_with_distinct_tokens_both_fire() {
         vec![Token(10), Token(20)]
     );
     assert_eq!(b.read().unwrap(), 1);
+    // Drain `a` to WouldBlock too: on Windows mio is re-armed only for the
+    // handle that performed the read (see `sys::windows` docs).
+    assert_eq!(a.read().unwrap_err().kind(), ErrorKind::WouldBlock);
 
     // Again, written through the other handle.
     b.write(2).unwrap();

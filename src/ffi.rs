@@ -100,6 +100,42 @@ unsafe extern "C" {
     fn _close(fd: c_int) -> c_int;
 }
 
+#[cfg(windows)]
+type InvalidParameterHandler =
+    Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, c_uint, usize)>;
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _set_thread_local_invalid_parameter_handler(
+        h: InvalidParameterHandler,
+    ) -> InvalidParameterHandler;
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn ignore_invalid_parameter(
+    _: *const u16,
+    _: *const u16,
+    _: *const u16,
+    _: c_uint,
+    _: usize,
+) {
+}
+
+/// Runs a CRT descriptor call with the invalid-parameter handler silenced.
+/// Without it the CRT aborts the process (`STATUS_STACK_BUFFER_OVERRUN`) on a
+/// bad descriptor such as `-1`, where POSIX returns `-1` with `EBADF`. The
+/// handler is thread-local and restored afterwards; the cost is two TLS stores.
+#[cfg(windows)]
+fn crt_call<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: installs/restores a thread-local handler; no pointers involved.
+    let prev =
+        unsafe { _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter)) };
+    let r = f();
+    // SAFETY: as above.
+    unsafe { _set_thread_local_invalid_parameter_handler(prev) };
+    r
+}
+
 /// The CRT takes an `unsigned int` count but returns an `int`; larger counts
 /// are clamped (a short read/write, which callers must handle anyway).
 #[cfg(windows)]
@@ -128,7 +164,7 @@ pub unsafe extern "C" fn gk_read(fd: c_int, buf: *mut c_void, count: usize) -> S
         #[cfg(unix)]
         return unsafe { libc::read(fd, buf, count) };
         #[cfg(windows)]
-        return unsafe { _read(fd, buf, crt_count(count)) };
+        return crt_call(|| unsafe { _read(fd, buf, crt_count(count)) });
     })
 }
 
@@ -153,7 +189,7 @@ pub unsafe extern "C" fn gk_write(fd: c_int, buf: *const c_void, count: usize) -
         #[cfg(unix)]
         return unsafe { libc::write(fd, buf, count) };
         #[cfg(windows)]
-        return unsafe { _write(fd, buf, crt_count(count)) };
+        return crt_call(|| unsafe { _write(fd, buf, crt_count(count)) });
     })
 }
 
@@ -174,7 +210,7 @@ pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
         #[cfg(unix)]
         return unsafe { libc::close(fd) };
         #[cfg(windows)]
-        return unsafe { _close(fd) };
+        return crt_call(|| unsafe { _close(fd) });
     })
 }
 
@@ -259,7 +295,7 @@ pub extern "C" fn gk_dup(fd: c_int) -> c_int {
         return unsafe { libc::dup(fd) };
         // SAFETY: as above.
         #[cfg(windows)]
-        return unsafe { _dup(fd) };
+        return crt_call(|| unsafe { _dup(fd) });
     })
 }
 
@@ -291,7 +327,7 @@ pub unsafe extern "C" fn gk_dup2(oldfd: c_int, newfd: c_int) -> c_int {
         let r = unsafe { libc::dup2(oldfd, newfd) };
         // SAFETY: as above.
         #[cfg(windows)]
-        let r = unsafe { _dup2(oldfd, newfd) };
+        let r = crt_call(|| unsafe { _dup2(oldfd, newfd) });
         if r >= 0 && oldfd != newfd {
             compat::forget(newfd);
         }

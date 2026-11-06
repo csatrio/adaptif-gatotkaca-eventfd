@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: `gk_read`, `gk_write`, `gk_close`, `gk_dup` and `gk_dup2` no longer
+  abort the process (`STATUS_STACK_BUFFER_OVERRUN`) when forwarding an invalid
+  descriptor such as `-1` to the CRT. The forwarded call now runs with a
+  thread-local no-op invalid-parameter handler (restored afterwards), so it
+  returns `-1` with `errno` set, as on POSIX. Eventfd fast paths are unaffected.
+- Windows tests: `recovers_when_child_is_killed_holding_the_lock` never saw the
+  child's `locked` line because libtest prefixes it under `--nocapture`; it now
+  matches the end of the line.
+- Windows tests: `clones_with_distinct_tokens_both_fire` drained through one
+  clone and expected another clone's mio registration to re-arm. It now drains
+  the registered clone to `WouldBlock`, matching the documented Windows mio
+  limitation.
+
 ## [0.1.0] - Unreleased
 
 ### Added

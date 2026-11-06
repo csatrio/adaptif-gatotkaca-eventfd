@@ -1120,7 +1120,8 @@ mod tests {
         loop {
             line.clear();
             assert!(out.read_line(&mut line).unwrap() > 0, "child exited early");
-            if line.trim() == "locked" {
+            // libtest prefixes `test <name> ... ` to the child's first line.
+            if line.trim_end().ends_with("locked") {
                 break;
             }
         }
