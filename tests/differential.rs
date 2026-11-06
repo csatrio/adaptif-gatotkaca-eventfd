@@ -3,7 +3,12 @@
 //!
 //! Random operation sequences run against both a [`GkEventFd`] and a raw
 //! `libc::eventfd`. After every operation the results (values and errno) and
-//! the `POLLIN` readiness of both descriptors must be identical.
+//! the `POLLIN` readiness of every descriptor must be identical.
+//!
+//! Sequences also duplicate and close descriptors: `try_clone` against
+//! `dup(2)` for `GkEventFd`, and the `compat` C-style API (`eventfd_dup`,
+//! `eventfd_dup2`, raw `dup(2)` adoption, `eventfd_close`) against the same
+//! calls on the kernel eventfd.
 //!
 //! Run with: `cargo test --features force-shim --test differential`
 //! (`PROPTEST_CASES=N` raises the number of cases.)
@@ -11,9 +16,9 @@
 #![cfg(all(target_os = "linux", feature = "force-shim"))]
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-use adaptif_gatotkaca_eventfd::{EFD_MAX, EfdFlags, GkEventFd};
+use adaptif_gatotkaca_eventfd::{EFD_MAX, EfdFlags, GkEventFd, compat};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -26,6 +31,17 @@ enum Op {
     WriteBuf(u64, usize),
     /// `io::Read` with a buffer of `len` bytes.
     ReadBuf(usize),
+}
+
+/// A step of a sequence: an I/O op on handle `index % handles`, or a change
+/// to the set of handles.
+#[derive(Debug, Clone)]
+enum Step {
+    Io(usize, Op),
+    /// Duplicate handle `index % handles`.
+    Dup(usize),
+    /// Close handle `index % handles` (skipped if it is the last one).
+    Close(usize),
 }
 
 /// Result of one op: the value read (0 for writes) or the errno.
@@ -151,37 +167,207 @@ fn initval() -> impl Strategy<Value = u32> {
     prop_oneof![Just(0u32), Just(1u32), Just(u32::MAX), any::<u32>()]
 }
 
-fn run(initval: u32, semaphore: bool, ops: &[Op]) -> Result<(), TestCaseError> {
-    let mut flags = EfdFlags::NONBLOCK;
+fn flags(semaphore: bool) -> EfdFlags {
     if semaphore {
-        flags |= EfdFlags::SEMAPHORE;
+        EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE
+    } else {
+        EfdFlags::NONBLOCK
     }
-    let shim = GkEventFd::new(initval, flags).unwrap();
-    let kernel = kernel_eventfd(initval, semaphore);
-    let kfd = kernel.as_raw_fd();
+}
 
-    prop_assert_eq!(
-        pollin(shim.as_raw_fd()),
-        pollin(kfd),
-        "readiness after create"
-    );
-    for (i, op) in ops.iter().enumerate() {
-        let s = shim_op(&shim, op);
-        let k = kernel_op(kfd, op);
-        prop_assert_eq!(s, k, "op #{} {:?}: shim vs kernel", i, op);
-        prop_assert_eq!(
-            pollin(shim.as_raw_fd()),
-            pollin(kfd),
-            "readiness after op #{} {:?}",
-            i,
-            op
-        );
+fn run(initval: u32, semaphore: bool, ops: &[Op]) -> Result<(), TestCaseError> {
+    let steps: Vec<Step> = ops.iter().cloned().map(|op| Step::Io(0, op)).collect();
+    run_steps(initval, semaphore, &steps)
+}
+
+/// `GkEventFd` handles (`try_clone`) against kernel descriptors (`dup`).
+fn run_steps(initval: u32, semaphore: bool, steps: &[Step]) -> Result<(), TestCaseError> {
+    let mut shim = vec![GkEventFd::new(initval, flags(semaphore)).unwrap()];
+    let mut kernel = vec![kernel_eventfd(initval, semaphore)];
+
+    let check_ready = |shim: &[GkEventFd], kernel: &[OwnedFd], what: &str| {
+        for (i, (s, k)) in shim.iter().zip(kernel).enumerate() {
+            prop_assert_eq!(
+                pollin(s.as_raw_fd()),
+                pollin(k.as_raw_fd()),
+                "readiness of handle {} after {}",
+                i,
+                what
+            );
+        }
+        Ok(())
+    };
+    check_ready(&shim, &kernel, "create")?;
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            Step::Io(h, op) => {
+                let h = h % shim.len();
+                let s = shim_op(&shim[h], op);
+                let k = kernel_op(kernel[h].as_raw_fd(), op);
+                prop_assert_eq!(s, k, "step #{} {:?}: shim vs kernel", i, step);
+            }
+            Step::Dup(h) => {
+                let h = h % shim.len();
+                shim.push(shim[h].try_clone().unwrap());
+                kernel.push(kernel[h].try_clone().unwrap());
+            }
+            Step::Close(h) => {
+                if shim.len() > 1 {
+                    let h = h % shim.len();
+                    drop(shim.remove(h));
+                    drop(kernel.remove(h));
+                }
+            }
+        }
+        check_ready(&shim, &kernel, &format!("step #{i} {step:?}"))?;
     }
     // Final state: drain both and compare what is left.
-    let s = shim_op(&shim, &Op::Read);
-    let k = kernel_op(kfd, &Op::Read);
+    let s = shim_op(&shim[0], &Op::Read);
+    let k = kernel_op(kernel[0].as_raw_fd(), &Op::Read);
     prop_assert_eq!(s, k, "final read");
     Ok(())
+}
+
+/// Steps of the compat (C-style) differential.
+#[derive(Debug, Clone)]
+enum CStep {
+    Write(usize, u64),
+    Read(usize),
+    /// `eventfd_dup` vs `dup(2)`.
+    Dup(usize),
+    /// Raw `dup(2)` on both, then a no-op write through the copy: the shim
+    /// adopts a raw dup the first time it is passed to compat (a raw dup that
+    /// is never used before every known descriptor is closed is a documented
+    /// limitation, see `compat`).
+    RawDup(usize),
+    /// `eventfd_dup2(a, b)` vs `dup2(2)` between two live handles.
+    Dup2(usize, usize),
+    /// `eventfd_close` vs `close(2)` (skipped for the last handle).
+    Close(usize),
+}
+
+fn compat_read(fd: RawFd) -> Outcome {
+    let mut v = 0;
+    // SAFETY: `v` is a valid eventfd_t.
+    match unsafe { compat::eventfd_read(fd, &mut v) } {
+        0 => Ok(v),
+        _ => Err(last_errno()),
+    }
+}
+
+fn compat_write(fd: RawFd, v: u64) -> Outcome {
+    match compat::eventfd_write(fd, v) {
+        0 => Ok(0),
+        _ => Err(last_errno()),
+    }
+}
+
+/// The compat registry (shim) against raw syscalls on the kernel eventfd.
+/// Both sides use raw descriptor numbers that this function owns.
+fn run_compat(initval: u32, semaphore: bool, steps: &[CStep]) -> Result<(), TestCaseError> {
+    let bits = flags(semaphore).bits();
+    let first = compat::eventfd(initval, bits);
+    prop_assert!(first >= 0);
+    let mut shim = vec![first];
+    let mut kernel = vec![kernel_eventfd(initval, semaphore).into_raw_fd()];
+
+    let result = (|| {
+        for (i, step) in steps.iter().enumerate() {
+            let n = shim.len();
+            match *step {
+                CStep::Write(h, v) => {
+                    let (s, k) = (
+                        compat_write(shim[h % n], v),
+                        kernel_write(kernel[h % n], v, 8),
+                    );
+                    prop_assert_eq!(s, k, "step #{} {:?}", i, step);
+                }
+                CStep::Read(h) => {
+                    let (s, k) = (compat_read(shim[h % n]), kernel_read(kernel[h % n], 8));
+                    prop_assert_eq!(s, k, "step #{} {:?}", i, step);
+                }
+                CStep::Dup(h) => {
+                    let s = compat::eventfd_dup(shim[h % n]);
+                    // SAFETY: plain dup of a descriptor we own.
+                    let k = unsafe { libc::dup(kernel[h % n]) };
+                    prop_assert!(s >= 0 && k >= 0, "step #{} {:?}", i, step);
+                    shim.push(s);
+                    kernel.push(k);
+                }
+                CStep::RawDup(h) => {
+                    // SAFETY: plain dups of descriptors we own.
+                    let (s, k) = unsafe { (libc::dup(shim[h % n]), libc::dup(kernel[h % n])) };
+                    prop_assert!(s >= 0 && k >= 0, "step #{} {:?}", i, step);
+                    let (ws, wk) = (compat_write(s, 0), kernel_write(k, 0, 8));
+                    prop_assert_eq!(ws, wk, "first use of raw dup, step #{} {:?}", i, step);
+                    shim.push(s);
+                    kernel.push(k);
+                }
+                CStep::Dup2(a, b) => {
+                    let (a, b) = (a % n, b % n);
+                    // SAFETY: both targets are descriptors we own.
+                    let (s, k) = unsafe {
+                        (
+                            compat::eventfd_dup2(shim[a], shim[b]),
+                            libc::dup2(kernel[a], kernel[b]),
+                        )
+                    };
+                    prop_assert_eq!(s, shim[b], "step #{} {:?}", i, step);
+                    prop_assert_eq!(k, kernel[b], "step #{} {:?}", i, step);
+                }
+                CStep::Close(h) => {
+                    if n > 1 {
+                        let h = h % n;
+                        prop_assert_eq!(compat::eventfd_close(shim.remove(h)), 0);
+                        // SAFETY: we own it.
+                        prop_assert_eq!(unsafe { libc::close(kernel.remove(h)) }, 0);
+                    }
+                }
+            }
+            for (j, (&s, &k)) in shim.iter().zip(&kernel).enumerate() {
+                prop_assert_eq!(
+                    pollin(s),
+                    pollin(k),
+                    "readiness of {} after step #{} {:?}",
+                    j,
+                    i,
+                    step
+                );
+            }
+        }
+        // Every handle must still see the same final counter.
+        let (s, k) = (compat_read(shim[0]), kernel_read(kernel[0], 8));
+        prop_assert_eq!(s, k, "final read");
+        Ok(())
+    })();
+
+    for fd in shim {
+        compat::eventfd_close(fd);
+    }
+    for fd in kernel {
+        // SAFETY: we own it.
+        unsafe { libc::close(fd) };
+    }
+    result
+}
+
+fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        12 => (0usize..8, op()).prop_map(|(h, op)| Step::Io(h, op)),
+        2 => (0usize..8).prop_map(Step::Dup),
+        1 => (0usize..8).prop_map(Step::Close),
+    ]
+}
+
+fn cstep() -> impl Strategy<Value = CStep> {
+    prop_oneof![
+        5 => (0usize..8, value()).prop_map(|(h, v)| CStep::Write(h, v)),
+        5 => (0usize..8).prop_map(CStep::Read),
+        1 => (0usize..8).prop_map(CStep::Dup),
+        1 => (0usize..8).prop_map(CStep::RawDup),
+        1 => (0usize..8, 0usize..8).prop_map(|(a, b)| CStep::Dup2(a, b)),
+        1 => (0usize..8).prop_map(CStep::Close),
+    ]
 }
 
 proptest! {
@@ -198,6 +384,32 @@ proptest! {
     ) {
         run(initval, semaphore, &ops)?;
     }
+
+    #[test]
+    fn shim_handles_match_kernel_dups(
+        initval in initval(),
+        semaphore in any::<bool>(),
+        steps in prop::collection::vec(step(), 0..64),
+    ) {
+        run_steps(initval, semaphore, &steps)?;
+    }
+
+    #[test]
+    fn compat_dups_match_kernel(
+        initval in initval(),
+        semaphore in any::<bool>(),
+        steps in prop::collection::vec(cstep(), 0..48),
+    ) {
+        // The compat registry is process-wide; keep its cases sequential.
+        let _g = compat_lock();
+        run_compat(initval, semaphore, &steps)?;
+    }
+}
+
+/// Serialises the compat cases (proptest may run tests on several threads).
+fn compat_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Hand-picked edge cases that random generation may hit only rarely.

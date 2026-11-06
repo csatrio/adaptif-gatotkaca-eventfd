@@ -107,6 +107,12 @@ impl GkEventFd {
     pub fn is_nonblocking(&self) -> io::Result<bool> {
         self.inner.is_nonblocking()
     }
+
+    /// Splits the handle into its counter and descriptor (compat registry).
+    #[cfg(all(unix, not(gk_native)))]
+    pub(crate) fn into_core(self) -> (sys::Core, std::os::fd::OwnedFd) {
+        self.inner.into_core()
+    }
 }
 
 impl fmt::Debug for GkEventFd {

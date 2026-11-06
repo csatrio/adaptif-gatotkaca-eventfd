@@ -28,7 +28,8 @@
 //! * The counter lives in this process's memory: after `fork(2)` the child
 //!   gets the descriptor but not a shared counter.
 //! * A plain `dup(2)` of the descriptor shares readiness (same pipe), but
-//!   it is not a new eventfd handle; use `try_clone` to get one.
+//!   it is not a new eventfd handle; use `try_clone` to get one. (The compat
+//!   / C layer recognises such dups by their pipe identity, see [`pipe_id`].)
 //! * Only read readiness (`POLLIN`, `EVFILT_READ`) is meaningful.
 //!   Write readiness (`POLLOUT`) is not reported, as it is for a Linux eventfd
 //!   whose counter is below `EFD_MAX`. Writes that would block are rare and
@@ -251,6 +252,68 @@ impl Inner {
 impl AsFd for Inner {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+}
+
+/// Identity of the pipe behind a descriptor (`st_dev`, `st_ino`). Every `dup`
+/// of an eventfd's descriptor (raw or not) has the identity of its pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PipeId {
+    dev: u64,
+    ino: u64,
+}
+
+/// Hashes to a single `u64` so it can key a `nohash_hasher` map (which
+/// accepts exactly one integer write). Equality still compares both fields.
+impl std::hash::Hash for PipeId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.ino ^ self.dev.rotate_left(32));
+    }
+}
+
+impl nohash_hasher::IsEnabled for PipeId {}
+
+/// The pipe identity of `fd`, or `None` if `fd` is not an open FIFO.
+pub(crate) fn pipe_id(fd: RawFd) -> Option<PipeId> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes a `stat` through a valid pointer; any fd value is
+    // allowed (invalid ones fail with EBADF).
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat succeeded, so `st` is initialised.
+    let st = unsafe { st.assume_init() };
+    #[allow(clippy::unnecessary_cast)] // field types differ between OSes
+    ((st.st_mode & libc::S_IFMT) == libc::S_IFIFO).then_some(PipeId {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+    })
+}
+
+/// A counter handle without a descriptor of its own, for the compat registry,
+/// which owns the descriptor numbers itself (so `dup2` can replace them).
+#[derive(Debug, Clone)]
+pub(crate) struct Core(Arc<Shared>);
+
+impl Core {
+    pub(crate) fn read(&self) -> io::Result<u64> {
+        self.0.counter.read(&*self.0)
+    }
+
+    pub(crate) fn write(&self, value: u64) -> io::Result<()> {
+        self.0.counter.write(value, &*self.0)
+    }
+
+    /// Identity of this eventfd's pipe (see [`pipe_id`]).
+    pub(crate) fn pipe_id(&self) -> Option<PipeId> {
+        pipe_id(self.0.pipe_r.as_raw_fd())
+    }
+}
+
+impl Inner {
+    /// Splits the handle into its counter and its descriptor.
+    pub(crate) fn into_core(self) -> (Core, OwnedFd) {
+        (Core(self.shared), self.fd)
     }
 }
 

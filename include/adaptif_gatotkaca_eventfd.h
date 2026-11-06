@@ -13,8 +13,12 @@
  *     internal pipe,
  *     pollable with poll/select/kqueue. Raw read/write/close on it do NOT have
  *     eventfd semantics: use the gk_* functions, or GK_EVENTFD_WRAP_IO below.
+ *     Duplicate it with gk_dup/gk_dup2/gk_dup3; a raw dup()/fcntl(F_DUPFD)
+ *     copy is also recognised the first time it is passed to a gk_* function.
+ *     The eventfd lives until every descriptor known to the crate is closed.
  *   - Windows: the descriptor is a synthetic int >= 65536 (never a CRT fd).
- *     Use gk_eventfd_socket() to get a SOCKET for WSAPoll/select.
+ *     Use gk_eventfd_socket() to get a SOCKET for WSAPoll/select. gk_dup
+ *     returns another synthetic number; gk_dup2 only accepts targets >= 65536.
  *
  * Every function returns -1 and sets errno on failure.
  *
@@ -29,10 +33,13 @@
  *
  *   GK_EVENTFD_WRAP_IO
  *       On non-native platforms, redirect raw I/O so Linux code that does
- *       read(efd, &v, 8) / write(efd, &v, 8) / close(efd) works unchanged:
- *         unix:    read, write, close           -> gk_read, gk_write, gk_close
- *         Windows: _read, _write, _close and the
- *                  POSIX aliases read, write, close -> gk_read, gk_write, gk_close
+ *       read(efd, &v, 8) / write(efd, &v, 8) / close(efd) / dup(efd) works
+ *       unchanged:
+ *         unix:    read, write, close, dup, dup2, dup3
+ *                    -> gk_read, gk_write, gk_close, gk_dup, gk_dup2, gk_dup3
+ *         Windows: _read, _write, _close, _dup, _dup2 and the POSIX aliases
+ *                  read, write, close, dup, dup2
+ *                    -> gk_read, gk_write, gk_close, gk_dup, gk_dup2
  *       gk_* give eventfd semantics to descriptors from gk_eventfd and
  *       forward every other descriptor to the real function. No-op on native
  *       platforms. Limitations: these are function-like macros, so they only
@@ -203,6 +210,32 @@ gk_ssize_t gk_write(int fd, const void *buf, size_t count);
  */
 int gk_close(int fd);
 
+/*
+ * dup(2) for any descriptor: an eventfd gets a new descriptor on the same
+ * counter (lowest free number on unix, close-on-exec cleared; a new
+ * synthetic number on Windows); every other descriptor is forwarded to the
+ * real dup() (CRT _dup() on Windows). Close every copy separately.
+ */
+int gk_dup(int fd);
+
+/*
+ * dup2(2) for any descriptor. If oldfd is an eventfd, newfd becomes another
+ * descriptor of it (whatever newfd was is closed first, atomically on unix;
+ * on Windows newfd must be >= 65536, else EBADF). Otherwise forwarded to the
+ * real dup2() (CRT _dup2()). Returns newfd on unix and 0 on Windows (as
+ * dup2/_dup2 do there), or -1 with errno.
+ */
+int gk_dup2(int oldfd, int newfd);
+
+#ifndef _WIN32
+/*
+ * dup3(2) for any descriptor (unix only): like gk_dup2 but flags is 0 or
+ * O_CLOEXEC and oldfd == newfd fails with EINVAL. Works on macOS too, which
+ * has no dup3 (close-on-exec is then set right after the dup2).
+ */
+int gk_dup3(int oldfd, int newfd, int flags);
+#endif
+
 #ifdef _WIN32
 /* Returned by gk_eventfd_socket() on error; equal to INVALID_SOCKET. */
 #define GK_EVENTFD_INVALID_SOCKET (~(uintptr_t)0)
@@ -250,6 +283,14 @@ GK_EVENTFD_INLINE int eventfd_write(int fd, eventfd_t value) {
 #define read(fd, buf, count) gk_read((fd), (buf), (count))
 #define write(fd, buf, count) gk_write((fd), (buf), (count))
 #define close(fd) gk_close(fd)
+#undef dup
+#undef dup2
+#define dup(fd) gk_dup(fd)
+#define dup2(oldfd, newfd) gk_dup2((oldfd), (newfd))
+#ifndef _WIN32
+#undef dup3
+#define dup3(oldfd, newfd, flags) gk_dup3((oldfd), (newfd), (flags))
+#endif
 #ifdef _WIN32
 #undef _read
 #undef _write
@@ -257,6 +298,10 @@ GK_EVENTFD_INLINE int eventfd_write(int fd, eventfd_t value) {
 #define _read(fd, buf, count) gk_read((fd), (buf), (count))
 #define _write(fd, buf, count) gk_write((fd), (buf), (count))
 #define _close(fd) gk_close(fd)
+#undef _dup
+#undef _dup2
+#define _dup(fd) gk_dup(fd)
+#define _dup2(oldfd, newfd) gk_dup2((oldfd), (newfd))
 #endif
 #endif
 

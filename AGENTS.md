@@ -29,8 +29,9 @@ visible to your crate.
    `gk_*` functions. This is portable; raw syscalls are not.
 2. **Use the `EFD_*` constants or `EfdFlags`, never numbers.** Flag values
    differ per OS (FreeBSD's `EFD_NONBLOCK` is `0x4`, Linux's is `0o4000`).
-3. **Share with `Arc<GkEventFd>` or `try_clone()`.** Don't `dup()` the raw fd
-   on a shim: the dup is pollable but isn't known to the crate.
+3. **Share with `Arc<GkEventFd>` or `try_clone()`.** In C-style code duplicate
+   with `eventfd_dup`/`eventfd_dup2`/`eventfd_dup3` (`gk_dup*`). See section 5
+   for raw `dup()` on shims.
 4. **`fork()` does not share a shim counter** with the child. Use the native
    platforms, or another IPC mechanism, if you need a cross-process eventfd.
 5. **Close by dropping** the `GkEventFd` (or `eventfd_close`/`gk_eventfd_close`
@@ -137,7 +138,10 @@ native platforms**. Don't use them in portable code.
 
 `<sys/eventfd.h>`-style functions that return `-1` and set `errno`:
 `eventfd(initval, flags)`, `eventfd_read(fd, *mut eventfd_t)`,
-`eventfd_write(fd, value)`, `eventfd_close(fd)`. On native platforms they pass
+`eventfd_write(fd, value)`, `eventfd_close(fd)`, plus `eventfd_dup(fd)`,
+`eventfd_dup2(old, new)` and (unix) `eventfd_dup3(old, new, flags)`, which
+behave like `dup(2)`/`dup2(2)`/`dup3(2)` (new descriptor, same counter;
+`dup`/`dup2` clear close-on-exec). On native platforms they pass
 straight through to libc. On shims the returned `int` is a crate-managed
 descriptor (on Windows a synthetic number, not a SOCKET). Use them only when
 porting C-shaped code; prefer `GkEventFd` otherwise.
@@ -163,13 +167,24 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - Exported symbols are always `gk_`-prefixed (`gk_eventfd`,
   `gk_eventfd_read`, `gk_eventfd_write`, `gk_eventfd_close`, ...), so they
   never clash with libc.
-- **Raw `read`/`write`/`close` in ported Linux C code:** define
+- **Raw `read`/`write`/`close`/`dup` in ported Linux C code:** define
   `GK_EVENTFD_WRAP_IO` before including the header. On shim platforms
-  `read`, `write` and `close` (and `_read`/`_write`/`_close` on Windows) are
-  redirected to `gk_read`/`gk_write`/`gk_close`. Those apply eventfd rules to
-  crate eventfds and forward every other descriptor to the real function. On
-  native platforms the macro does nothing. It only affects code compiled with
-  the header, not prebuilt libraries.
+  `read`, `write`, `close`, `dup`, `dup2` and `dup3` (on Windows `_read`,
+  `_write`, `_close`, `_dup`, `_dup2` and their POSIX aliases; no `dup3`) are
+  redirected to `gk_read`/`gk_write`/`gk_close`/`gk_dup`/`gk_dup2`/`gk_dup3`.
+  Those apply eventfd rules to crate eventfds and forward every other
+  descriptor to the real function. On native platforms the macro does
+  nothing. It only affects code compiled with the header, not prebuilt
+  libraries.
+- **Duplicating from C:** `gk_dup`, `gk_dup2`, `gk_dup3` (unix) give a new
+  descriptor on the same counter; close each copy separately.
+  - macOS/BSD shim: a raw `dup()`/`fcntl(F_DUPFD)` copy is recognised by its
+    pipe the first time it reaches a `gk_*`/`compat` call. The eventfd ends
+    when every descriptor the crate knows is closed, so pass raw copies to
+    the crate (or use `gk_dup`) before closing the original.
+  - Windows: descriptors are synthetic numbers `>= 65536`. `gk_dup2` only
+    accepts targets in that range and returns `0` on success (like `_dup2`);
+    the CRT's own `_dup` cannot copy them.
 - **Polling from C:** on unix `poll()` the returned fd for `POLLIN`. On
   Windows get the socket with `gk_eventfd_socket(fd)` and use `WSAPoll`.
 - Close with `eventfd_close`/`gk_eventfd_close` (or `close` under

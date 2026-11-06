@@ -11,6 +11,9 @@
 //! | [`eventfd_close`] | `close(2)` on an eventfd |
 //! | [`eventfd_read_buf`] | `read(2)` on an eventfd |
 //! | [`eventfd_write_buf`] | `write(2)` on an eventfd |
+//! | [`eventfd_dup`] | `dup(2)` on an eventfd |
+//! | [`eventfd_dup2`] | `dup2(2)` on an eventfd |
+//! | `eventfd_dup3` (unix only) | `dup3(2)` on an eventfd |
 //! | `eventfd_socket` (Windows only) | — (the `SOCKET` to `WSAPoll`/`select` on) |
 //!
 //! # Backends
@@ -26,10 +29,15 @@
 //!   shim's pipe, a real descriptor that `poll`/`select`/`kqueue` report
 //!   readable exactly while the counter is non-zero. Read, write and close it
 //!   only through this module: raw `read(2)`/`write(2)` reach the signalling
-//!   pipe, not the counter, and a raw `close(2)` leaks the registry entry.
+//!   pipe, not the counter. Duplicate it with [`eventfd_dup`] and friends;
+//!   a raw `dup(2)`/`fcntl(F_DUPFD)` copy is also recognised (by the pipe's
+//!   identity) the first time it is passed to this module. The eventfd lives
+//!   until every descriptor known to this module is closed.
 //! * **Windows**: the returned `int` is a synthetic number `>= 65536`: never
 //!   a truncated `SOCKET`, and never a valid CRT descriptor. Use
-//!   `eventfd_socket` to get the pollable socket.
+//!   `eventfd_socket` to get the pollable socket. Dups get new synthetic
+//!   numbers and share the eventfd; `eventfd_dup2` only accepts targets
+//!   `>= 65536` (`EBADF` otherwise).
 //!
 //! Descriptors not created by [`eventfd`] fail with `EBADF` on the shim
 //! backends.
@@ -125,6 +133,42 @@ pub unsafe fn eventfd_write_buf(fd: c_int, buf: *const c_void, count: usize) -> 
     unsafe { imp::eventfd_write_buf(fd, buf, count) }
 }
 
+/// Duplicates an eventfd descriptor, like `dup(2)`: returns the lowest free
+/// descriptor (a new synthetic number on Windows) referring to the same
+/// counter, with close-on-exec cleared. Close each copy separately; the
+/// eventfd lives until all are closed. Returns `-1` with `errno` (`EBADF`
+/// for an unknown descriptor on the shim backends, `EMFILE`).
+pub fn eventfd_dup(fd: c_int) -> c_int {
+    imp::eventfd_dup(fd)
+}
+
+/// Makes `newfd` refer to the same eventfd as `oldfd`, like `dup2(2)`:
+/// if `newfd` was open it is closed first (atomically). If
+/// `oldfd == newfd` it just returns `newfd`. Returns `newfd` or `-1` with
+/// `errno` (`EBADF` for an unknown `oldfd` or a negative `newfd`; on Windows
+/// also for `newfd < 65536`, which belong to the CRT).
+///
+/// # Safety
+///
+/// Like `dup2(2)`, this closes whatever `newfd` was: it must not be a
+/// descriptor owned by someone else (for example a Rust `OwnedFd`).
+pub unsafe fn eventfd_dup2(oldfd: c_int, newfd: c_int) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_dup2(oldfd, newfd) }
+}
+
+/// Like [`eventfd_dup2`] but, as `dup3(2)`, `flags` may only be `0` or
+/// `O_CLOEXEC`, and `oldfd == newfd` fails with `EINVAL`. Unix only.
+///
+/// # Safety
+///
+/// As for [`eventfd_dup2`].
+#[cfg(unix)]
+pub unsafe fn eventfd_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_dup3(oldfd, newfd, flags) }
+}
+
 /// Returns the `SOCKET` of an eventfd, for `WSAPoll`/`select`/IOCP readiness.
 /// It is readable exactly while the counter is non-zero.
 ///
@@ -146,11 +190,58 @@ unsafe extern "C" {
     fn _errno() -> *mut c_int;
 }
 
-/// True if `fd` was returned by [`eventfd`] and not closed yet, on the shim
-/// backends. Always false on native platforms, where there is no registry.
+/// True if `fd` refers to an eventfd of this module (including a raw dup of
+/// one) on the shim backends. Always false on native platforms, where there
+/// is no registry.
 #[cfg(feature = "ffi")]
-pub(crate) fn is_registered(fd: c_int) -> bool {
-    imp::is_registered(fd)
+pub(crate) fn is_eventfd(fd: c_int) -> bool {
+    imp::is_eventfd(fd)
+}
+
+/// Forgets `fd` without closing it, after a foreign `dup2` replaced it.
+#[cfg(feature = "ffi")]
+pub(crate) fn forget(fd: c_int) {
+    imp::forget(fd)
+}
+
+/// `dup3(2)` for any descriptor; emulated with `dup2` + `fcntl` where libc
+/// has no `dup3` (macOS, iOS, Android), so close-on-exec is not atomic there.
+#[cfg(unix)]
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+pub(crate) unsafe fn raw_dup3(old: c_int, new: c_int, flags: c_int) -> c_int {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    // SAFETY: forwarded to the caller.
+    return unsafe { libc::dup3(old, new, flags) };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    {
+        if flags & !libc::O_CLOEXEC != 0 || old == new {
+            set_errno(crate::error::errno::EINVAL);
+            return -1;
+        }
+        // SAFETY: forwarded to the caller.
+        let r = unsafe { libc::dup2(old, new) };
+        if r >= 0 && flags & libc::O_CLOEXEC != 0 {
+            // SAFETY: plain fcntl on the descriptor just created.
+            unsafe { libc::fcntl(new, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        r
+    }
 }
 
 /// Pointer to the calling thread's C `errno`.
@@ -209,8 +300,26 @@ mod imp {
     use core::ffi::{c_int, c_uint, c_void};
 
     #[cfg(feature = "ffi")]
-    pub(super) fn is_registered(_fd: c_int) -> bool {
+    pub(super) fn is_eventfd(_fd: c_int) -> bool {
         false
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(super) fn forget(_fd: c_int) {}
+
+    pub(super) fn eventfd_dup(fd: c_int) -> c_int {
+        // SAFETY: no pointers involved.
+        unsafe { libc::dup(fd) }
+    }
+
+    pub(super) unsafe fn eventfd_dup2(old: c_int, new: c_int) -> c_int {
+        // SAFETY: the caller owns `new` (see compat::eventfd_dup2).
+        unsafe { libc::dup2(old, new) }
+    }
+
+    pub(super) unsafe fn eventfd_dup3(old: c_int, new: c_int, flags: c_int) -> c_int {
+        // SAFETY: as above.
+        unsafe { super::raw_dup3(old, new, flags) }
     }
 
     pub(super) fn eventfd(initval: c_uint, flags: c_int) -> c_int {
@@ -261,52 +370,14 @@ mod imp {
     use crate::GkEventFd;
     use crate::error::{errno, to_errno};
     use core::ffi::{c_int, c_uint, c_void};
-    use std::collections::HashMap;
+    use nohash_hasher::IntMap;
     use std::io;
-    use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+    use std::sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
     #[cfg(unix)]
     const EFAULT: c_int = libc::EFAULT;
     #[cfg(windows)]
     const EFAULT: c_int = 14;
-
-    /// Live compat descriptors. Entries are `Arc`s so that a blocking read
-    /// or write runs on a clone, *without* holding the lock.
-    struct Registry {
-        map: HashMap<c_int, Arc<GkEventFd>>,
-        /// Next synthetic descriptor to try (Windows only).
-        #[cfg(windows)]
-        next: c_int,
-    }
-
-    /// First synthetic descriptor on Windows. The CRT allows at most 8192
-    /// descriptors, so numbers from here on never collide with CRT fds (which
-    /// lets `gk_read`/`gk_write`/`gk_close` tell the two apart).
-    #[cfg(windows)]
-    pub(super) const FIRST_SYNTHETIC_FD: c_int = 0x1_0000;
-
-    fn registry() -> &'static RwLock<Registry> {
-        static REGISTRY: OnceLock<RwLock<Registry>> = OnceLock::new();
-        REGISTRY.get_or_init(|| {
-            RwLock::new(Registry {
-                map: HashMap::new(),
-                #[cfg(windows)]
-                next: FIRST_SYNTHETIC_FD,
-            })
-        })
-    }
-
-    /// Clones the entry for `fd` out of the registry (lock released on return).
-    fn lookup(fd: c_int) -> Option<Arc<GkEventFd>> {
-        let reg = registry().read().unwrap_or_else(PoisonError::into_inner);
-        reg.map.get(&fd).cloned()
-    }
-
-    #[cfg(feature = "ffi")]
-    pub(super) fn is_registered(fd: c_int) -> bool {
-        let reg = registry().read().unwrap_or_else(PoisonError::into_inner);
-        reg.map.contains_key(&fd)
-    }
 
     fn fail(e: &io::Error) -> c_int {
         set_errno(to_errno(e));
@@ -318,48 +389,340 @@ mod imp {
         -1
     }
 
-    pub(super) fn eventfd(initval: c_uint, flags: c_int) -> c_int {
-        let efd = match GkEventFd::with_raw_flags(initval, flags) {
-            Ok(efd) => Arc::new(efd),
-            Err(e) => return fail(&e),
-        };
-        let mut reg = registry().write().unwrap_or_else(PoisonError::into_inner);
-        insert(&mut reg, efd)
+    fn registry() -> &'static RwLock<Registry> {
+        static REGISTRY: OnceLock<RwLock<Registry>> = OnceLock::new();
+        REGISTRY.get_or_init(|| RwLock::new(Registry::new()))
     }
 
-    /// The key is the pipe's read end: a real, pollable descriptor number.
+    fn read_lock() -> RwLockReadGuard<'static, Registry> {
+        registry().read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_lock() -> RwLockWriteGuard<'static, Registry> {
+        registry().write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // -- unix: the registry owns the descriptor numbers ---------------------
+
+    /// What a descriptor resolves to: a handle on the counter. Lookups return
+    /// a clone, so a blocking read or write runs *without* the registry lock.
     #[cfg(unix)]
-    fn insert(reg: &mut Registry, efd: Arc<GkEventFd>) -> c_int {
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&*efd);
-        if let Some(stale) = reg.map.insert(fd, efd) {
-            // The OS handed out this number again, so the old entry's
-            // descriptors were closed behind our back (raw close(2)).
-            // Dropping it would close descriptors that now belong to someone
-            // else (including the new eventfd), so leak it instead.
-            std::mem::forget(stale);
+    type Handle = crate::sys::Core;
+
+    /// Every key is a real descriptor owned by the registry: a `dup` of the
+    /// eventfd's pipe read end, so `poll`/`kqueue` work on it directly. Each
+    /// key remembers its pipe's identity, which lets lookups notice a number
+    /// that was closed behind our back and reused, and recognise raw `dup`s
+    /// (`dup(2)`, `fcntl(F_DUPFD)`, ...) of our descriptors.
+    #[cfg(unix)]
+    struct Registry {
+        map: IntMap<c_int, (Handle, PipeId)>,
+        /// Pipe identity -> its counter and how many keys refer to it.
+        by_pipe: IntMap<PipeId, (Handle, usize)>,
+    }
+
+    #[cfg(unix)]
+    use crate::sys::{PipeId, pipe_id};
+
+    #[cfg(unix)]
+    impl Registry {
+        fn new() -> Self {
+            Self {
+                map: IntMap::default(),
+                by_pipe: IntMap::default(),
+            }
         }
+
+        /// Registers `fd` (which must be open on the pipe `id`). A stale
+        /// entry with the same number is forgotten, not closed.
+        fn insert(&mut self, fd: c_int, core: Handle, id: PipeId) {
+            if let Some((_, old)) = self.map.insert(fd, (core.clone(), id)) {
+                self.unref(old);
+            }
+            self.by_pipe.entry(id).or_insert((core, 0)).1 += 1;
+        }
+
+        /// Forgets `fd` without closing it.
+        fn remove(&mut self, fd: c_int) {
+            if let Some((_, id)) = self.map.remove(&fd) {
+                self.unref(id);
+            }
+        }
+
+        fn unref(&mut self, id: PipeId) {
+            if let Some(entry) = self.by_pipe.get_mut(&id) {
+                entry.1 -= 1;
+                if entry.1 == 0 {
+                    self.by_pipe.remove(&id);
+                }
+            }
+        }
+
+        /// Verified lookup that also repairs the registry: forgets a stale
+        /// number and adopts a raw dup of one of our pipes.
+        fn resolve(&mut self, fd: c_int) -> Option<(Handle, PipeId)> {
+            if fd < 0 {
+                return None;
+            }
+            let actual = pipe_id(fd);
+            if let Some((core, id)) = self.map.get(&fd) {
+                if actual == Some(*id) {
+                    return Some((core.clone(), *id));
+                }
+                // Closed behind our back and the number reused.
+                self.remove(fd);
+            }
+            let id = actual?;
+            let core = self.by_pipe.get(&id)?.0.clone();
+            self.insert(fd, core.clone(), id);
+            Some((core, id))
+        }
+    }
+
+    #[cfg(unix)]
+    fn lookup(fd: c_int) -> Option<Handle> {
+        if fd < 0 {
+            return None;
+        }
+        {
+            let reg = read_lock();
+            match reg.map.get(&fd) {
+                Some((core, id)) => {
+                    if pipe_id(fd) == Some(*id) {
+                        return Some(core.clone());
+                    }
+                }
+                // Fast path for foreign descriptors (gk_read on a file, ...).
+                None if reg.by_pipe.is_empty() => return None,
+                None => {
+                    let id = pipe_id(fd)?;
+                    if !reg.by_pipe.contains_key(&id) {
+                        return None;
+                    }
+                }
+            }
+        }
+        // Needs a repair (stale number or raw dup to adopt).
+        write_lock().resolve(fd).map(|(core, _)| core)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn eventfd(initval: c_uint, flags: c_int) -> c_int {
+        let (core, fd) = match GkEventFd::with_raw_flags(initval, flags) {
+            Ok(efd) => efd.into_core(),
+            Err(e) => return fail(&e),
+        };
+        let Some(id) = core.pipe_id() else {
+            return fail_errno(errno::EIO);
+        };
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+        write_lock().insert(fd, core, id);
         fd
     }
 
-    /// Synthetic numbers in `FIRST_SYNTHETIC_FD..=c_int::MAX`; SOCKETs don't
-    /// fit in an int.
-    #[cfg(windows)]
-    fn insert(reg: &mut Registry, efd: Arc<GkEventFd>) -> c_int {
-        if reg.map.len() > (c_int::MAX - FIRST_SYNTHETIC_FD) as usize {
-            return fail_errno(errno::EMFILE);
+    #[cfg(unix)]
+    pub(super) fn eventfd_close(fd: c_int) -> c_int {
+        let mut reg = write_lock();
+        if reg.resolve(fd).is_none() {
+            return fail_errno(errno::EBADF);
         }
+        reg.remove(fd);
+        // Closed under the lock, so the number can't be handed out and
+        // registered again before it is actually free.
+        // SAFETY: the registry owned `fd` and has just forgotten it.
+        unsafe { libc::close(fd) }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn eventfd_dup(fd: c_int) -> c_int {
+        let mut reg = write_lock();
+        let Some((core, id)) = reg.resolve(fd) else {
+            return fail_errno(errno::EBADF);
+        };
+        // Like dup(2): lowest free number, close-on-exec cleared.
+        // SAFETY: plain fcntl on a descriptor the registry owns.
+        let new = unsafe { libc::fcntl(fd, libc::F_DUPFD, 0) };
+        if new >= 0 {
+            reg.insert(new, core, id);
+        }
+        new
+    }
+
+    /// `dup2`/`dup3` core: makes `new` a descriptor of `old`'s eventfd.
+    #[cfg(unix)]
+    fn dup_to(
+        old: c_int,
+        new: c_int,
+        check: impl FnOnce() -> Option<c_int>,
+        cloexec: bool,
+    ) -> c_int {
+        let mut reg = write_lock();
+        let Some((core, id)) = reg.resolve(old) else {
+            return fail_errno(errno::EBADF);
+        };
+        if new < 0 {
+            return fail_errno(errno::EBADF);
+        }
+        if let Some(code) = check() {
+            return fail_errno(code);
+        }
+        if old == new {
+            return new;
+        }
+        // Atomically replaces whatever `new` was (closing it), like dup2(2).
         loop {
-            let fd = reg.next;
-            reg.next = if fd == c_int::MAX {
-                FIRST_SYNTHETIC_FD
-            } else {
-                fd + 1
-            };
-            if let std::collections::hash_map::Entry::Vacant(slot) = reg.map.entry(fd) {
-                slot.insert(efd);
-                return fd;
+            // SAFETY: `old` is owned by the registry; replacing `new` is the
+            // caller's responsibility (see eventfd_dup2).
+            if unsafe { libc::dup2(old, new) } >= 0 {
+                break;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return -1;
             }
         }
+        if cloexec {
+            // SAFETY: plain fcntl on the descriptor we just created.
+            unsafe { libc::fcntl(new, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        reg.insert(new, core, id);
+        new
+    }
+
+    #[cfg(unix)]
+    pub(super) unsafe fn eventfd_dup2(old: c_int, new: c_int) -> c_int {
+        dup_to(old, new, || None, false)
+    }
+
+    #[cfg(unix)]
+    pub(super) unsafe fn eventfd_dup3(old: c_int, new: c_int, flags: c_int) -> c_int {
+        let check = || (flags & !libc::O_CLOEXEC != 0 || old == new).then_some(errno::EINVAL);
+        dup_to(old, new, check, flags & libc::O_CLOEXEC != 0)
+    }
+
+    // -- Windows: synthetic descriptor numbers ------------------------------
+
+    #[cfg(windows)]
+    type Handle = std::sync::Arc<GkEventFd>;
+
+    /// Descriptors are synthetic numbers; several numbers (dups) may share
+    /// one `GkEventFd`, which is dropped when the last of them is closed.
+    #[cfg(windows)]
+    struct Registry {
+        map: IntMap<c_int, Handle>,
+        /// Next synthetic descriptor to try.
+        next: c_int,
+    }
+
+    /// First synthetic descriptor on Windows. The CRT allows at most 8192
+    /// descriptors, so numbers from here on never collide with CRT fds (which
+    /// lets `gk_read`/`gk_write`/`gk_close`/`gk_dup` tell the two apart).
+    #[cfg(windows)]
+    pub(super) const FIRST_SYNTHETIC_FD: c_int = 0x1_0000;
+
+    #[cfg(windows)]
+    impl Registry {
+        fn new() -> Self {
+            Self {
+                map: IntMap::default(),
+                next: FIRST_SYNTHETIC_FD,
+            }
+        }
+
+        /// Registers `efd` under the next free synthetic number.
+        fn insert_new(&mut self, efd: Handle) -> c_int {
+            if self.map.len() > (c_int::MAX - FIRST_SYNTHETIC_FD) as usize {
+                return fail_errno(errno::EMFILE);
+            }
+            loop {
+                let fd = self.next;
+                self.next = if fd == c_int::MAX {
+                    FIRST_SYNTHETIC_FD
+                } else {
+                    fd + 1
+                };
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.map.entry(fd) {
+                    slot.insert(efd);
+                    return fd;
+                }
+            }
+        }
+
+        #[cfg(feature = "ffi")]
+        fn remove(&mut self, fd: c_int) {
+            self.map.remove(&fd);
+        }
+    }
+
+    #[cfg(windows)]
+    fn lookup(fd: c_int) -> Option<Handle> {
+        read_lock().map.get(&fd).cloned()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn eventfd(initval: c_uint, flags: c_int) -> c_int {
+        match GkEventFd::with_raw_flags(initval, flags) {
+            Ok(efd) => write_lock().insert_new(std::sync::Arc::new(efd)),
+            Err(e) => fail(&e),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn eventfd_close(fd: c_int) -> c_int {
+        // Dropped outside the lock; a concurrent reader may still hold a clone.
+        let removed = write_lock().map.remove(&fd);
+        match removed {
+            Some(_) => 0,
+            None => fail_errno(errno::EBADF),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn eventfd_dup(fd: c_int) -> c_int {
+        let mut reg = write_lock();
+        match reg.map.get(&fd).cloned() {
+            Some(efd) => reg.insert_new(efd),
+            None => fail_errno(errno::EBADF),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) unsafe fn eventfd_dup2(old: c_int, new: c_int) -> c_int {
+        let replaced = {
+            let mut reg = write_lock();
+            let Some(efd) = reg.map.get(&old).cloned() else {
+                return fail_errno(errno::EBADF);
+            };
+            // Only synthetic numbers: lower ones belong to the CRT.
+            if new < FIRST_SYNTHETIC_FD {
+                return fail_errno(errno::EBADF);
+            }
+            reg.map.insert(new, efd)
+        };
+        drop(replaced); // outside the lock
+        new
+    }
+
+    #[cfg(windows)]
+    pub(super) fn eventfd_socket(fd: c_int) -> std::os::windows::io::RawSocket {
+        match lookup(fd) {
+            Some(efd) => std::os::windows::io::AsRawSocket::as_raw_socket(&*efd),
+            None => {
+                set_errno(errno::EBADF);
+                std::os::windows::io::RawSocket::MAX
+            }
+        }
+    }
+
+    // -- common ---------------------------------------------------------------
+
+    #[cfg(feature = "ffi")]
+    pub(super) fn is_eventfd(fd: c_int) -> bool {
+        lookup(fd).is_some()
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(super) fn forget(fd: c_int) {
+        write_lock().remove(fd);
     }
 
     pub(super) unsafe fn eventfd_read(fd: c_int, value: *mut u64) -> c_int {
@@ -386,18 +749,6 @@ mod imp {
         match efd.write(value) {
             Ok(()) => 0,
             Err(e) => fail(&e),
-        }
-    }
-
-    pub(super) fn eventfd_close(fd: c_int) -> c_int {
-        let removed = {
-            let mut reg = registry().write().unwrap_or_else(PoisonError::into_inner);
-            reg.map.remove(&fd)
-        };
-        // Dropped outside the lock; a concurrent reader may still hold a clone.
-        match removed {
-            Some(_) => 0,
-            None => fail_errno(errno::EBADF),
         }
     }
 
@@ -437,17 +788,6 @@ mod imp {
         match efd.write(v) {
             Ok(()) => 8,
             Err(e) => fail(&e) as isize,
-        }
-    }
-
-    #[cfg(windows)]
-    pub(super) fn eventfd_socket(fd: c_int) -> std::os::windows::io::RawSocket {
-        match lookup(fd) {
-            Some(efd) => std::os::windows::io::AsRawSocket::as_raw_socket(&*efd),
-            None => {
-                set_errno(errno::EBADF);
-                std::os::windows::io::RawSocket::MAX
-            }
         }
     }
 }
@@ -674,6 +1014,213 @@ pub(crate) mod tests {
         assert_eq!(eventfd_close(fd), 0);
         assert_eq!(eventfd_socket(fd), std::os::windows::io::RawSocket::MAX);
         assert_eq!(errno(), EBADF);
+    }
+
+    #[test]
+    fn dup_shares_counter() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        let d = eventfd_dup(fd);
+        assert!(d >= 0 && d != fd, "errno {}", errno());
+        assert_eq!(write(fd, 3), Ok(()));
+        assert_eq!(read(d), Ok(3));
+        // Closing one copy leaves the other working.
+        assert_eq!(eventfd_close(fd), 0);
+        assert_eq!(write(d, 1), Ok(()));
+        assert_eq!(read(d), Ok(1));
+        assert_eq!(read(d), Err(EAGAIN));
+        assert_eq!(eventfd_close(d), 0);
+        if !NATIVE {
+            assert_eq!(read(d), Err(EBADF));
+            assert_eq!(eventfd_dup(d), -1);
+            assert_eq!(errno(), EBADF);
+        }
+    }
+
+    #[test]
+    fn dup2_replaces_target() {
+        let _g = lock();
+        let a = eventfd(0, EFD_NONBLOCK);
+        let b = eventfd(5, EFD_NONBLOCK);
+        assert!(a >= 0 && b >= 0);
+        // SAFETY: we own both descriptors.
+        unsafe {
+            assert_eq!(eventfd_dup2(a, a), a);
+            assert_eq!(eventfd_dup2(a, b), b);
+        }
+        // `b` now refers to `a`'s counter; its own counter (5) is gone.
+        assert_eq!(read(b), Err(EAGAIN));
+        assert_eq!(write(a, 2), Ok(()));
+        assert_eq!(read(b), Ok(2));
+        assert_eq!(eventfd_close(a), 0);
+        assert_eq!(write(b, 4), Ok(()));
+        assert_eq!(read(b), Ok(4));
+        assert_eq!(eventfd_close(b), 0);
+        // SAFETY: invalid descriptors only.
+        unsafe {
+            assert_eq!(eventfd_dup2(-1, 100), -1);
+            assert_eq!(errno(), EBADF);
+        }
+    }
+
+    #[test]
+    fn dup2_rejects_negative_target() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        // SAFETY: a negative target can't close anything.
+        assert_eq!(unsafe { eventfd_dup2(fd, -5) }, -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(eventfd_close(fd), 0);
+    }
+
+    #[cfg(unix)]
+    fn cloexec(fd: c_int) -> bool {
+        // SAFETY: plain fcntl.
+        let f = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(f >= 0);
+        f & libc::FD_CLOEXEC != 0
+    }
+
+    /// A free descriptor number (opened and closed again).
+    #[cfg(unix)]
+    fn free_fd() -> c_int {
+        // SAFETY: plain dup/close of stdin's number space.
+        unsafe {
+            let fd = libc::fcntl(0, libc::F_DUPFD, 200);
+            assert!(fd >= 0);
+            libc::close(fd);
+            fd
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dup_cloexec_rules() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        assert!(fd >= 0);
+        assert!(cloexec(fd));
+        // dup and dup2 clear close-on-exec, dup3(O_CLOEXEC) sets it.
+        let d = eventfd_dup(fd);
+        assert!(!cloexec(d));
+        let t = free_fd();
+        // SAFETY: `t` is a free number; `d` and `fd` are ours.
+        unsafe {
+            assert_eq!(eventfd_dup2(fd, t), t);
+            assert!(!cloexec(t));
+            assert_eq!(eventfd_dup3(d, t, libc::O_CLOEXEC), t);
+            assert!(cloexec(t));
+            assert_eq!(eventfd_dup3(d, t, 0), t);
+            assert!(!cloexec(t));
+            assert_eq!(eventfd_dup3(d, d, 0), -1);
+            assert_eq!(errno(), EINVAL);
+            assert_eq!(eventfd_dup3(d, t, 0x4000_0000), -1);
+            assert_eq!(errno(), EINVAL);
+        }
+        assert_eq!(write(t, 7), Ok(()));
+        assert_eq!(read(fd), Ok(7));
+        for x in [fd, d, t] {
+            assert_eq!(eventfd_close(x), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dup_is_pollable() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        let d = eventfd_dup(fd);
+        assert!(fd >= 0 && d >= 0);
+        let readable = |fd: c_int| {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd.
+            assert!(unsafe { libc::poll(&mut pfd, 1, 0) } >= 0);
+            pfd.revents & libc::POLLIN != 0
+        };
+        assert!(!readable(d));
+        assert_eq!(write(fd, 1), Ok(()));
+        assert!(readable(d) && readable(fd));
+        assert_eq!(read(d), Ok(1));
+        assert!(!readable(d) && !readable(fd));
+        assert_eq!(eventfd_close(fd), 0);
+        assert_eq!(eventfd_close(d), 0);
+    }
+
+    /// Raw dup(2) / fcntl(F_DUPFD) copies are recognised by pipe identity.
+    #[cfg(all(unix, not(gk_native)))]
+    #[test]
+    fn shim_adopts_raw_dups() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        // SAFETY: plain dups of our descriptor.
+        let (raw, fcntl_dup) = unsafe { (libc::dup(fd), libc::fcntl(fd, libc::F_DUPFD, 0)) };
+        assert!(raw >= 0 && fcntl_dup >= 0);
+        assert_eq!(write(raw, 4), Ok(()));
+        assert_eq!(read(fd), Ok(4));
+        assert_eq!(write(fd, 6), Ok(()));
+        assert_eq!(read(fcntl_dup), Ok(6));
+        // Adopted copies are owned by the registry and closed by it.
+        assert_eq!(eventfd_close(raw), 0);
+        assert_eq!(eventfd_close(fcntl_dup), 0);
+        assert_eq!(eventfd_close(fd), 0);
+        // Once every known descriptor is closed the eventfd is gone.
+        assert_eq!(read(fd), Err(EBADF));
+    }
+
+    /// A number closed behind the registry's back and reused for something
+    /// else is not mistaken for the eventfd.
+    #[cfg(all(unix, not(gk_native)))]
+    #[test]
+    fn shim_detects_reused_numbers() {
+        let _g = lock();
+        let fd = eventfd(1, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        let mut p = [0; 2];
+        // SAFETY: `p` has room for two descriptors; dup2 replaces our own
+        // eventfd number with an unrelated pipe, as a raw dup2 would.
+        unsafe {
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            assert_eq!(libc::dup2(p[0], fd), fd);
+        }
+        assert_eq!(read(fd), Err(EBADF));
+        assert_eq!(eventfd_close(fd), -1);
+        // SAFETY: we own all three.
+        unsafe {
+            libc::close(fd);
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dup_numbers() {
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        let d = eventfd_dup(fd);
+        assert!(fd >= 0x1_0000 && d >= 0x1_0000 && d != fd);
+        assert_eq!(eventfd_socket(fd), eventfd_socket(d));
+        // SAFETY: CRT-range and free synthetic targets only.
+        unsafe {
+            assert_eq!(eventfd_dup2(fd, 3), -1);
+            assert_eq!(errno(), EBADF);
+            let t = 0x7fff_0000;
+            assert_eq!(eventfd_dup2(fd, t), t);
+            assert_eq!(write(t, 2), Ok(()));
+            assert_eq!(read(d), Ok(2));
+            assert_eq!(eventfd_close(t), 0);
+        }
+        assert_eq!(eventfd_close(fd), 0);
+        assert_eq!(write(d, 1), Ok(()));
+        assert_eq!(read(d), Ok(1));
+        assert_eq!(eventfd_close(d), 0);
     }
 
     /// The C header hard-codes the flag values for shim platforms.

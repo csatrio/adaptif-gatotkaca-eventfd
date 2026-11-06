@@ -164,6 +164,9 @@ clash with libc:
 | `ssize_t gk_read(int fd, void *buf, size_t count)` | `read(2)` of *any* fd: eventfd semantics for ours, else the real `read` (`int`/`_read` on Windows) |
 | `ssize_t gk_write(int fd, const void *buf, size_t count)` | `write(2)` of any fd (`int`/`_write` on Windows) |
 | `int gk_close(int fd)` | `close(2)` of any fd (`_close` on Windows) |
+| `int gk_dup(int fd)` | `dup(2)` of any fd: a new descriptor on the same counter for ours, else the real `dup` (`_dup` on Windows) |
+| `int gk_dup2(int oldfd, int newfd)` | `dup2(2)` of any fd (`_dup2` on Windows: returns 0, and `newfd` must be `>= 65536` for eventfds) |
+| `int gk_dup3(int oldfd, int newfd, int flags)` | Unix only: `dup3(2)` of any fd, `flags` is `0` or `O_CLOEXEC` (emulated on macOS) |
 | `uintptr_t gk_eventfd_socket(int fd)` | Windows only: the `SOCKET` to `WSAPoll`/`select` on |
 
 They follow C conventions: `-1` and `errno` on failure. Flags are
@@ -204,11 +207,11 @@ number (>= 65536, never a CRT fd); `WSAPoll`/`select` the socket from
 
 ### Unchanged Linux code: `GK_EVENTFD_WRAP_IO`
 
-Code that does raw `read(efd, &v, 8)` / `write(efd, &v, 8)` / `close(efd)`
-can be compiled unchanged on the shim platforms by defining
+Code that does raw `read(efd, &v, 8)` / `write(efd, &v, 8)` / `close(efd)` /
+`dup(efd)` can be compiled unchanged on the shim platforms by defining
 `GK_EVENTFD_WRAP_IO` before including the header. It then redirects
-`read`/`write`/`close` (on Windows also `_read`/`_write`/`_close`) to
-`gk_read`/`gk_write`/`gk_close`, which give our eventfds eventfd semantics
+`read`/`write`/`close`/`dup`/`dup2` (plus `dup3` on unix, and on Windows also
+`_read`/`_write`/`_close`/`_dup`/`_dup2`) to the matching `gk_*` functions, which give our eventfds eventfd semantics
 and forward every other descriptor to the real function. It is a no-op where
 `GK_EVENTFD_NATIVE` is 1. The redirects are function-like macros, so they only
 affect calls in code compiled with this header (not prebuilt libraries, not
@@ -239,8 +242,9 @@ build warning-free with `-std=c11 -Wall -Wextra -Werror` (gcc, clang) and
 
 From Rust, the same functions are available without the `ffi` feature in
 `adaptif_gatotkaca_eventfd::compat`: `eventfd`, `eventfd_read`,
-`eventfd_write`, `eventfd_close`, `eventfd_read_buf`, `eventfd_write_buf`
-and (Windows) `eventfd_socket`.
+`eventfd_write`, `eventfd_close`, `eventfd_read_buf`, `eventfd_write_buf`,
+`eventfd_dup`, `eventfd_dup2`, `eventfd_dup3` (unix) and (Windows)
+`eventfd_socket`.
 
 ## Feature flags
 
@@ -286,14 +290,22 @@ DragonFly, Windows, and any platform built with `force-shim`):
 - **Close with `eventfd_close`.** A descriptor obtained from
   `compat::eventfd` (or `gk_eventfd` in C) is registered with the compat
   layer. Close it with `eventfd_close` (or `gk_close`), not a raw
-  `close`/`closesocket`, or the counter leaks (the stale entry is discarded
-  without closing anything if the OS reuses the number).
+  `close`/`closesocket`. (On unix the registry notices a number that was
+  closed behind its back and reused, and forgets it without closing anything.)
 - **No sharing across `fork()`.** The counter lives in process memory. After
   `fork()`, parent and child have separate counters.
 - **No write readiness.** `POLLOUT` and writability are not reported in a
   meaningful way. Only readability (counter > 0) is supported.
-- **`dup()` is not tracked.** A plain `dup()`/`dup2()` of a compat descriptor
-  is not registered with the compat layer. Use `GkEventFd::try_clone` in Rust.
+- **Duplicate through the crate.** Use `GkEventFd::try_clone` in Rust and
+  `eventfd_dup`/`eventfd_dup2`/`eventfd_dup3` (C: `gk_dup*`, or plain
+  `dup`/`dup2`/`dup3` under `GK_EVENTFD_WRAP_IO`). On macOS/BSD a raw
+  `dup()`/`fcntl(F_DUPFD)` copy also works: it is recognised by its pipe the
+  first time it is passed to the crate. But the eventfd ends when every
+  descriptor the crate knows about is closed, so a raw copy that was never
+  passed to the crate stops working once the original is closed.
+- **Windows descriptors are synthetic.** `gk_dup` returns another synthetic
+  number (`>= 65536`); `gk_dup2` onto a CRT descriptor number fails with
+  `EBADF`. The CRT's own `_dup` cannot copy them (use `gk_dup`).
 
 ## MSRV
 

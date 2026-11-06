@@ -24,6 +24,7 @@ force-shim = []
 
 [dependencies]
 mio = { version = "1", optional = true, features = ["os-ext", "net"] }
+nohash-hasher = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -118,7 +118,7 @@ fn crt_count(count: usize) -> c_uint {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_read(fd: c_int, buf: *mut c_void, count: usize) -> SSize {
     guard(-1, || {
-        if compat::is_registered(fd) {
+        if compat::is_eventfd(fd) {
             // SAFETY: forwarded to the caller.
             let n = unsafe { compat::eventfd_read_buf(fd, buf, count) };
             return n as SSize;
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn gk_read(fd: c_int, buf: *mut c_void, count: usize) -> S
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_write(fd: c_int, buf: *const c_void, count: usize) -> SSize {
     guard(-1, || {
-        if compat::is_registered(fd) {
+        if compat::is_eventfd(fd) {
             // SAFETY: forwarded to the caller.
             let n = unsafe { compat::eventfd_write_buf(fd, buf, count) };
             return n as SSize;
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn gk_write(fd: c_int, buf: *const c_void, count: usize) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
     guard(-1, || {
-        if compat::is_registered(fd) {
+        if compat::is_eventfd(fd) {
             return compat::eventfd_close(fd);
         }
         // SAFETY: forwarded to the caller.
@@ -175,6 +175,93 @@ pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
         return unsafe { libc::close(fd) };
         #[cfg(windows)]
         return unsafe { _close(fd) };
+    })
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _dup(fd: c_int) -> c_int;
+    fn _dup2(fd: c_int, fd2: c_int) -> c_int;
+}
+
+/// `int gk_dup(int fd);`
+///
+/// `dup(2)` that understands eventfds: an eventfd (including a raw dup of
+/// one) gets a new descriptor on the same counter (see `eventfd_dup`); any
+/// other descriptor is forwarded to the real `dup` (CRT `_dup` on Windows).
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_dup(fd: c_int) -> c_int {
+    guard(-1, || {
+        if compat::is_eventfd(fd) {
+            return compat::eventfd_dup(fd);
+        }
+        // SAFETY: no pointers involved.
+        #[cfg(unix)]
+        return unsafe { libc::dup(fd) };
+        // SAFETY: as above.
+        #[cfg(windows)]
+        return unsafe { _dup(fd) };
+    })
+}
+
+/// `int gk_dup2(int oldfd, int newfd);`
+///
+/// `dup2(2)` that understands eventfds. If `oldfd` is an eventfd, `newfd`
+/// becomes another descriptor of it (see `eventfd_dup2`). Otherwise the call
+/// is forwarded to the real `dup2` (CRT `_dup2` on Windows), and if that
+/// replaced an eventfd descriptor the crate forgets it.
+///
+/// Returns `newfd` on unix and `0` on Windows on success (as `dup2` /
+/// `_dup2` do there), or `-1` with `errno`.
+///
+/// # Safety
+/// As for `dup2(2)`: whatever `newfd` was is closed, so it must not be owned
+/// by someone else.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_dup2(oldfd: c_int, newfd: c_int) -> c_int {
+    guard(-1, || {
+        if compat::is_eventfd(oldfd) {
+            // SAFETY: forwarded to the caller.
+            let r = unsafe { compat::eventfd_dup2(oldfd, newfd) };
+            #[cfg(windows)]
+            let r = if r >= 0 { 0 } else { r };
+            return r;
+        }
+        // SAFETY: forwarded to the caller.
+        #[cfg(unix)]
+        let r = unsafe { libc::dup2(oldfd, newfd) };
+        // SAFETY: as above.
+        #[cfg(windows)]
+        let r = unsafe { _dup2(oldfd, newfd) };
+        if r >= 0 && oldfd != newfd {
+            compat::forget(newfd);
+        }
+        r
+    })
+}
+
+/// `int gk_dup3(int oldfd, int newfd, int flags);` (unix only)
+///
+/// `dup3(2)` that understands eventfds (see `gk_dup2`). `flags` is `0` or
+/// `O_CLOEXEC`. On macOS, iOS and Android, which have no `dup3`, foreign
+/// descriptors use `dup2` + `fcntl`, so close-on-exec is not atomic there.
+///
+/// # Safety
+/// As for `gk_dup2`.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
+    guard(-1, || {
+        if compat::is_eventfd(oldfd) {
+            // SAFETY: forwarded to the caller.
+            return unsafe { compat::eventfd_dup3(oldfd, newfd, flags) };
+        }
+        // SAFETY: forwarded to the caller.
+        let r = unsafe { compat::raw_dup3(oldfd, newfd, flags) };
+        if r >= 0 {
+            compat::forget(newfd);
+        }
+        r
     })
 }
 
@@ -264,6 +351,97 @@ mod tests {
         #[cfg(windows)]
         assert_ne!(gk_eventfd_socket(fd), usize::MAX);
         assert_eq!(gk_eventfd_close(fd), 0);
+    }
+
+    #[test]
+    fn dup_on_eventfd() {
+        let _g = compat::tests::lock();
+        let fd = gk_eventfd(0, compat::EFD_NONBLOCK);
+        let d = gk_dup(fd);
+        assert!(fd >= 0 && d >= 0 && d != fd);
+        let v = 9u64.to_ne_bytes();
+        let mut out = [0u8; 8];
+        // SAFETY: valid buffers; we own every descriptor involved.
+        unsafe {
+            assert_eq!(gk_write(fd, v.as_ptr().cast(), 8), 8);
+            assert_eq!(gk_read(d, out.as_mut_ptr().cast(), 8), 8);
+            assert_eq!(u64::from_ne_bytes(out), 9);
+            let other = gk_eventfd(0, compat::EFD_NONBLOCK);
+            let r = gk_dup2(fd, other);
+            assert!(r >= 0);
+            assert_eq!(gk_write(other, v.as_ptr().cast(), 8), 8);
+            assert_eq!(gk_read(d, out.as_mut_ptr().cast(), 8), 8);
+            for x in [fd, d, other] {
+                assert_eq!(gk_close(x), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn dup_forwards_other_descriptors() {
+        let _g = compat::tests::lock();
+        let [r, w] = pipe();
+        let mut out = [0u8; 8];
+        // SAFETY: valid buffers; we own every descriptor involved.
+        unsafe {
+            let w2 = gk_dup(w);
+            assert!(w2 >= 0);
+            assert_eq!(gk_write(w2, b"ab".as_ptr().cast(), 2), 2);
+            assert_eq!(gk_read(r, out.as_mut_ptr().cast(), 8), 2);
+            assert_eq!(gk_close(w2), 0);
+            assert_eq!(gk_close(w), 0);
+            assert_eq!(gk_close(r), 0);
+            assert_eq!(gk_dup(-1), -1);
+            assert_eq!(compat::errno(), EBADF);
+        }
+    }
+
+    /// A foreign dup2 onto an eventfd number replaces it; the crate must
+    /// forget that number and treat it as the foreign descriptor afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_dup2_over_eventfd() {
+        let _g = compat::tests::lock();
+        let fd = gk_eventfd(1, compat::EFD_NONBLOCK);
+        let [r, w] = pipe();
+        let mut out = [0u8; 8];
+        // SAFETY: valid buffers; we own every descriptor involved.
+        unsafe {
+            assert_eq!(gk_dup2(w, fd), fd);
+            // `fd` is now the pipe's write end: plain write semantics.
+            assert_eq!(gk_write(fd, b"xyz".as_ptr().cast(), 3), 3);
+            assert_eq!(gk_read(r, out.as_mut_ptr().cast(), 8), 3);
+            assert!(!compat::is_eventfd(fd));
+            for x in [fd, r, w] {
+                assert_eq!(gk_close(x), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dup3_flags() {
+        let _g = compat::tests::lock();
+        let fd = gk_eventfd(0, compat::EFD_NONBLOCK);
+        let [r, w] = pipe();
+        // SAFETY: we own every descriptor involved.
+        unsafe {
+            let t = libc::fcntl(0, libc::F_DUPFD, 300);
+            assert!(t >= 0);
+            libc::close(t);
+            assert_eq!(gk_dup3(fd, t, libc::O_CLOEXEC), t);
+            assert!(libc::fcntl(t, libc::F_GETFD) & libc::FD_CLOEXEC != 0);
+            assert_eq!(gk_dup3(fd, fd, 0), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            // Foreign descriptors go to the real (or emulated) dup3.
+            assert_eq!(gk_dup3(w, w, 0), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_dup3(w, t, 0), t);
+            assert!(!compat::is_eventfd(t));
+            for x in [fd, t, r, w] {
+                assert_eq!(gk_close(x), 0);
+            }
+        }
     }
 
     #[test]
