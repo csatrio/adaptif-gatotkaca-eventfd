@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: `GkListener::bind` / `gk_listener_bind` on a name already in use now
+  fails with `ErrorKind::AddrInUse` (`EADDRINUSE`) instead of `EIO`. Windows
+  reports `ERROR_ACCESS_DENIED` for a taken name when creating the first named
+  pipe instance; it is translated on the error path only.
 - Windows: `gk_read`, `gk_write`, `gk_close`, `gk_dup` and `gk_dup2` no longer
   abort the process (`STATUS_STACK_BUFFER_OVERRUN`) when forwarding an invalid
   descriptor such as `-1` to the CRT. The forwarded call now runs with a

@@ -364,6 +364,7 @@ mod imp {
 
     /// A new, unconnected instance of the pipe `name`.
     fn instance(name: &[u16], first: bool) -> io::Result<OwnedHandle> {
+        let first_instance = first;
         let first = if first {
             FILE_FLAG_FIRST_PIPE_INSTANCE
         } else {
@@ -384,7 +385,13 @@ mod imp {
             )
         };
         if h == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            // With FIRST_PIPE_INSTANCE, a taken name reports ACCESS_DENIED
+            // (5); surface it as the "address in use" it is.
+            if first_instance && e.raw_os_error() == Some(5) {
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, e));
+            }
+            return Err(e);
         }
         // SAFETY: a fresh handle we own.
         Ok(unsafe { OwnedHandle::from_raw_handle(h) })
