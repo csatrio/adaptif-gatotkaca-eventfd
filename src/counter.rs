@@ -55,6 +55,7 @@ impl Counter {
     }
 
     /// True when the counter is non-zero.
+    #[allow(dead_code)]
     pub(crate) fn is_readable(&self) -> bool {
         *self.lock() > 0
     }
@@ -209,11 +210,17 @@ mod tests {
     fn write_limits() {
         let c = Counter::new(0, nb());
         let n = Flag::default();
-        assert_eq!(c.write(u64::MAX, &n).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            c.write(u64::MAX, &n).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         c.write(0, &n).unwrap();
         assert!(!n.get());
         c.write(EFD_MAX, &n).unwrap();
-        assert_eq!(c.write(1, &n).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            c.write(1, &n).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         c.write(0, &n).unwrap();
         assert_eq!(c.read(&n).unwrap(), EFD_MAX);
     }

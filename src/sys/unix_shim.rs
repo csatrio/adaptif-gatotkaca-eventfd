@@ -79,8 +79,8 @@ fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// Number of bytes buffered in the pipe (debug checks only).
-#[cfg(any(debug_assertions, test))]
+/// Number of bytes buffered in the pipe (crate tests only).
+#[cfg(test)]
 fn pending_bytes(fd: BorrowedFd<'_>) -> Option<libc::c_int> {
     let mut n: libc::c_int = 0;
     // SAFETY: FIONREAD writes one `c_int` through the pointer, which points to
@@ -91,9 +91,11 @@ fn pending_bytes(fd: BorrowedFd<'_>) -> Option<libc::c_int> {
 
 impl Notifier for Shared {
     fn set_readable(&self) -> io::Result<()> {
-        #[cfg(debug_assertions)]
+        // Checked only in this crate's tests: raw I/O on the fd by users is
+        // unsupported but must not panic their debug builds.
+        #[cfg(test)]
         if let Some(n) = pending_bytes(self.pipe_r.as_fd()) {
-            debug_assert_eq!(n, 0, "eventfd shim: pipe not empty while counter was 0");
+            assert_eq!(n, 0, "eventfd shim: pipe not empty while counter was 0");
         }
         let byte = 1u8;
         let res = cvt_retry(|| {
@@ -127,7 +129,9 @@ impl Notifier for Shared {
                 Err(e) => return Err(e),
             }
         }
-        debug_assert_eq!(drained, 1, "eventfd shim: pipe did not hold exactly 1 byte");
+        if cfg!(test) {
+            assert_eq!(drained, 1, "eventfd shim: pipe did not hold exactly 1 byte");
+        }
         Ok(())
     }
 }

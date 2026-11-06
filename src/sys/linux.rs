@@ -17,7 +17,11 @@ pub(crate) struct Inner {
 
 /// Converts a `-1`-on-error libc return value into an `io::Result`.
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
-    if ret == -1 { Err(io::Error::last_os_error()) } else { Ok(ret) }
+    if ret == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
 }
 
 /// Converts a short transfer on an eventfd (which the kernel never produces
@@ -32,7 +36,9 @@ impl Inner {
         // returns a fresh descriptor that nothing else owns.
         let fd = cvt(unsafe { libc::eventfd(initval, flags.bits()) })?;
         // SAFETY: `fd` is a valid, open descriptor exclusively owned by us.
-        Ok(Self { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
     }
 
     fn raw(&self) -> RawFd {
@@ -52,7 +58,11 @@ impl Inner {
                 }
                 return Err(err);
             }
-            return if n as usize == COUNTER_SIZE { Ok(value) } else { Err(short_transfer()) };
+            return if n as usize == COUNTER_SIZE {
+                Ok(value)
+            } else {
+                Err(short_transfer())
+            };
         }
     }
 
@@ -69,13 +79,19 @@ impl Inner {
                 }
                 return Err(err);
             }
-            return if n as usize == COUNTER_SIZE { Ok(()) } else { Err(short_transfer()) };
+            return if n as usize == COUNTER_SIZE {
+                Ok(())
+            } else {
+                Err(short_transfer())
+            };
         }
     }
 
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         // `OwnedFd::try_clone` uses `fcntl(F_DUPFD_CLOEXEC, 0)`.
-        Ok(Self { fd: self.fd.try_clone()? })
+        Ok(Self {
+            fd: self.fd.try_clone()?,
+        })
     }
 
     fn get_fl(&self) -> io::Result<libc::c_int> {
@@ -85,7 +101,11 @@ impl Inner {
 
     pub(crate) fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
         let flags = self.get_fl()?;
-        let new = if nb { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+        let new = if nb {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
         if new != flags {
             // SAFETY: F_SETFL takes an int argument; `self.fd` is open.
             cvt(unsafe { libc::fcntl(self.raw(), libc::F_SETFL, new) })?;
@@ -127,7 +147,11 @@ mod tests {
     }
 
     fn readable(e: &Inner) -> bool {
-        let mut pfd = libc::pollfd { fd: e.raw(), events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: e.raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: `pfd` is a valid pollfd array of length 1; timeout 0.
         let n = unsafe { libc::poll(&mut pfd, 1, 0) };
         assert!(n >= 0, "poll failed: {}", io::Error::last_os_error());

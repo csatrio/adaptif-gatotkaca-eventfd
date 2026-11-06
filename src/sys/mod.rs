@@ -18,14 +18,32 @@
 //! //          #[cfg(feature = "mio")] fn register/reregister/deregister (mio::event::Source signatures)
 //! ```
 
-#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "force-shim")
+))]
 mod linux;
-#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "force-shim")
+))]
 pub(crate) use linux::Inner;
 
-#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))))]
+#[cfg(all(
+    unix,
+    not(all(
+        any(target_os = "linux", target_os = "android"),
+        not(feature = "force-shim")
+    ))
+))]
 mod unix_shim;
-#[cfg(all(unix, not(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))))]
+#[cfg(all(
+    unix,
+    not(all(
+        any(target_os = "linux", target_os = "android"),
+        not(feature = "force-shim")
+    ))
+))]
 pub(crate) use unix_shim::Inner;
 
 #[cfg(windows)]

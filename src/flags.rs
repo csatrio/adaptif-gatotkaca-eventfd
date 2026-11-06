@@ -12,7 +12,10 @@ use core::ops::{BitAnd, BitOr, BitOrAssign};
 #[allow(non_camel_case_types)]
 pub type eventfd_t = u64;
 
-#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "force-shim")
+))]
 mod values {
     use core::ffi::c_int;
     pub const EFD_SEMAPHORE: c_int = libc::EFD_SEMAPHORE;
@@ -20,7 +23,10 @@ mod values {
     pub const EFD_NONBLOCK: c_int = libc::EFD_NONBLOCK;
 }
 
-#[cfg(not(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim"))))]
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "force-shim")
+)))]
 mod values {
     use core::ffi::c_int;
     pub const EFD_SEMAPHORE: c_int = 0o1;
@@ -57,7 +63,11 @@ impl EfdFlags {
     /// Builds flags from raw bits. Returns `None` if unknown bits are set
     /// (the C `eventfd()` call fails with `EINVAL` in that case).
     pub const fn from_bits(bits: c_int) -> Option<Self> {
-        if bits & !Self::ALL != 0 { None } else { Some(Self(bits)) }
+        if bits & !Self::ALL != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
     }
 
     /// Raw bits, suitable for passing to C `eventfd()`.

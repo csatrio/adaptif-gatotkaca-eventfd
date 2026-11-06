@@ -37,7 +37,10 @@ use std::fmt;
 use std::io;
 
 #[cfg_attr(
-    all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")),
+    all(
+        any(target_os = "linux", target_os = "android"),
+        not(feature = "force-shim")
+    ),
     allow(dead_code)
 )]
 mod counter;
@@ -62,7 +65,9 @@ pub struct GkEventFd {
 impl GkEventFd {
     /// Creates an eventfd, like `eventfd(initval, flags)`.
     pub fn new(initval: u32, flags: EfdFlags) -> io::Result<Self> {
-        Ok(Self { inner: sys::Inner::new(initval, flags)? })
+        Ok(Self {
+            inner: sys::Inner::new(initval, flags)?,
+        })
     }
 
     /// Like [`new`](Self::new) but takes raw `EFD_*` bits.
@@ -93,7 +98,9 @@ impl GkEventFd {
     /// Creates a new handle to the same counter (like `dup(2)`).
     /// The clone has its own pollable descriptor.
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self { inner: self.inner.try_clone()? })
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+        })
     }
 
     /// Switches non-blocking mode. Like `O_NONBLOCK`, this is shared by all
@@ -114,7 +121,10 @@ impl fmt::Debug for GkEventFd {
         #[cfg(unix)]
         d.field("fd", &std::os::fd::AsRawFd::as_raw_fd(self));
         #[cfg(windows)]
-        d.field("socket", &std::os::windows::io::AsRawSocket::as_raw_socket(self));
+        d.field(
+            "socket",
+            &std::os::windows::io::AsRawSocket::as_raw_socket(self),
+        );
         d.finish_non_exhaustive()
     }
 }
@@ -203,7 +213,10 @@ mod unix_impls {
 }
 
 /// Raw-descriptor conversions only exist where the descriptor *is* the eventfd.
-#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "force-shim")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "force-shim")
+))]
 mod native_impls {
     use super::GkEventFd;
     use crate::sys::Inner;
@@ -218,7 +231,9 @@ mod native_impls {
     /// The fd must be an eventfd.
     impl From<OwnedFd> for GkEventFd {
         fn from(fd: OwnedFd) -> Self {
-            Self { inner: Inner::from(fd) }
+            Self {
+                inner: Inner::from(fd),
+            }
         }
     }
 
