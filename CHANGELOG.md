@@ -23,9 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `EfdFlags` and the `EFD_SEMAPHORE`, `EFD_CLOEXEC`, `EFD_NONBLOCK`, `EFD_MAX`
   constants, plus the `eventfd_t` type.
 - `compat` module with `<sys/eventfd.h>`-style `eventfd`, `eventfd_read`,
-  `eventfd_write` and `eventfd_close`.
-- `ffi` feature: C ABI (`gk_eventfd*`) and the
-  `include/adaptif_gatotkaca_eventfd.h` header.
+  `eventfd_write` and `eventfd_close`, plus `eventfd_read_buf`/
+  `eventfd_write_buf` (`read(2)`/`write(2)` with eventfd semantics) and, on
+  Windows, `eventfd_socket`. C semantics: `-1` and `errno` on failure.
+- `ffi` feature: C ABI (`gk_eventfd`, `gk_eventfd_read`, `gk_eventfd_write`,
+  `gk_eventfd_close`, `gk_eventfd_read_buf`, `gk_eventfd_write_buf`,
+  `gk_read`, `gk_write`, `gk_close`, and `gk_eventfd_socket` on Windows) and
+  the `include/adaptif_gatotkaca_eventfd.h` header, which also provides the
+  `<sys/eventfd.h>` names on shim platforms and an opt-in
+  `GK_EVENTFD_WRAP_IO` redirect of raw `read`/`write`/`close`.
 - `mio` feature: `mio::event::Source` implementation.
 - `force-shim` feature: use the Unix shim on Linux for differential testing.
 

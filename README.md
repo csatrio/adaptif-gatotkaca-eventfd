@@ -150,19 +150,39 @@ socket returned by `AsSocket`.
 Build with the `ffi` feature to export a C ABI that matches
 `<sys/eventfd.h>`. The header is
 [`include/adaptif_gatotkaca_eventfd.h`](include/adaptif_gatotkaca_eventfd.h).
-The exported symbols are prefixed with `gk_` (`gk_eventfd`,
-`gk_eventfd_read`, `gk_eventfd_write`, `gk_eventfd_close`) so they never clash
-with libc. On non-Linux platforms the header also maps the standard
-`eventfd.h` names (`eventfd`, `eventfd_read`, `eventfd_write`, `eventfd_t`,
-`EFD_*`) onto them. On Linux, the `gk_` functions pass straight through to
-libc.
+All exported symbols are prefixed with `gk_` on every platform, so they never
+clash with libc:
+
+| C function | Behavior |
+|---|---|
+| `int gk_eventfd(unsigned int initval, int flags)` | `eventfd(2)` |
+| `int gk_eventfd_read(int fd, eventfd_t *value)` | `eventfd_read(3)` |
+| `int gk_eventfd_write(int fd, eventfd_t value)` | `eventfd_write(3)` |
+| `int gk_eventfd_close(int fd)` | `close(2)` of an eventfd |
+| `intptr_t gk_eventfd_read_buf(int fd, void *buf, size_t count)` | `read(2)` of an eventfd: 8 or -1 (`EINVAL` if `count < 8`) |
+| `intptr_t gk_eventfd_write_buf(int fd, const void *buf, size_t count)` | `write(2)` of an eventfd: 8 or -1 |
+| `ssize_t gk_read(int fd, void *buf, size_t count)` | `read(2)` of *any* fd: eventfd semantics for ours, else the real `read` (`int`/`_read` on Windows) |
+| `ssize_t gk_write(int fd, const void *buf, size_t count)` | `write(2)` of any fd (`int`/`_write` on Windows) |
+| `int gk_close(int fd)` | `close(2)` of any fd (`_close` on Windows) |
+| `uintptr_t gk_eventfd_socket(int fd)` | Windows only: the `SOCKET` to `WSAPoll`/`select` on |
+
+They follow C conventions: `-1` and `errno` on failure. Flags are
+`GK_EFD_SEMAPHORE`, `GK_EFD_NONBLOCK` and `GK_EFD_CLOEXEC`.
+
+The header computes `GK_EVENTFD_NATIVE` in one place: 1 on Linux, Android,
+FreeBSD 13+, NetBSD 10+ and illumos, where it includes the system
+`<sys/eventfd.h>` (so `EFD_*` have the OS's own values) and the `gk_`
+functions pass straight through to libc. Elsewhere (macOS, iOS, OpenBSD,
+DragonFly, Windows) it also defines the standard names `eventfd`,
+`eventfd_read`, `eventfd_write` (as `static inline` wrappers), `eventfd_t`
+and `EFD_*`, unless you define `GK_EVENTFD_NO_COMPAT_NAMES`.
 
 ```c
 #include <stdio.h>
 #include "adaptif_gatotkaca_eventfd.h"
 
 int main(void) {
-    int fd = gk_eventfd(0, EFD_NONBLOCK);
+    int fd = gk_eventfd(0, GK_EFD_NONBLOCK);
     if (fd < 0) { perror("eventfd"); return 1; }
 
     gk_eventfd_write(fd, 3);
@@ -177,27 +197,50 @@ int main(void) {
 }
 ```
 
-Build the static library and link it:
+To poll: on unix, `poll`/`select`/`kqueue` the returned fd itself (it is
+readable iff the counter is non-zero). On Windows the fd is a synthetic
+number (>= 65536, never a CRT fd); `WSAPoll`/`select` the socket from
+`gk_eventfd_socket(fd)` and call `WSAStartup` yourself before using Winsock.
+
+### Unchanged Linux code: `GK_EVENTFD_WRAP_IO`
+
+Code that does raw `read(efd, &v, 8)` / `write(efd, &v, 8)` / `close(efd)`
+can be compiled unchanged on the shim platforms by defining
+`GK_EVENTFD_WRAP_IO` before including the header. It then redirects
+`read`/`write`/`close` (on Windows also `_read`/`_write`/`_close`) to
+`gk_read`/`gk_write`/`gk_close`, which give our eventfds eventfd semantics
+and forward every other descriptor to the real function. It is a no-op where
+`GK_EVENTFD_NATIVE` is 1. The redirects are function-like macros, so they only
+affect calls in code compiled with this header (not prebuilt libraries, not
+Rust), don't affect `&read` or function pointers, and do rewrite member calls
+such as `obj->read(a, b, c)` (`#undef` them in such files). See
+[`examples/c/wrap_io.c`](examples/c/wrap_io.c).
+
+### Building
 
 ```sh
-cargo rustc --release --features ffi --crate-type staticlib
-# Print the system libraries the static lib needs on your platform:
+# Build the static library and print the system libraries it needs:
 cargo rustc --release --features ffi --crate-type staticlib -- --print native-static-libs
 
-# Linux / macOS
-cc -Iinclude main.c target/release/libadaptif_gatotkaca_eventfd.a -lpthread -lm -ldl -o main
+# Linux / macOS (use the libraries printed above)
+cc -std=c11 -Iinclude main.c target/release/libadaptif_gatotkaca_eventfd.a -lpthread -lm -ldl -o main
 
 # Windows (MSVC developer prompt)
-cl /Iinclude main.c target\release\adaptif_gatotkaca_eventfd.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib advapi32.lib kernel32.lib
+cl /MD /Iinclude main.c target\release\adaptif_gatotkaca_eventfd.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib advapi32.lib kernel32.lib
 ```
 
-The functions follow C conventions: they return `-1` and set `errno` on
-failure. See [`examples/c/smoke.c`](examples/c/smoke.c) for a fuller example.
+On Windows, link the C program against the same dynamic CRT as Rust (`/MD`)
+so both sides see the same `errno`.
+
+[`examples/c/smoke.c`](examples/c/smoke.c) and
+[`examples/c/wrap_io.c`](examples/c/wrap_io.c) are fuller examples. They
+build warning-free with `-std=c11 -Wall -Wextra -Werror` (gcc, clang) and
+`/W3 /WX` (MSVC), and exit 0 when every check passes.
 
 From Rust, the same functions are available without the `ffi` feature in
-`adaptif_gatotkaca_eventfd::compat`: `eventfd(initval, flags) -> c_int`,
-`eventfd_read(fd, *mut eventfd_t)`, `eventfd_write(fd, eventfd_t)` and
-`eventfd_close(fd)`.
+`adaptif_gatotkaca_eventfd::compat`: `eventfd`, `eventfd_read`,
+`eventfd_write`, `eventfd_close`, `eventfd_read_buf`, `eventfd_write_buf`
+and (Windows) `eventfd_socket`.
 
 ## Feature flags
 
@@ -238,11 +281,13 @@ DragonFly, Windows, and any platform built with `force-shim`):
 
 - **Raw I/O has no eventfd semantics.** `read(2)`, `write(2)` or `recv` on
   the shim descriptor reach the internal signalling pipe or socket, not the
-  counter. Use `GkEventFd::read`/`write` or the `compat` functions.
+  counter. Use `GkEventFd::read`/`write`, the `compat` functions, or in C
+  `gk_read`/`gk_write` (or `GK_EVENTFD_WRAP_IO`).
 - **Close with `eventfd_close`.** A descriptor obtained from
   `compat::eventfd` (or `gk_eventfd` in C) is registered with the compat
-  layer. Close it with `eventfd_close`, not a raw `close`/`closesocket`, or the
-  counter leaks and the descriptor number may later map to a stale entry.
+  layer. Close it with `eventfd_close` (or `gk_close`), not a raw
+  `close`/`closesocket`, or the counter leaks (the stale entry is discarded
+  without closing anything if the OS reuses the number).
 - **No sharing across `fork()`.** The counter lives in process memory. After
   `fork()`, parent and child have separate counters.
 - **No write readiness.** `POLLOUT` and writability are not reported in a

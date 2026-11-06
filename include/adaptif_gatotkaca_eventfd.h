@@ -1,0 +1,263 @@
+/*
+ * adaptif_gatotkaca_eventfd.h - C interface of the adaptif-gatotkaca-eventfd
+ * Rust crate (build it with `--features ffi`).
+ *
+ * A cross-platform eventfd(2) with Linux semantics: a 64-bit counter whose
+ * descriptor is readable exactly while the counter is non-zero.
+ *
+ *   - Native platforms (GK_EVENTFD_NATIVE == 1: Linux, Android, FreeBSD 13+,
+ *     NetBSD 10+, illumos): this header includes <sys/eventfd.h> (so EFD_*
+ *     have the OS's own values); the gk_* functions pass straight through
+ *     to libc and the descriptor is the kernel eventfd.
+ *   - macOS, iOS, OpenBSD, DragonFly: the descriptor is the read end of an
+ *     internal pipe,
+ *     pollable with poll/select/kqueue. Raw read/write/close on it do NOT have
+ *     eventfd semantics: use the gk_* functions, or GK_EVENTFD_WRAP_IO below.
+ *   - Windows: the descriptor is a synthetic int >= 65536 (never a CRT fd).
+ *     Use gk_eventfd_socket() to get a SOCKET for WSAPoll/select.
+ *
+ * Every function returns -1 and sets errno on failure.
+ *
+ * Configuration macros (define them before including this header):
+ *
+ *   GK_EVENTFD_NO_COMPAT_NAMES
+ *       On non-native platforms this header provides the <sys/eventfd.h>
+ *       names (eventfd, eventfd_read, eventfd_write, eventfd_t, EFD_*) as
+ *       static inline wrappers around gk_*, so code written for Linux
+ *       compiles unchanged. Define this to get only the gk_* / GK_EFD_*
+ *       names, e.g. to avoid clashing with a system <sys/eventfd.h>.
+ *
+ *   GK_EVENTFD_WRAP_IO
+ *       On non-native platforms, redirect raw I/O so Linux code that does
+ *       read(efd, &v, 8) / write(efd, &v, 8) / close(efd) works unchanged:
+ *         unix:    read, write, close           -> gk_read, gk_write, gk_close
+ *         Windows: _read, _write, _close and the
+ *                  POSIX aliases read, write, close -> gk_read, gk_write, gk_close
+ *       gk_* give eventfd semantics to descriptors from gk_eventfd and
+ *       forward every other descriptor to the real function. No-op on native
+ *       platforms. Limitations: these are function-like macros, so they only
+ *       affect code compiled with this header (not prebuilt libraries, not
+ *       Rust code), they do not affect uses that are not calls (taking
+ *       &read or storing `read` in a function pointer bypasses the
+ *       redirect), and they DO rewrite calls through members named like
+ *       them (obj->read(a, b, c) becomes obj->gk_read(a, b, c)); #undef the
+ *       macro in such files. This header includes <unistd.h> (unix) or
+ *       <io.h> (Windows) first so the system prototypes are not rewritten.
+ *
+ *   GK_EVENTFD_NATIVE
+ *       1 where the platform has a kernel eventfd and the crate passes
+ *       through to it, else 0. Computed below; only override it to match a
+ *       library built with the `force-shim` testing feature (-DGK_EVENTFD_NATIVE=0).
+ *
+ * SPDX-License-Identifier: MIT OR Apache-2.0
+ * Copyright (c) 2026 Adaptif.
+ */
+
+#ifndef ADAPTIF_GATOTKACA_EVENTFD_H
+#define ADAPTIF_GATOTKACA_EVENTFD_H
+
+/* The one place that decides which platforms use the kernel eventfd
+ * (must match `cfg(gk_native)` in the crate's build.rs). */
+#ifndef GK_EVENTFD_NATIVE
+#if defined(__linux__) || defined(__ANDROID__) || defined(__illumos__)
+#define GK_EVENTFD_NATIVE 1
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
+#include <sys/param.h> /* __FreeBSD_version, __NetBSD_Version__ */
+#if (defined(__FreeBSD_version) && __FreeBSD_version >= 1300000) || \
+    (defined(__NetBSD_Version__) && __NetBSD_Version__ >= 1000000000)
+#define GK_EVENTFD_NATIVE 1
+#else
+#define GK_EVENTFD_NATIVE 0
+#endif
+#else
+#define GK_EVENTFD_NATIVE 0
+#endif
+#endif
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef _WIN32
+#if defined(GK_EVENTFD_WRAP_IO) && !GK_EVENTFD_NATIVE
+#include <io.h> /* before the redirect macros below */
+#endif
+#else
+#include <sys/types.h> /* ssize_t */
+#if defined(GK_EVENTFD_WRAP_IO) && !GK_EVENTFD_NATIVE
+#include <unistd.h> /* before the redirect macros below */
+#endif
+#endif
+
+#if GK_EVENTFD_NATIVE
+
+#include <sys/eventfd.h>
+
+#define GK_EFD_SEMAPHORE EFD_SEMAPHORE
+#define GK_EFD_NONBLOCK EFD_NONBLOCK
+#define GK_EFD_CLOEXEC EFD_CLOEXEC
+
+#else
+
+/* Flag values: the Linux x86/arm values, as in src/flags.rs. */
+#define GK_EFD_SEMAPHORE 01
+#define GK_EFD_NONBLOCK 04000
+#define GK_EFD_CLOEXEC 02000000
+
+/* The eventfd counter type. */
+typedef uint64_t eventfd_t;
+
+#ifndef GK_EVENTFD_NO_COMPAT_NAMES
+#define EFD_SEMAPHORE GK_EFD_SEMAPHORE
+#define EFD_NONBLOCK GK_EFD_NONBLOCK
+#define EFD_CLOEXEC GK_EFD_CLOEXEC
+#endif
+
+#endif /* GK_EVENTFD_NATIVE */
+
+/* Return type of gk_read/gk_write: matches read/write (CRT _read/_write). */
+#ifdef _WIN32
+typedef int gk_ssize_t;
+#else
+typedef ssize_t gk_ssize_t;
+#endif
+
+#if defined(_MSC_VER) && !defined(__cplusplus)
+#define GK_EVENTFD_INLINE static __inline
+#else
+#define GK_EVENTFD_INLINE static inline
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Creates an eventfd with counter `initval`, like eventfd(2).
+ * `flags` is a bitwise OR of GK_EFD_SEMAPHORE, GK_EFD_NONBLOCK and
+ * GK_EFD_CLOEXEC (non-inheritable handles on Windows).
+ * Returns a descriptor >= 0, or -1 with errno set (EINVAL for unknown flags,
+ * EMFILE/ENFILE/ENOMEM on resource exhaustion).
+ * Close it with gk_eventfd_close() (or gk_close()).
+ */
+int gk_eventfd(unsigned int initval, int flags);
+
+/*
+ * Reads the counter into *value, like eventfd_read(3).
+ * Normal mode: stores the counter and resets it to 0.
+ * GK_EFD_SEMAPHORE: stores 1 and decrements the counter.
+ * If the counter is 0 it blocks, or fails with EAGAIN when non-blocking.
+ * Returns 0, or -1 with errno (EAGAIN, EBADF, EFAULT, ...).
+ */
+int gk_eventfd_read(int fd, eventfd_t *value);
+
+/*
+ * Adds `value` to the counter, like eventfd_write(3).
+ * Fails with EINVAL for UINT64_MAX. If the counter would exceed
+ * UINT64_MAX - 1 it blocks, or fails with EAGAIN when non-blocking.
+ * Returns 0, or -1 with errno.
+ */
+int gk_eventfd_write(int fd, eventfd_t value);
+
+/*
+ * Closes an eventfd created by gk_eventfd(). On non-native platforms never
+ * use a raw close()/closesocket() on it (unless GK_EVENTFD_WRAP_IO redirects
+ * close). Returns 0, or -1 with errno (EBADF).
+ */
+int gk_eventfd_close(int fd);
+
+/*
+ * read(2) with eventfd semantics: stores the counter value (as for
+ * gk_eventfd_read) as a native-endian uint64_t in the first 8 bytes of buf.
+ * Returns 8, or -1 with errno: EINVAL if count < 8, EAGAIN if non-blocking
+ * and the counter is 0, EBADF, EFAULT.
+ */
+intptr_t gk_eventfd_read_buf(int fd, void *buf, size_t count);
+
+/*
+ * write(2) with eventfd semantics: adds the native-endian uint64_t in the
+ * first 8 bytes of buf to the counter (as for gk_eventfd_write).
+ * Returns 8, or -1 with errno: EINVAL if count < 8 or the value is
+ * UINT64_MAX, EAGAIN if non-blocking and the counter would overflow, EBADF,
+ * EFAULT.
+ */
+intptr_t gk_eventfd_write_buf(int fd, const void *buf, size_t count);
+
+/*
+ * read(2) for any descriptor: eventfds from gk_eventfd() behave like
+ * gk_eventfd_read_buf(); every other descriptor is forwarded to the real
+ * read() (CRT _read() on Windows, with count clamped to INT_MAX).
+ */
+gk_ssize_t gk_read(int fd, void *buf, size_t count);
+
+/*
+ * write(2) for any descriptor: eventfds from gk_eventfd() behave like
+ * gk_eventfd_write_buf(); every other descriptor is forwarded to the real
+ * write() (CRT _write() on Windows, with count clamped to INT_MAX).
+ */
+gk_ssize_t gk_write(int fd, const void *buf, size_t count);
+
+/*
+ * close(2) for any descriptor: eventfds from gk_eventfd() are closed as by
+ * gk_eventfd_close(); every other descriptor is forwarded to the real
+ * close() (CRT _close() on Windows).
+ */
+int gk_close(int fd);
+
+#ifdef _WIN32
+/* Returned by gk_eventfd_socket() on error; equal to INVALID_SOCKET. */
+#define GK_EVENTFD_INVALID_SOCKET (~(uintptr_t)0)
+
+/*
+ * Windows only: returns the SOCKET (cast it to SOCKET) that is readable
+ * exactly while the counter is non-zero, for WSAPoll/select. The socket is
+ * owned by the eventfd: never recv() from or close it, and do not use it
+ * after gk_eventfd_close(). Returns GK_EVENTFD_INVALID_SOCKET with
+ * errno = EBADF for an unknown descriptor.
+ */
+uintptr_t gk_eventfd_socket(int fd);
+#endif
+
+#if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)
+
+/* <sys/eventfd.h> names, mapped onto the gk_* functions. */
+
+/* See gk_eventfd(). */
+GK_EVENTFD_INLINE int eventfd(unsigned int initval, int flags) {
+    return gk_eventfd(initval, flags);
+}
+
+/* See gk_eventfd_read(). */
+GK_EVENTFD_INLINE int eventfd_read(int fd, eventfd_t *value) {
+    return gk_eventfd_read(fd, value);
+}
+
+/* See gk_eventfd_write(). */
+GK_EVENTFD_INLINE int eventfd_write(int fd, eventfd_t value) {
+    return gk_eventfd_write(fd, value);
+}
+
+#endif
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+/* Raw-I/O redirect; must stay after every declaration above. */
+#if defined(GK_EVENTFD_WRAP_IO) && !GK_EVENTFD_NATIVE
+#undef read
+#undef write
+#undef close
+#define read(fd, buf, count) gk_read((fd), (buf), (count))
+#define write(fd, buf, count) gk_write((fd), (buf), (count))
+#define close(fd) gk_close(fd)
+#ifdef _WIN32
+#undef _read
+#undef _write
+#undef _close
+#define _read(fd, buf, count) gk_read((fd), (buf), (count))
+#define _write(fd, buf, count) gk_write((fd), (buf), (count))
+#define _close(fd) gk_close(fd)
+#endif
+#endif
+
+#endif /* ADAPTIF_GATOTKACA_EVENTFD_H */
