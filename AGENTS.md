@@ -33,8 +33,9 @@ visible to your crate.
    with `eventfd_dup`/`eventfd_dup2`/`eventfd_dup3` (`gk_dup*`). See section 5
    for raw `dup()` on shims.
 4. **`fork()` shares the counter on every unix platform** (on the shim too).
-   `exec()` and unrelated processes do not get it on the shim; Windows has no
-   `fork`. Use the native platforms or another IPC mechanism for those.
+   `exec()` and unrelated processes do not get it on the shim. Windows has no
+   `fork`: share with a child via `export_inheritable`/`export_to` +
+   `GkEventFd::import` (section 6).
 5. **Close by dropping** the `GkEventFd` (or `eventfd_close`/`gk_eventfd_close`
    in the C-style APIs). Never `close(2)` a shim fd yourself.
 6. Write-readiness (`POLLOUT`) is not reported on shims. Register for
@@ -221,7 +222,24 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - Uses a loopback TCP connection per eventfd. Each eventfd costs 2 sockets
   plus 1 per clone, and closed pairs sit in `TIME_WAIT`. Don't create and
   destroy thousands per second; reuse them.
-- Sockets are always non-inheritable, with or without `EFD_CLOEXEC`.
+- The eventfd's own handles are always non-inheritable, with or without
+  `EFD_CLOEXEC`. Share with another process explicitly:
+  - **At spawn:** `let export = efd.export_inheritable()?;` pass
+    `export.token()` to `std::process::Command` (e.g. `.env("GK_EVENTFD", ...)`),
+    spawn, then `drop(export)`. The child calls
+    `unsafe { GkEventFd::import(&token) }`. Every child spawned while the export
+    is alive inherits the handles.
+  - **To a running process:** `let token = efd.export_to(pid)?;` send the token
+    (stdin, pipe) and `import` it there. Nothing becomes inheritable.
+  - `import` takes ownership of the named handles: one import per token, in
+    the process the token was made for. Bad tokens fail without closing
+    anything.
+  - C: `gk_eventfd_export_inheritable` (+ `gk_eventfd_export_release` after
+    spawning), `gk_eventfd_export_to`, `gk_eventfd_import`; buffers of
+    `GK_EVENTFD_TOKEN_MAX` bytes.
+  - After sharing, the counter, blocking reads, readiness and
+    `set_nonblocking` work across the processes; the same cross-process lock
+    and dead-holder takeover as on the unix shim apply.
 - Use `WSAPoll`/`select`/mio for readiness. tokio needs `spawn_blocking`.
 - Third-party firewalls and antivirus that filter loopback traffic can delay
   or break readiness.
@@ -248,7 +266,10 @@ docker run --rm -v "$(pwd)":/w -w /w -v cargo-cache:/usr/local/cargo/registry \
 
 - `force-shim` makes Linux use the pipe shim. `tests/differential.rs` then
   compares it against the kernel eventfd with random operation sequences.
-  Run this after any change to `src/counter.rs` or `src/sys/unix_shim.rs`.
+  Run this after any change to `src/sys/shm.rs` (shared by the unix and
+  Windows shims) or `src/sys/unix_shim.rs`.
 - Windows tests only run on a Windows machine:
-  `cargo test --features mio,ffi`.
+  `cargo test --features mio,ffi`. `tests/windows_share.rs` and the
+  sharing tests in `src/sys/windows.rs` re-run the test binary as a child
+  process.
 - Commit messages: no `Co-Authored-By` lines.

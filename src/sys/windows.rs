@@ -1,10 +1,13 @@
-//! Windows backend: user-space [`Counter`] + loopback TCP socket pair.
+//! Windows backend: counter in a shared section + loopback TCP socket pair.
 //!
 //! # Design
 //!
-//! All eventfd semantics (blocking, non-blocking, semaphore mode, overflow)
-//! live in the shared [`Counter`]. This file only provides a [`Notifier`]
-//! that mirrors "counter > 0" onto a pollable socket:
+//! The eventfd rules (blocking, non-blocking, semaphore mode, overflow) and
+//! the cross-process lock live in [`SharedPage`] (`src/sys/shm.rs`), shared
+//! with the unix shim. The counter is in an unnamed file-mapping section, so
+//! it can be shared with other processes (see "Sharing with other processes").
+//! This file provides the [`Signal`] that mirrors "counter > 0" onto a
+//! pollable socket:
 //!
 //! * A connected loopback TCP pair (`writer` → `reader`) is created per
 //!   eventfd and shared by all clones ([`Shared`]).
@@ -19,8 +22,21 @@
 //!   It refers to the same underlying socket, so it becomes readable when the
 //!   byte arrives. No I/O is ever done on it: draining always goes through
 //!   the shared `reader`.
-//! * All sockets are non-blocking; blocking eventfd semantics come from the
-//!   counter's `Condvar`, never from the socket.
+//! * All sockets are non-blocking. A blocking read that finds the counter at
+//!   0 waits in `WSAPoll` for `reader` to become readable (which works across
+//!   processes) and tries again; a write that would overflow retries after
+//!   short sleeps.
+//!
+//! # Sharing with other processes
+//!
+//! Windows has no `fork`, so an eventfd is handed to another process
+//! explicitly, as a text token naming three objects: the section and the two
+//! sockets. [`Inner::export_inheritable`] makes inheritable copies (for a
+//! child spawned while the returned [`InheritableExport`] is alive);
+//! [`Inner::export_to`] duplicates them straight into one running process.
+//! [`Inner::import`] rebuilds a full handle from a token. Duplicated sockets
+//! refer to the same endpoints, so a byte sent by any process is seen by all.
+//! The section stays alive while any process maps it.
 //!
 //! # Loopback delivery latency
 //!
@@ -56,11 +72,11 @@
 //!
 //! # Handle inheritance (`EFD_CLOEXEC`)
 //!
-//! Sockets are *always* non-inheritable, whether or not `EFD_CLOEXEC` was
-//! requested. The counter lives in this process's memory, so an inherited
-//! socket would be useless to a child (it could only observe or corrupt the
-//! readiness byte), and since `std::process::Command` spawns children with
-//! `bInheritHandles = TRUE`, an inheritable socket would leak into every child.
+//! The eventfd's own handles are *always* non-inheritable, whether or not
+//! `EFD_CLOEXEC` was requested: `std::process::Command` spawns children with
+//! `bInheritHandles = TRUE`, so inheritable handles would leak into every
+//! child. Sharing is explicit, through the export functions; imported handles
+//! are made non-inheritable again.
 //!
 //! # mio
 //!
@@ -93,32 +109,38 @@
 //! Limitation: the re-arm only applies to the `Inner` that performed the
 //! read. A registration on clone A is re-armed when A is read (as mio's
 //! contract requires: read the registered source until `WouldBlock`); if only
-//! clone B is ever read, A's registration stays disarmed after its first
-//! event. Unlike Linux eventfd under `EPOLLET`, a write that does not take the
-//! counter from 0 to > 0 produces no new event (no new byte is sent); mio's
-//! contract (drain until `WouldBlock`) makes this unobservable for correct
-//! users.
+//! clone B (or another process) is ever read, A's registration stays disarmed
+//! after its first event. Unlike Linux eventfd under `EPOLLET`, a write that
+//! does not take the counter from 0 to > 0 produces no new event (no new byte
+//! is sent); mio's contract (drain until `WouldBlock`) makes this unobservable
+//! for correct users.
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::io::{
-    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket,
+    AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, FromRawHandle, FromRawSocket, OwnedHandle,
+    OwnedSocket, RawHandle, RawSocket,
 };
 use std::ptr;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, IN_ADDR, IN_ADDR_0, INADDR_LOOPBACK, INVALID_SOCKET, IPPROTO_TCP, POLLRDNORM,
-    POLLWRNORM, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSADATA, WSAGetLastError,
-    WSAPOLLFD, WSAPoll, WSASocketW, WSAStartup, bind, listen, setsockopt,
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
+    SetHandleInformation,
 };
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, FROM_PROTOCOL_INFO, IN_ADDR, IN_ADDR_0, INADDR_LOOPBACK, INVALID_SOCKET, IPPROTO_TCP,
+    POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR,
+    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    WSADATA, WSADuplicateSocketW, WSAGetLastError, WSAPOLLFD, WSAPROTOCOL_INFOW, WSAPoll,
+    WSASocketW, WSAStartup, bind, listen, setsockopt,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
-use crate::counter::{Counter, Notifier};
+use super::shm::{SharedPage, Signal};
 use crate::flags::EfdFlags;
 
 /// Upper bound for building the socket pair (connect + accept).
@@ -135,16 +157,16 @@ type PollSocket = mio::net::TcpStream;
 #[cfg(not(feature = "mio"))]
 type PollSocket = TcpStream;
 
-/// The connected loopback pair; the [`Notifier`] of the counter.
+/// The connected loopback pair; the [`Signal`] of the counter.
 #[derive(Debug)]
 struct SocketPair {
-    /// Receives the readiness byte. Only ever read by `clear_readable`.
+    /// Receives the readiness byte. Only ever read under the counter lock.
     reader: TcpStream,
-    /// Sends the readiness byte. Only ever written by `set_readable`.
+    /// Sends the readiness byte. Only ever written under the counter lock.
     writer: TcpStream,
 }
 
-impl Notifier for SocketPair {
+impl Signal for SocketPair {
     fn set_readable(&self) -> io::Result<()> {
         let deadline = Instant::now() + SEND_TIMEOUT;
         loop {
@@ -172,12 +194,7 @@ impl Notifier for SocketPair {
         let mut buf = [0u8; 64];
         loop {
             match (&self.reader).read(&mut buf) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "eventfd socket pair was closed",
-                    ));
-                }
+                Ok(0) => return Err(closed()),
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 // The counter is > 0, so our byte was sent and is in transit
@@ -194,12 +211,41 @@ impl Notifier for SocketPair {
             }
         }
     }
+
+    fn drain(&self) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+        loop {
+            match (&self.reader).read(&mut buf) {
+                Ok(0) => return Err(closed()),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn wait_readable(&self) -> io::Result<()> {
+        let revents = poll_one(self.reader.as_socket(), POLLRDNORM, -1)?;
+        if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+            return Err(closed());
+        }
+        Ok(())
+    }
 }
 
-/// State shared by all clones of one eventfd.
+fn closed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "eventfd socket pair was closed",
+    )
+}
+
+/// State shared by all clones of one eventfd in this process. The counter is
+/// in `page`, which other processes may map too.
 #[derive(Debug)]
 struct Shared {
-    counter: Counter,
+    page: SharedPage,
     pair: SocketPair,
 }
 
@@ -215,20 +261,19 @@ impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner")
             .field("socket", &self.sock.as_raw_socket())
-            .field("counter", &self.shared.counter)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl Inner {
     pub(crate) fn new(initval: u32, flags: EfdFlags) -> io::Result<Self> {
-        // EFD_CLOEXEC is implied: every socket is non-inheritable.
+        // EFD_CLOEXEC is implied: every handle is non-inheritable.
         let (reader, writer) = socket_pair()?;
         let shared = Arc::new(Shared {
-            counter: Counter::new(initval, flags),
+            page: SharedPage::new(initval, flags)?,
             pair: SocketPair { reader, writer },
         });
-        if shared.counter.is_readable() {
+        if shared.page.is_readable() {
             shared.pair.set_readable()?;
         }
         Self::with_shared(shared)
@@ -237,21 +282,21 @@ impl Inner {
     fn with_shared(shared: Arc<Shared>) -> io::Result<Self> {
         let sock = shared.pair.reader.try_clone()?;
         sock.set_nonblocking(true)?;
-        set_no_inherit(sock.as_socket())?;
+        set_inherit(sock.as_raw_socket() as RawHandle, false)?;
         #[cfg(feature = "mio")]
         let sock = mio::net::TcpStream::from_std(sock);
         Ok(Self { shared, sock })
     }
 
     pub(crate) fn read(&self) -> io::Result<u64> {
-        let result = self.shared.counter.read(&self.shared.pair);
+        let result = self.shared.page.read(&self.shared.pair);
         #[cfg(feature = "mio")]
         self.rearm();
         result
     }
 
     pub(crate) fn write(&self, value: u64) -> io::Result<()> {
-        self.shared.counter.write(value, &self.shared.pair)
+        self.shared.page.write(value, &self.shared.pair)
     }
 
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
@@ -259,12 +304,12 @@ impl Inner {
     }
 
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.shared.counter.set_nonblocking(nonblocking);
+        self.shared.page.set_nonblocking(nonblocking);
         Ok(())
     }
 
     pub(crate) fn is_nonblocking(&self) -> io::Result<bool> {
-        Ok(self.shared.counter.is_nonblocking())
+        Ok(self.shared.page.is_nonblocking())
     }
 }
 
@@ -310,6 +355,297 @@ impl Inner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sharing with other processes
+// ---------------------------------------------------------------------------
+
+/// Token prefix: crate + token format version.
+const TOKEN_PREFIX: &str = "gkefd1";
+
+/// Inheritable copies of an eventfd's handles, for a child process spawned
+/// while this value is alive. Dropping it closes this process's copies (a
+/// child that was already spawned keeps its own).
+#[derive(Debug)]
+pub(crate) struct InheritableExport {
+    token: String,
+    _section: OwnedHandle,
+    _reader: OwnedSocket,
+    _writer: OwnedSocket,
+}
+
+impl InheritableExport {
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl Inner {
+    /// Inheritable copies of the section and both sockets, plus a token
+    /// naming them (`gkefd1:i:<section>:<reader>:<writer>`, hex values).
+    pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        let section = self.shared.page.section().try_clone_to_owned()?;
+        set_inherit(section.as_raw_handle(), true)?;
+        let reader = OwnedSocket::from(self.shared.pair.reader.try_clone()?);
+        set_inherit(reader.as_raw_socket() as RawHandle, true)?;
+        let writer = OwnedSocket::from(self.shared.pair.writer.try_clone()?);
+        set_inherit(writer.as_raw_socket() as RawHandle, true)?;
+        let token = format!(
+            "{TOKEN_PREFIX}:i:{:x}:{:x}:{:x}",
+            section.as_raw_handle() as usize,
+            reader.as_raw_socket(),
+            writer.as_raw_socket()
+        );
+        Ok(InheritableExport {
+            token,
+            _section: section,
+            _reader: reader,
+            _writer: writer,
+        })
+    }
+
+    /// Duplicates the section into process `pid` and prepares the sockets
+    /// for it (`WSADuplicateSocketW`). Returns the token for that process
+    /// (`gkefd1:d:<section>:<reader info>:<writer info>`).
+    pub(crate) fn export_to(&self, pid: u32) -> io::Result<String> {
+        // SAFETY: plain call; the handle is owned right below.
+        let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+        if target.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh process handle that we own.
+        let target = unsafe { OwnedHandle::from_raw_handle(target) };
+
+        let mut remote: HANDLE = ptr::null_mut();
+        // SAFETY: duplicates our open section handle into `target`; the
+        // result is a handle value that is only meaningful in `target`.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.shared.page.section().as_raw_handle(),
+                target.as_raw_handle(),
+                &mut remote,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let infos = (|| {
+            let r = protocol_info(self.shared.pair.reader.as_socket(), pid)?;
+            let w = protocol_info(self.shared.pair.writer.as_socket(), pid)?;
+            Ok::<_, io::Error>((r, w))
+        })();
+        let (r, w) = match infos {
+            Ok(infos) => infos,
+            Err(e) => {
+                // Don't leak the section handle in the target process.
+                // SAFETY: closes the handle we just created in `target`.
+                unsafe {
+                    DuplicateHandle(
+                        target.as_raw_handle(),
+                        remote,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        0,
+                        0,
+                        DUPLICATE_CLOSE_SOURCE,
+                    )
+                };
+                return Err(e);
+            }
+        };
+        Ok(format!(
+            "{TOKEN_PREFIX}:d:{:x}:{}:{}",
+            remote as usize,
+            hex(&r),
+            hex(&w)
+        ))
+    }
+
+    /// Rebuilds an eventfd from a token made by `export_inheritable` (in a
+    /// child that inherited the handles) or `export_to` (for this process).
+    ///
+    /// Nothing named by the token is closed unless it validates: the sockets
+    /// must be the two ends of one loopback connection and the section must
+    /// hold an eventfd page.
+    ///
+    /// # Safety
+    ///
+    /// On success this takes ownership of the handles named by the token, so
+    /// the token must have been made for this process and be imported only
+    /// once, and nothing else in this process may own those handles.
+    pub(crate) unsafe fn import(token: &str) -> io::Result<Self> {
+        init_winsock();
+        let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid eventfd token");
+        let mut parts = token.trim().split(':');
+        if parts.next() != Some(TOKEN_PREFIX) {
+            return Err(bad());
+        }
+        let kind = parts.next().ok_or_else(bad)?;
+        let section = parse_hex_usize(parts.next().ok_or_else(bad)?).ok_or_else(bad)?;
+        let a = parts.next().ok_or_else(bad)?;
+        let b = parts.next().ok_or_else(bad)?;
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        let (reader, writer) = match kind {
+            "i" => {
+                let r = parse_hex_usize(a).ok_or_else(bad)? as RawSocket;
+                let w = parse_hex_usize(b).ok_or_else(bad)? as RawSocket;
+                check_pair(r, w)?;
+                // SAFETY: validated as our connected pair; the caller
+                // guarantees we may own the inherited handles.
+                unsafe {
+                    (
+                        OwnedSocket::from_raw_socket(r),
+                        OwnedSocket::from_raw_socket(w),
+                    )
+                }
+            }
+            "d" => {
+                let r = socket_from_info(&unhex_info(a).ok_or_else(bad)?)?;
+                let w = socket_from_info(&unhex_info(b).ok_or_else(bad)?)?;
+                // These are new sockets of ours; dropped (closed) on failure.
+                check_pair(r.as_raw_socket(), w.as_raw_socket())?;
+                (r, w)
+            }
+            _ => return Err(bad()),
+        };
+        // SAFETY: the caller guarantees `section` names a handle we may own;
+        // `adopt` only takes it over if it holds an eventfd page.
+        let page = unsafe { SharedPage::adopt(section as RawHandle) }?;
+
+        for h in [
+            page.section().as_raw_handle(),
+            reader.as_raw_socket() as RawHandle,
+            writer.as_raw_socket() as RawHandle,
+        ] {
+            set_inherit(h, false)?;
+        }
+        let reader = TcpStream::from(reader);
+        let writer = TcpStream::from(writer);
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Self::with_shared(Arc::new(Shared {
+            page,
+            pair: SocketPair { reader, writer },
+        }))
+    }
+}
+
+/// `WSADuplicateSocketW` of `sock` for process `pid`, as raw bytes.
+fn protocol_info(sock: BorrowedSocket<'_>, pid: u32) -> io::Result<Vec<u8>> {
+    let mut info = MaybeUninit::<WSAPROTOCOL_INFOW>::zeroed();
+    // SAFETY: `info` is a writable WSAPROTOCOL_INFOW; the socket is open.
+    if unsafe { WSADuplicateSocketW(sock.as_raw_socket() as SOCKET, pid, info.as_mut_ptr()) } != 0 {
+        return Err(last_wsa_error());
+    }
+    // SAFETY: plain-old-data struct, fully written by WSADuplicateSocketW.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), size_of::<WSAPROTOCOL_INFOW>())
+    };
+    Ok(bytes.to_vec())
+}
+
+/// Creates our socket from a `WSAPROTOCOL_INFOW` made for this process.
+fn socket_from_info(info: &WSAPROTOCOL_INFOW) -> io::Result<OwnedSocket> {
+    // SAFETY: `info` is a valid protocol info (WinSock validates it).
+    let raw = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            info,
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if raw == INVALID_SOCKET {
+        return Err(last_wsa_error());
+    }
+    // SAFETY: a fresh socket nothing else owns.
+    Ok(unsafe { OwnedSocket::from_raw_socket(raw as RawSocket) })
+}
+
+/// Checks, without taking ownership, that `reader` and `writer` are the two
+/// ends of one loopback TCP connection.
+fn check_pair(reader: RawSocket, writer: RawSocket) -> io::Result<()> {
+    // SAFETY: only used for getsockname/getpeername and never dropped
+    // (ManuallyDrop), so nothing is closed even if the values are bogus.
+    let (r, w) = unsafe {
+        (
+            ManuallyDrop::new(TcpStream::from_raw_socket(reader)),
+            ManuallyDrop::new(TcpStream::from_raw_socket(writer)),
+        )
+    };
+    let ok = (|| {
+        let (rl, rp, wl, wp) = (
+            r.local_addr()?,
+            r.peer_addr()?,
+            w.local_addr()?,
+            w.peer_addr()?,
+        );
+        Ok::<_, io::Error>(rp == wl && wp == rl && rl.ip().is_loopback())
+    })();
+    match ok {
+        Ok(true) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "eventfd token: sockets are not an eventfd socket pair",
+        )),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn parse_hex_usize(s: &str) -> Option<usize> {
+    (!s.is_empty() && s.len() <= 16)
+        .then(|| usize::from_str_radix(s, 16).ok())
+        .flatten()
+}
+
+fn unhex_info(s: &str) -> Option<WSAPROTOCOL_INFOW> {
+    if s.len() != size_of::<WSAPROTOCOL_INFOW>() * 2 {
+        return None;
+    }
+    let mut info = MaybeUninit::<WSAPROTOCOL_INFOW>::zeroed();
+    // SAFETY: we write exactly size_of::<WSAPROTOCOL_INFOW>() bytes into it.
+    let out = unsafe {
+        std::slice::from_raw_parts_mut(
+            info.as_mut_ptr().cast::<u8>(),
+            size_of::<WSAPROTOCOL_INFOW>(),
+        )
+    };
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    // SAFETY: plain-old-data struct; every bit pattern is a valid value
+    // (WinSock validates the contents).
+    Some(unsafe { info.assume_init() })
+}
+
+/// Sets or clears `HANDLE_FLAG_INHERIT` (sockets are kernel handles too).
+fn set_inherit(handle: RawHandle, inherit: bool) -> io::Result<()> {
+    let flag = if inherit { HANDLE_FLAG_INHERIT } else { 0 };
+    // SAFETY: SetHandleInformation only changes flags of an open handle; the
+    // callers pass handles they own or borrow.
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flag) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn last_wsa_error() -> io::Error {
     // SAFETY: WSAGetLastError has no preconditions.
     io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
@@ -341,24 +677,30 @@ fn set_no_inherit(sock: BorrowedSocket<'_>) -> io::Result<()> {
     }
 }
 
-/// `WSAPoll`s one socket. Returns `true` if any requested event (or an
-/// error/hangup) is pending.
-fn wait(sock: BorrowedSocket<'_>, events: i16, timeout: Duration) -> io::Result<bool> {
+/// `WSAPoll`s one socket for up to `ms` milliseconds (`-1`: no timeout).
+/// Returns the reported events (0 on timeout).
+fn poll_one(sock: BorrowedSocket<'_>, events: i16, ms: i32) -> io::Result<i16> {
     let mut fd = WSAPOLLFD {
         fd: sock.as_raw_socket() as SOCKET,
         events,
         revents: 0,
     };
-    // Round up so a sub-millisecond remainder does not become a busy loop.
-    let ms = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
     // SAFETY: `fd` is a valid WSAPOLLFD array of length 1 for the call, and
     // the socket is open for the duration of the borrow.
     let n = unsafe { WSAPoll(&mut fd, 1, ms) };
     if n == SOCKET_ERROR {
         Err(last_wsa_error())
     } else {
-        Ok(n > 0)
+        Ok(if n > 0 { fd.revents } else { 0 })
     }
+}
+
+/// `WSAPoll`s one socket. Returns `true` if any requested event (or an
+/// error/hangup) is pending.
+fn wait(sock: BorrowedSocket<'_>, events: i16, timeout: Duration) -> io::Result<bool> {
+    // Round up so a sub-millisecond remainder does not become a busy loop.
+    let ms = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+    Ok(poll_one(sock, events, ms)? != 0)
 }
 
 /// A non-inheritable listener on `127.0.0.1:0` with `SO_EXCLUSIVEADDRUSE`.
@@ -470,7 +812,7 @@ fn socket_pair() -> io::Result<(TcpStream, TcpStream)> {
 mod tests {
     use crate::{EfdFlags, GkEventFd};
     use std::io;
-    use std::os::windows::io::{AsRawSocket, AsSocket};
+    use std::os::windows::io::{AsRawHandle, AsRawSocket, AsSocket};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -655,5 +997,144 @@ mod tests {
             got.sort();
             assert_eq!(got, vec![Token(1), Token(2)]);
         }
+    }
+
+    // -- sharing with other processes -------------------------------------
+
+    #[test]
+    fn export_to_self_and_import() {
+        let a = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
+        let token = a.export_to(std::process::id()).unwrap();
+        assert!(token.starts_with("gkefd1:d:"));
+        assert!(
+            token.len() < crate::compat::TOKEN_MAX,
+            "token is {} bytes",
+            token.len()
+        );
+        // SAFETY: made for this process, imported once.
+        let b = unsafe { GkEventFd::import(&token) }.unwrap();
+        assert_ne!(a.as_raw_socket(), b.as_raw_socket());
+        a.write(3).unwrap();
+        assert!(readable(&b));
+        assert_eq!(b.read().unwrap(), 3);
+        assert!(idle(&a) && idle(&b));
+        // Non-blocking mode lives in the shared page.
+        b.set_nonblocking(false).unwrap();
+        assert!(!a.is_nonblocking().unwrap());
+        drop(a);
+        b.set_nonblocking(true).unwrap();
+        b.write(1).unwrap();
+        assert_eq!(b.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn import_rejects_malformed_tokens() {
+        for token in [
+            "",
+            "gkefd1",
+            "gkefd2:i:1:2:3",
+            "gkefd1:x:1:2:3",
+            "gkefd1:i:zz:1:2",
+            "gkefd1:i:1:2:3:4",
+            "gkefd1:d:4:00:00",
+        ] {
+            // SAFETY: rejected before any handle is touched.
+            let err = unsafe { GkEventFd::import(token) }.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{token:?}");
+        }
+    }
+
+    /// Sockets that are not one eventfd pair are rejected and left open.
+    #[test]
+    fn import_rejects_foreign_sockets_without_closing_them() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c1 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (s1, _) = listener.accept().unwrap();
+        let c2 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+        let section = efd.inner.shared.page.section().as_raw_handle() as usize;
+        // c1 and c2 are not connected to each other.
+        let token = format!(
+            "gkefd1:i:{section:x}:{:x}:{:x}",
+            c1.as_raw_socket(),
+            c2.as_raw_socket()
+        );
+        // SAFETY: rejected during validation; nothing is taken over.
+        let err = unsafe { GkEventFd::import(&token) }.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Everything is still open and usable.
+        assert!(c1.local_addr().is_ok() && c2.local_addr().is_ok() && s1.peer_addr().is_ok());
+        efd.write(1).unwrap();
+        assert_eq!(efd.read().unwrap(), 1);
+    }
+
+    /// Runs only as a child spawned by the tests below (`GK_WIN_TEST_ROLE`).
+    #[test]
+    fn child_entry() {
+        let Ok(role) = std::env::var("GK_WIN_TEST_ROLE") else {
+            return;
+        };
+        let token = std::env::var("GK_WIN_TEST_TOKEN").unwrap();
+        // SAFETY: the parent made this token for us (inherited handles).
+        let efd = unsafe { GkEventFd::import(&token) }.unwrap();
+        let page = &efd.inner.shared.page;
+        match role.as_str() {
+            // Take the lock, leave the readiness byte out of step with the
+            // counter, and wait to be killed while holding the lock.
+            "poke_and_hold" => {
+                std::mem::forget(page.lock_raw());
+                page.poke(5);
+                println!("locked");
+                io::Write::flush(&mut io::stdout()).unwrap();
+                thread::sleep(Duration::from_secs(60));
+            }
+            other => panic!("unknown role {other}"),
+        }
+    }
+
+    fn spawn_child(role: &str, token: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sys::windows::tests::child_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GK_WIN_TEST_ROLE", role)
+            .env("GK_WIN_TEST_TOKEN", token)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn recovers_when_child_is_killed_holding_the_lock() {
+        use std::io::BufRead;
+        let efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
+        let export = efd.export_inheritable().unwrap();
+        let mut child = spawn_child("poke_and_hold", export.token());
+        drop(export);
+        // Wait until the child holds the lock with a half-done update.
+        let mut out = io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(out.read_line(&mut line).unwrap() > 0, "child exited early");
+            if line.trim() == "locked" {
+                break;
+            }
+        }
+        assert_eq!(efd.inner.shared.page.holder(), child.id());
+        assert!(idle(&efd), "readiness byte was never sent");
+        child.kill().unwrap();
+        let start = std::time::Instant::now();
+        // Taking the lock over repairs readiness from the counter (5).
+        assert_eq!(efd.read().unwrap(), 5);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(idle(&efd));
+        efd.write(2).unwrap();
+        assert!(readable(&efd));
+        assert_eq!(efd.read().unwrap(), 2);
+        child.wait().unwrap();
     }
 }

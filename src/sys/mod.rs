@@ -23,7 +23,7 @@ mod native;
 #[cfg(gk_native)]
 pub(crate) use native::Inner;
 
-#[cfg(all(unix, not(gk_native)))]
+#[cfg(any(windows, all(unix, not(gk_native))))]
 mod shm;
 #[cfg(all(unix, not(gk_native)))]
 mod unix_shim;
@@ -33,7 +33,7 @@ pub(crate) use unix_shim::{Core, Inner, PipeId, pipe_id};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::Inner;
+pub(crate) use windows::{InheritableExport, Inner};
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("adaptif-gatotkaca-eventfd supports unix and windows targets only");

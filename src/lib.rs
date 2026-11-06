@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself |
 //! | macOS, iOS, OpenBSD, DragonFly | counter in fork-shared memory + pipe | read end of the pipe (`AsFd`) |
-//! | Windows | user-space counter + loopback socket pair | read socket (`AsSocket`) |
+//! | Windows | counter in a shareable section + loopback socket pair | read socket (`AsSocket`) |
 //!
 //! On the shim platforms the pollable object is readable exactly while the
 //! counter is non-zero, so it works with `poll`/`kqueue`/`WSAPoll`/`select`
@@ -36,9 +36,6 @@ use core::ffi::c_int;
 use std::fmt;
 use std::io;
 
-// The Mutex/Condvar counter is only used by the Windows shim; the unix shim
-// keeps its counter in cross-process shared memory (src/sys/shm.rs).
-#[cfg_attr(not(windows), allow(dead_code))]
 mod counter;
 mod error;
 mod flags;
@@ -110,10 +107,99 @@ impl GkEventFd {
         self.inner.is_nonblocking()
     }
 
+    /// Windows: prepares this eventfd for a child process spawned while the
+    /// returned [`InheritableExport`] is alive.
+    ///
+    /// It makes inheritable copies of the eventfd's handles; pass
+    /// [`InheritableExport::token`] to the child (for example in an
+    /// environment variable) and call [`GkEventFd::import`] there. The child
+    /// shares the counter with this process. Drop the export once the child
+    /// has been spawned: that closes this process's copies, not the child's.
+    ///
+    /// `std::process::Command` lets every child inherit inheritable handles,
+    /// so any other child spawned while the export is alive inherits them
+    /// too (harmless, but they stay open in that child until it exits). Use
+    /// [`export_to`](Self::export_to) to avoid that.
+    ///
+    /// ```no_run
+    /// # use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd};
+    /// let efd = GkEventFd::new(0, EfdFlags::NONE)?;
+    /// let export = efd.export_inheritable()?;
+    /// let mut child = std::process::Command::new("child.exe")
+    ///     .env("GK_EVENTFD", export.token())
+    ///     .spawn()?;
+    /// drop(export);
+    /// let value = efd.read()?; // woken by a write in the child
+    /// # child.wait()?; Ok::<(), std::io::Error>(())
+    /// ```
+    #[cfg(windows)]
+    pub fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        Ok(InheritableExport(self.inner.export_inheritable()?))
+    }
+
+    /// Windows: duplicates this eventfd into the running process `pid` and
+    /// returns a token for it. Send the token to that process (stdin, a pipe,
+    /// ...) and call [`GkEventFd::import`] there. Nothing becomes
+    /// inheritable. Needs `PROCESS_DUP_HANDLE` access to the target.
+    ///
+    /// If the target never imports the token, the duplicated section handle
+    /// stays open in it until it exits.
+    #[cfg(windows)]
+    pub fn export_to(&self, pid: u32) -> io::Result<String> {
+        self.inner.export_to(pid)
+    }
+
+    /// Windows: rebuilds an eventfd from a token made by
+    /// [`export_inheritable`](Self::export_inheritable) (in a child that
+    /// inherited the handles) or [`export_to`](Self::export_to) (for this
+    /// process). The result shares the counter with the exporting process
+    /// and works like any other `GkEventFd` (polling, clones, mio).
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] for a malformed token or
+    /// sockets that are not an eventfd's pair, and
+    /// [`io::ErrorKind::InvalidData`] for a section that is not an eventfd's.
+    /// In those cases nothing named by the token is closed.
+    ///
+    /// # Safety
+    ///
+    /// On success this takes ownership of the handles the token names (like
+    /// `FromRawHandle`), so the token must have been made for this process,
+    /// be imported only once, and those handles must not be owned by
+    /// anything else in this process.
+    #[cfg(windows)]
+    pub unsafe fn import(token: &str) -> io::Result<Self> {
+        // SAFETY: forwarded to the caller.
+        Ok(Self {
+            inner: unsafe { sys::Inner::import(token) }?,
+        })
+    }
+
     /// Splits the handle into its counter and descriptor (compat registry).
     #[cfg(all(unix, not(gk_native)))]
     pub(crate) fn into_core(self) -> (sys::Core, std::os::fd::OwnedFd) {
         self.inner.into_core()
+    }
+}
+
+/// Windows: inheritable copies of an eventfd's handles, from
+/// [`GkEventFd::export_inheritable`]. Spawn the child while this is alive and
+/// pass it [`token`](Self::token); dropping it closes this process's copies.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct InheritableExport(sys::InheritableExport);
+
+#[cfg(windows)]
+impl InheritableExport {
+    /// The text to give the child, for [`GkEventFd::import`].
+    pub fn token(&self) -> &str {
+        self.0.token()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Display for InheritableExport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.token())
     }
 }
 

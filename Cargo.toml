@@ -23,18 +23,20 @@ mio = ["dep:mio"]
 force-shim = []
 
 [dependencies]
+# Backoff for the shims' cross-process spinlock (src/sys/shm.rs).
+crossbeam-utils = "0.8"
 mio = { version = "1", optional = true, features = ["os-ext", "net"] }
 nohash-hasher = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# Backoff for the shim's cross-process spinlock.
-crossbeam-utils = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
 

@@ -169,6 +169,80 @@ pub unsafe fn eventfd_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
     unsafe { imp::eventfd_dup3(oldfd, newfd, flags) }
 }
 
+/// Windows: makes `fd` shareable with a child process spawned afterwards,
+/// writing a NUL-terminated token into `buf` (`len` bytes, at least
+/// `TOKEN_MAX`). Give the token to the child (e.g. in an environment
+/// variable) and call [`eventfd_import`] there. This process's inheritable
+/// copies stay open until [`eventfd_export_release`]; release them once the
+/// child is spawned. Any other child spawned meanwhile inherits them too.
+///
+/// Returns the token length, or `-1` with `errno` (`EBADF`, `ERANGE` if
+/// `buf` is too small, `EFAULT`).
+///
+/// # Safety
+///
+/// `buf` must be valid for writing `len` bytes.
+#[cfg(windows)]
+pub unsafe fn eventfd_export_inheritable(
+    fd: c_int,
+    buf: *mut core::ffi::c_char,
+    len: usize,
+) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_export_inheritable(fd, buf, len) }
+}
+
+/// Windows: closes this process's inheritable copies made by
+/// [`eventfd_export_inheritable`] for `token`. Returns `0`, or `-1` with
+/// `errno = EINVAL` for an unknown token.
+///
+/// # Safety
+///
+/// `token` must be a valid NUL-terminated string.
+#[cfg(windows)]
+pub unsafe fn eventfd_export_release(token: *const core::ffi::c_char) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_export_release(token) }
+}
+
+/// Windows: duplicates `fd` into the running process `pid`, writing a
+/// NUL-terminated token for it into `buf`. Send it to that process and call
+/// [`eventfd_import`] there. Returns the token length, or `-1` with `errno`.
+///
+/// # Safety
+///
+/// `buf` must be valid for writing `len` bytes.
+#[cfg(windows)]
+pub unsafe fn eventfd_export_to(
+    fd: c_int,
+    pid: u32,
+    buf: *mut core::ffi::c_char,
+    len: usize,
+) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_export_to(fd, pid, buf, len) }
+}
+
+/// Windows: opens an eventfd from a token made by
+/// [`eventfd_export_inheritable`] or [`eventfd_export_to`] in another
+/// process. Returns a new descriptor sharing that eventfd's counter, or `-1`
+/// with `errno` (`EINVAL` for a bad token, which leaves every handle it
+/// names open).
+///
+/// # Safety
+///
+/// `token` must be a NUL-terminated string made for this process and
+/// imported only once (see [`GkEventFd::import`](crate::GkEventFd::import)).
+#[cfg(windows)]
+pub unsafe fn eventfd_import(token: *const core::ffi::c_char) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { imp::eventfd_import(token) }
+}
+
+/// Windows: buffer size that always fits a token from the export functions.
+#[cfg(windows)]
+pub const TOKEN_MAX: usize = 4096;
+
 /// Returns the `SOCKET` of an eventfd, for `WSAPoll`/`select`/IOCP readiness.
 /// It is readable exactly while the counter is non-zero.
 ///
@@ -611,6 +685,9 @@ mod imp {
         map: IntMap<c_int, Handle>,
         /// Next synthetic descriptor to try.
         next: c_int,
+        /// Inheritable exports kept alive until `eventfd_export_release`
+        /// (C callers have no destructor to end them).
+        exports: std::collections::HashMap<String, crate::InheritableExport>,
     }
 
     /// First synthetic descriptor on Windows. The CRT allows at most 8192
@@ -625,6 +702,7 @@ mod imp {
             Self {
                 map: IntMap::default(),
                 next: FIRST_SYNTHETIC_FD,
+                exports: std::collections::HashMap::new(),
             }
         }
 
@@ -710,6 +788,103 @@ mod imp {
                 set_errno(errno::EBADF);
                 std::os::windows::io::RawSocket::MAX
             }
+        }
+    }
+
+    /// Copies `token` and a NUL into `buf` (`ERANGE` if it doesn't fit).
+    /// Returns the token length.
+    #[cfg(windows)]
+    unsafe fn copy_token(token: &str, buf: *mut core::ffi::c_char, len: usize) -> c_int {
+        if buf.is_null() {
+            return fail_errno(EFAULT);
+        }
+        if token.len() >= len {
+            return fail_errno(errno::ERANGE);
+        }
+        // SAFETY: the caller guarantees `buf` is writable for `len` bytes,
+        // and `token.len() + 1 <= len`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(token.as_ptr(), buf.cast::<u8>(), token.len());
+            *buf.add(token.len()) = 0;
+        }
+        token.len() as c_int
+    }
+
+    /// Maps import/export errors to errno (`EINVAL` for bad tokens).
+    #[cfg(windows)]
+    fn fail_share(e: &io::Error) -> c_int {
+        match e.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => fail_errno(errno::EINVAL),
+            _ => fail(e),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) unsafe fn eventfd_export_to(
+        fd: c_int,
+        pid: u32,
+        buf: *mut core::ffi::c_char,
+        len: usize,
+    ) -> c_int {
+        let Some(efd) = lookup(fd) else {
+            return fail_errno(errno::EBADF);
+        };
+        match efd.export_to(pid) {
+            // SAFETY: forwarded to the caller.
+            Ok(token) => unsafe { copy_token(&token, buf, len) },
+            Err(e) => fail_share(&e),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) unsafe fn eventfd_export_inheritable(
+        fd: c_int,
+        buf: *mut core::ffi::c_char,
+        len: usize,
+    ) -> c_int {
+        let Some(efd) = lookup(fd) else {
+            return fail_errno(errno::EBADF);
+        };
+        let export = match efd.export_inheritable() {
+            Ok(export) => export,
+            Err(e) => return fail_share(&e),
+        };
+        // SAFETY: forwarded to the caller.
+        let n = unsafe { copy_token(export.token(), buf, len) };
+        if n >= 0 {
+            let token = export.token().to_owned();
+            write_lock().exports.insert(token, export);
+        }
+        n
+    }
+
+    #[cfg(windows)]
+    pub(super) unsafe fn eventfd_export_release(token: *const core::ffi::c_char) -> c_int {
+        if token.is_null() {
+            return fail_errno(EFAULT);
+        }
+        // SAFETY: the caller guarantees a NUL-terminated string.
+        let token = unsafe { core::ffi::CStr::from_ptr(token) }.to_string_lossy();
+        let removed = write_lock().exports.remove(token.as_ref());
+        match removed {
+            Some(_) => 0, // dropped here: closes this process's copies
+            None => fail_errno(errno::EINVAL),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) unsafe fn eventfd_import(token: *const core::ffi::c_char) -> c_int {
+        if token.is_null() {
+            return fail_errno(EFAULT);
+        }
+        // SAFETY: the caller guarantees a NUL-terminated string.
+        let Ok(token) = unsafe { core::ffi::CStr::from_ptr(token) }.to_str() else {
+            return fail_errno(errno::EINVAL);
+        };
+        // SAFETY: forwarded to the caller (see compat::eventfd_import).
+        match unsafe { GkEventFd::import(token) } {
+            Ok(efd) => write_lock().insert_new(std::sync::Arc::new(efd)),
+            Err(e) => fail_share(&e),
         }
     }
 
@@ -1221,6 +1396,48 @@ pub(crate) mod tests {
         assert_eq!(write(d, 1), Ok(()));
         assert_eq!(read(d), Ok(1));
         assert_eq!(eventfd_close(d), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_export_import_c_style() {
+        use crate::error::errno::ERANGE;
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        let mut buf = vec![0 as core::ffi::c_char; TOKEN_MAX];
+        // SAFETY: `buf` is valid for its length; the token is for us.
+        unsafe {
+            let n = eventfd_export_to(fd, std::process::id(), buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "errno {}", errno());
+            let other = eventfd_import(buf.as_ptr());
+            assert!(other >= 0 && other != fd, "errno {}", errno());
+            assert_eq!(write(fd, 4), Ok(()));
+            assert_eq!(read(other), Ok(4));
+            assert_eq!(eventfd_close(other), 0);
+
+            // Too small a buffer.
+            let mut small = [0 as core::ffi::c_char; 8];
+            assert_eq!(
+                eventfd_export_to(fd, std::process::id(), small.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(errno(), ERANGE);
+
+            // Inheritable export: release closes our copies; unknown tokens fail.
+            let n = eventfd_export_inheritable(fd, buf.as_mut_ptr(), buf.len());
+            assert!(n > 0);
+            assert_eq!(eventfd_export_release(buf.as_ptr()), 0);
+            assert_eq!(eventfd_export_release(buf.as_ptr()), -1);
+            assert_eq!(errno(), EINVAL);
+
+            // Garbage is rejected.
+            assert_eq!(eventfd_import(c"gkefd1:i:1".as_ptr()), -1);
+            assert_eq!(errno(), EINVAL);
+            assert_eq!(eventfd_export_to(-1, 0, buf.as_mut_ptr(), buf.len()), -1);
+            assert_eq!(errno(), EBADF);
+        }
+        assert_eq!(eventfd_close(fd), 0);
     }
 
     /// The C header hard-codes the flag values for shim platforms.

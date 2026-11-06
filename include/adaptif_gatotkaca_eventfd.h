@@ -248,6 +248,48 @@ int gk_dup3(int oldfd, int newfd, int flags);
  * errno = EBADF for an unknown descriptor.
  */
 uintptr_t gk_eventfd_socket(int fd);
+
+/*
+ * Sharing with other processes (Windows has no fork). The parent exports
+ * the eventfd as a text token; the other process imports it and shares the
+ * counter (writes, blocking reads and readiness work across processes).
+ */
+
+/* Buffer size that always fits an export token, including the NUL. */
+#define GK_EVENTFD_TOKEN_MAX 4096
+
+/*
+ * For a child spawned next: makes inheritable copies of fd's handles and
+ * writes a NUL-terminated token into buf (len bytes, GK_EVENTFD_TOKEN_MAX is
+ * enough). Pass the token to the child (e.g. in an environment variable)
+ * and spawn it with handle inheritance (CreateProcess bInheritHandles=TRUE).
+ * Then call gk_eventfd_export_release(token) to close this process's copies.
+ * Any other child spawned in between inherits them too.
+ * Returns the token length, or -1 with errno (EBADF, ERANGE, EFAULT).
+ */
+int gk_eventfd_export_inheritable(int fd, char *buf, size_t len);
+
+/*
+ * Closes this process's copies made by gk_eventfd_export_inheritable.
+ * Returns 0, or -1 with errno = EINVAL for an unknown token.
+ */
+int gk_eventfd_export_release(const char *token);
+
+/*
+ * For a running process: duplicates fd's handles into process `pid`
+ * (needs PROCESS_DUP_HANDLE access) and writes a NUL-terminated token for it
+ * into buf. Send the token to that process (stdin, a pipe, ...). Nothing
+ * becomes inheritable. Returns the token length, or -1 with errno.
+ */
+int gk_eventfd_export_to(int fd, unsigned long pid, char *buf, size_t len);
+
+/*
+ * Opens an eventfd from a token made for this process by one of the export
+ * functions. Returns a new descriptor (close it with gk_eventfd_close), or
+ * -1 with errno = EINVAL for a bad token (every handle it names is left
+ * open). Import each token only once.
+ */
+int gk_eventfd_import(const char *token);
 #endif
 
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)

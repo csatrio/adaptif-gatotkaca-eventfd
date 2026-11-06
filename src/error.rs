@@ -24,6 +24,8 @@ pub(crate) mod errno {
     pub const EINTR: c_int = libc::EINTR;
     #[cfg(unix)]
     pub const EIO: c_int = libc::EIO;
+    #[cfg(unix)]
+    pub const ERANGE: c_int = libc::ERANGE;
 
     #[cfg(windows)]
     pub const EAGAIN: c_int = 11;
@@ -39,10 +41,14 @@ pub(crate) mod errno {
     pub const EINTR: c_int = 4;
     #[cfg(windows)]
     pub const EIO: c_int = 5;
+    #[cfg(windows)]
+    pub const ERANGE: c_int = 34;
 }
 
 /// `EAGAIN`: the operation would block on a non-blocking eventfd.
-/// `kind()` is always [`io::ErrorKind::WouldBlock`].
+/// `kind()` is always [`io::ErrorKind::WouldBlock`]. (Shims only: on native
+/// platforms the kernel reports it.)
+#[cfg_attr(gk_native, allow(dead_code))]
 pub(crate) fn would_block() -> io::Error {
     #[cfg(unix)]
     {

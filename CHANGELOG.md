@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (shared across `fork()`), guarded by a cross-process spinlock with
   `crossbeam-utils` backoff and dead-holder takeover, plus a pipe that is
   readable while the counter is non-zero.
-- Windows backend: user-space counter plus a loopback socket pair whose read
+- Windows backend: counter in an unnamed shared memory section (same
+  cross-process lock as the unix shim) plus a loopback socket pair whose read
   socket (`AsSocket`) is readable while the counter is non-zero.
+- Windows sharing with other processes: `GkEventFd::export_inheritable`
+  (`InheritableExport`), `GkEventFd::export_to(pid)` and
+  `GkEventFd::import(token)`; C-style `compat::eventfd_export_inheritable`,
+  `eventfd_export_release`, `eventfd_export_to`, `eventfd_import` and the
+  `gk_eventfd_export_*`/`gk_eventfd_import` exports.
 - `EfdFlags` and the `EFD_SEMAPHORE`, `EFD_CLOEXEC`, `EFD_NONBLOCK`, `EFD_MAX`
   constants, plus the `eventfd_t` type.
 - `compat` module with `<sys/eventfd.h>`-style `eventfd`, `eventfd_read`,
