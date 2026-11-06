@@ -7,8 +7,8 @@
 //! | Platform | Backend | Pollable object |
 //! |---|---|---|
 //! | Linux, Android | the kernel `eventfd(2)` (no shim) | the eventfd itself |
-//! | macOS, iOS, BSDs | user-space counter + pipe | read end of the pipe ([`AsFd`](std::os::fd::AsFd)) |
-//! | Windows | user-space counter + loopback socket pair | read socket ([`AsSocket`](std::os::windows::io::AsSocket)) |
+//! | macOS, iOS, BSDs | user-space counter + pipe | read end of the pipe (`AsFd`) |
+//! | Windows | user-space counter + loopback socket pair | read socket (`AsSocket`) |
 //!
 //! On the shim platforms the pollable object is readable exactly while the
 //! counter is non-zero, so it works with `poll`/`kqueue`/`WSAPoll`/`select`
