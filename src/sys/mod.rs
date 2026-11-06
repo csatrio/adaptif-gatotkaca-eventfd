@@ -24,6 +24,8 @@ mod native;
 pub(crate) use native::Inner;
 
 #[cfg(all(unix, not(gk_native)))]
+mod shm;
+#[cfg(all(unix, not(gk_native)))]
 mod unix_shim;
 #[cfg(all(unix, not(gk_native)))]
 pub(crate) use unix_shim::{Core, Inner, PipeId, pipe_id};

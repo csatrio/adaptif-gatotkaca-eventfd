@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_nonblocking`, and 8-byte `io::Read`/`io::Write`).
 - Native backend for Linux, Android, FreeBSD 13+, NetBSD 10+ and illumos: the kernel eventfd, with `AsFd`/`AsRawFd` and
   `OwnedFd`/`RawFd` conversions.
-- macOS/iOS/OpenBSD/DragonFly backend: user-space counter plus a pipe that is readable while
-  the counter is non-zero.
+- macOS/iOS/OpenBSD/DragonFly backend: counter in anonymous shared memory
+  (shared across `fork()`), guarded by a cross-process spinlock with
+  `crossbeam-utils` backoff and dead-holder takeover, plus a pipe that is
+  readable while the counter is non-zero.
 - Windows backend: user-space counter plus a loopback socket pair whose read
   socket (`AsSocket`) is readable while the counter is non-zero.
 - `EfdFlags` and the `EFD_SEMAPHORE`, `EFD_CLOEXEC`, `EFD_NONBLOCK`, `EFD_MAX`

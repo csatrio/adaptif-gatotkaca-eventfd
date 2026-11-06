@@ -20,7 +20,7 @@ C code written for Linux eventfd can be ported with almost no changes.
 | Platform | Backend | Pollable object | Raw-fd conversions |
 |---|---|---|---|
 | Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself (`AsFd`, `AsRawFd`) | `From<OwnedFd>`, `Into<OwnedFd>`, `IntoRawFd`, `FromRawFd` |
-| macOS, iOS, OpenBSD, DragonFly | counter (`Mutex` + `Condvar`) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
+| macOS, iOS, OpenBSD, DragonFly | counter in fork-shared memory (cross-process spinlock) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
 | Windows | counter (`Mutex` + `Condvar`) + loopback TCP socket pair | read socket (`AsSocket`, `AsRawSocket`) | — |
 
 On the shim backends the pipe or socket holds exactly one byte iff the counter
@@ -292,8 +292,15 @@ DragonFly, Windows, and any platform built with `force-shim`):
   layer. Close it with `eventfd_close` (or `gk_close`), not a raw
   `close`/`closesocket`. (On unix the registry notices a number that was
   closed behind its back and reused, and forgets it without closing anything.)
-- **No sharing across `fork()`.** The counter lives in process memory. After
-  `fork()`, parent and child have separate counters.
+- **`fork()` yes, `exec()` no (unix shims).** The counter lives in an
+  anonymous shared memory page, so parent and child keep sharing it after
+  `fork()`, including blocking reads woken from the other process. It is not
+  carried across `exec()` or to unrelated processes. Windows has no `fork()`;
+  its counter is per process.
+- **Not async-signal-safe.** Operations take a short cross-process lock, so
+  calling into an eventfd from a signal handler that interrupted an
+  operation on the same eventfd deadlocks. (A process that dies holding the
+  lock is detected and the lock is taken over.)
 - **No write readiness.** `POLLOUT` and writability are not reported in a
   meaningful way. Only readability (counter > 0) is supported.
 - **Duplicate through the crate.** Use `GkEventFd::try_clone` in Rust and

@@ -32,8 +32,9 @@ visible to your crate.
 3. **Share with `Arc<GkEventFd>` or `try_clone()`.** In C-style code duplicate
    with `eventfd_dup`/`eventfd_dup2`/`eventfd_dup3` (`gk_dup*`). See section 5
    for raw `dup()` on shims.
-4. **`fork()` does not share a shim counter** with the child. Use the native
-   platforms, or another IPC mechanism, if you need a cross-process eventfd.
+4. **`fork()` shares the counter on every unix platform** (on the shim too).
+   `exec()` and unrelated processes do not get it on the shim; Windows has no
+   `fork`. Use the native platforms or another IPC mechanism for those.
 5. **Close by dropping** the `GkEventFd` (or `eventfd_close`/`gk_eventfd_close`
    in the C-style APIs). Never `close(2)` a shim fd yourself.
 6. Write-readiness (`POLLOUT`) is not reported on shims. Register for
@@ -202,7 +203,19 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 **macOS / iOS / OpenBSD / DragonFly (pipe shim)**
 - Poll the fd with `kqueue` (`EVFILT_READ`), `poll`, `select` or mio.
 - Each `GkEventFd` uses 3 fds, plus 1 per clone. Size `RLIMIT_NOFILE` accordingly.
-- Without `EFD_CLOEXEC` the fds are inherited across `exec`, but the counter is not.
+- `fork()` shares the counter: it lives in an anonymous shared memory page,
+  guarded by a cross-process spinlock. Parent and child see each other's
+  writes, blocking reads wake across processes, and `set_nonblocking` is
+  shared (as `O_NONBLOCK` is on Linux).
+- If a process dies while holding that lock (only possible mid-operation, e.g.
+  `SIGKILL`), the next caller takes it over and repairs readiness.
+- Not shared across `exec` or with unrelated processes: without
+  `EFD_CLOEXEC` the fds are inherited across `exec`, but the counter is not.
+- Not async-signal-safe: don't call into an eventfd from a signal handler
+  that may have interrupted an operation on the same eventfd.
+- After `fork()` in a multithreaded program, the usual rule applies: the child
+  should only use the eventfd itself (its operations don't allocate), not
+  the compat registry, until it calls `exec`.
 
 **Windows (socket-pair shim)**
 - Uses a loopback TCP connection per eventfd. Each eventfd costs 2 sockets

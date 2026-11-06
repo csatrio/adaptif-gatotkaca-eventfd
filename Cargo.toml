@@ -28,6 +28,8 @@ nohash-hasher = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Backoff for the shim's cross-process spinlock.
+crossbeam-utils = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

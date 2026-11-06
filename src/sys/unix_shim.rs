@@ -5,15 +5,19 @@
 //!
 //! # Design
 //!
-//! The eventfd semantics (counter, semaphore mode, overflow, blocking) live in
-//! [`Counter`]. This backend only makes it pollable: a non-blocking pipe
-//! holds **exactly one byte while the counter is non-zero** and is empty
-//! otherwise. The [`Notifier`] calls that write and drain that byte run under
-//! the counter lock, so the pipe is readable if and only if the counter is
-//! non-zero.
+//! The counter lives in a page of anonymous shared memory ([`SharedPage`]),
+//! guarded by a cross-process spinlock in the same page, so it stays shared
+//! between parent and child after `fork(2)`, like a kernel eventfd. A
+//! non-blocking pipe makes it pollable: it holds **exactly one byte while the
+//! counter is non-zero** and is empty otherwise. That byte is written and
+//! drained under the lock, so the pipe is readable if and only if the counter
+//! is non-zero, in every process.
 //!
-//! Both pipe ends are always `O_NONBLOCK`; blocking `read`/`write` wait on the
-//! counter's condition variable, never on the pipe. Every handle (the first
+//! Both pipe ends are always `O_NONBLOCK`. A blocking `read` that finds the
+//! counter at 0 waits in `poll(2)` for the pipe to become readable (which
+//! works across processes) and tries again. A blocking `write` that would
+//! overflow the counter (only possible near `EFD_MAX`) retries after short
+//! sleeps of up to 1 ms. Every handle (the first
 //! one and each [`Inner::try_clone`]) owns its own `dup` of the pipe's read
 //! end. That descriptor is what [`AsFd`] returns, so each handle has a distinct
 //! fd number and can be registered with kqueue / mio independently. The
@@ -25,8 +29,10 @@
 //!   semantics: it is a pipe. Use [`GkEventFd::read`](crate::GkEventFd::read)
 //!   and [`GkEventFd::write`](crate::GkEventFd::write) (or the C ABI). Raw I/O
 //!   on the descriptor desynchronises its readiness from the counter.
-//! * The counter lives in this process's memory: after `fork(2)` the child
-//!   gets the descriptor but not a shared counter.
+//! * The counter is shared across `fork(2)`, but not across `exec(2)` or
+//!   with unrelated processes (the shared page is not passed along).
+//! * If a process dies while holding the lock, another process takes it
+//!   over and resynchronises the pipe with the counter (see `src/sys/shm.rs`).
 //! * A plain `dup(2)` of the descriptor shares readiness (same pipe), but
 //!   it is not a new eventfd handle; use `try_clone` to get one. (The compat
 //!   / C layer recognises such dups by their pipe identity, see [`pipe_id`].)
@@ -39,14 +45,20 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use crate::counter::{Counter, Notifier};
-use crate::flags::EfdFlags;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-/// State shared by every handle of one eventfd.
+use super::shm::{Guard, SharedPage};
+use crate::error;
+use crate::flags::{EFD_MAX, EfdFlags};
+
+/// State shared by every handle of one eventfd in this process. The counter
+/// itself is in `page`, which is also shared with forked processes.
 #[derive(Debug)]
 struct Shared {
-    counter: Counter,
-    /// Read end: holds one byte iff `counter > 0`.
+    page: SharedPage,
+    semaphore: bool,
+    /// Read end: holds one byte iff the counter is > 0.
     pipe_r: OwnedFd,
     pipe_w: OwnedFd,
 }
@@ -90,7 +102,8 @@ fn pending_bytes(fd: BorrowedFd<'_>) -> Option<libc::c_int> {
     (ret != -1).then_some(n)
 }
 
-impl Notifier for Shared {
+impl Shared {
+    /// Writes the readiness byte (counter went from 0 to > 0). Under the lock.
     fn set_readable(&self) -> io::Result<()> {
         // Checked only in this crate's tests: raw I/O on the fd by users is
         // unsupported but must not panic their debug builds.
@@ -112,6 +125,7 @@ impl Notifier for Shared {
         }
     }
 
+    /// Drains the readiness byte (counter went to 0). Under the lock.
     fn clear_readable(&self) -> io::Result<()> {
         // Drain until empty. Normally this reads exactly one byte; looping
         // keeps readiness correct even if the fd was written to directly.
@@ -134,6 +148,137 @@ impl Notifier for Shared {
             assert_eq!(drained, 1, "eventfd shim: pipe did not hold exactly 1 byte");
         }
         Ok(())
+    }
+
+    /// Takes the cross-process lock. If it was taken over from a process
+    /// that died holding it, the pipe may disagree with the counter: fix it.
+    fn lock(&self) -> io::Result<Guard<'_>> {
+        let guard = self.page.state().lock();
+        if guard.recovered {
+            self.resync()?;
+        }
+        Ok(guard)
+    }
+
+    /// Makes the pipe hold one byte iff the counter is > 0. Under the lock.
+    fn resync(&self) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+        loop {
+            // SAFETY: reads into a live local buffer from a valid open fd.
+            let r = cvt_retry(|| unsafe {
+                libc::read(self.pipe_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+            });
+            match r {
+                Ok(n) if n > 0 => continue,
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if self.page.state().counter.load(Ordering::Relaxed) > 0 {
+            self.set_readable()?;
+        }
+        Ok(())
+    }
+
+    /// `read(2)` on the eventfd.
+    fn read(&self) -> io::Result<u64> {
+        let state = self.page.state();
+        // Like Linux, the blocking mode is sampled when the call starts.
+        let nonblocking = state.nonblocking.load(Ordering::Relaxed);
+        loop {
+            {
+                let _guard = self.lock()?;
+                let value = state.counter.load(Ordering::Relaxed);
+                if value > 0 {
+                    let (ret, new) = if self.semaphore {
+                        (1, value - 1)
+                    } else {
+                        (value, 0)
+                    };
+                    if new == 0 {
+                        self.clear_readable()?;
+                    }
+                    state.counter.store(new, Ordering::Relaxed);
+                    return Ok(ret);
+                }
+                if nonblocking {
+                    return Err(error::would_block());
+                }
+            }
+            // Counter is 0: wait (outside the lock) until a write in any
+            // process makes the pipe readable, then try again.
+            self.wait_readable()?;
+        }
+    }
+
+    /// `write(2)` on the eventfd.
+    fn write(&self, add: u64) -> io::Result<()> {
+        if add == u64::MAX {
+            return Err(error::invalid_input());
+        }
+        let state = self.page.state();
+        let nonblocking = state.nonblocking.load(Ordering::Relaxed);
+        let mut sleep = Duration::from_micros(50);
+        loop {
+            {
+                let _guard = self.lock()?;
+                let value = state.counter.load(Ordering::Relaxed);
+                if EFD_MAX - value >= add {
+                    if add == 0 {
+                        return Ok(());
+                    }
+                    if value == 0 {
+                        self.set_readable()?;
+                    }
+                    state.counter.store(value + add, Ordering::Relaxed);
+                    return Ok(());
+                }
+                if nonblocking {
+                    return Err(error::would_block());
+                }
+            }
+            // Would overflow: wait for a read (in any process). There is no
+            // pollable "space available" signal, and this only happens with
+            // the counter near EFD_MAX, so poll the counter with short sleeps.
+            std::thread::sleep(sleep);
+            sleep = (sleep * 2).min(Duration::from_millis(1));
+        }
+    }
+
+    /// Blocks until the pipe is readable (the counter may be > 0).
+    fn wait_readable(&self) -> io::Result<()> {
+        let mut pfd = libc::pollfd {
+            fd: self.pipe_r.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one valid pollfd, no timeout.
+            if unsafe { libc::poll(&mut pfd, 1, -1) } >= 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.page
+            .state()
+            .nonblocking
+            .store(nonblocking, Ordering::Relaxed);
+    }
+
+    fn is_nonblocking(&self) -> bool {
+        self.page.state().nonblocking.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn peek(&self) -> u64 {
+        self.page.state().counter.load(Ordering::Relaxed)
     }
 }
 
@@ -208,7 +353,8 @@ impl Inner {
         let cloexec = flags.contains(EfdFlags::CLOEXEC);
         let (pipe_r, pipe_w) = make_pipe(cloexec)?;
         let shared = Shared {
-            counter: Counter::new(initval, flags),
+            page: SharedPage::new(u64::from(initval), flags.contains(EfdFlags::NONBLOCK))?,
+            semaphore: flags.contains(EfdFlags::SEMAPHORE),
             pipe_r,
             pipe_w,
         };
@@ -223,11 +369,11 @@ impl Inner {
     }
 
     pub(crate) fn read(&self) -> io::Result<u64> {
-        self.shared.counter.read(&*self.shared)
+        self.shared.read()
     }
 
     pub(crate) fn write(&self, value: u64) -> io::Result<()> {
-        self.shared.counter.write(value, &*self.shared)
+        self.shared.write(value)
     }
 
     /// New handle on the same counter with its own descriptor. Like
@@ -240,12 +386,12 @@ impl Inner {
     }
 
     pub(crate) fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
-        self.shared.counter.set_nonblocking(nb);
+        self.shared.set_nonblocking(nb);
         Ok(())
     }
 
     pub(crate) fn is_nonblocking(&self) -> io::Result<bool> {
-        Ok(self.shared.counter.is_nonblocking())
+        Ok(self.shared.is_nonblocking())
     }
 }
 
@@ -297,11 +443,11 @@ pub(crate) struct Core(Arc<Shared>);
 
 impl Core {
     pub(crate) fn read(&self) -> io::Result<u64> {
-        self.0.counter.read(&*self.0)
+        self.0.read()
     }
 
     pub(crate) fn write(&self, value: u64) -> io::Result<()> {
-        self.0.counter.write(value, &*self.0)
+        self.0.write(value)
     }
 
     /// Identity of this eventfd's pipe (see [`pipe_id`]).
@@ -567,6 +713,76 @@ mod tests {
         }
     }
 
+    /// Forks a child that takes the lock, runs `half_update` (leaving the
+    /// pipe out of step with the counter) and dies holding the lock. Returns
+    /// once the child has exited, unreaped, so the lock is orphaned.
+    fn die_mid_update(e: &Inner, half_update: impl FnOnce(&Shared)) -> libc::pid_t {
+        // SAFETY: the child only touches the shared page and calls _exit.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            std::mem::forget(e.shared.page.state().lock());
+            half_update(&e.shared);
+            // SAFETY: async-signal-safe exit in the forked child.
+            unsafe { libc::_exit(0) };
+        }
+        assert!(child > 0);
+        // Wait for it to exit, without reaping it (WNOWAIT).
+        loop {
+            // SAFETY: an all-zero siginfo_t is a valid value.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waits on our own child; WNOWAIT keeps it a zombie.
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if r == 0 {
+                break;
+            }
+            assert_eq!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::Interrupted
+            );
+        }
+        child
+    }
+
+    fn reap(child: libc::pid_t) {
+        let mut status = 0;
+        // SAFETY: reaps our own child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    }
+
+    #[test]
+    fn recovers_from_holder_dying_before_signalling() {
+        let e = Inner::new(0, nb()).unwrap();
+        // Counter set, readiness byte never written.
+        let child = die_mid_update(&e, |s| s.page.state().counter.store(5, Ordering::Relaxed));
+        assert!(!now(&e), "pipe should still be empty");
+        assert_eq!(e.read().unwrap(), 5);
+        assert!(!now(&e));
+        e.write(1).unwrap();
+        assert!(now(&e));
+        assert_eq!(e.read().unwrap(), 1);
+        reap(child);
+    }
+
+    #[test]
+    fn recovers_from_holder_dying_before_draining() {
+        let e = Inner::new(3, nb()).unwrap();
+        // Counter cleared, readiness byte left in the pipe.
+        let child = die_mid_update(&e, |s| s.page.state().counter.store(0, Ordering::Relaxed));
+        assert!(now(&e), "stale byte should still be there");
+        // Any operation takes the lock over and resynchronises the pipe.
+        e.write(0).unwrap();
+        assert!(!now(&e));
+        assert_eq!(e.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        reap(child);
+    }
+
     #[test]
     fn stress_keeps_pipe_invariant() {
         let e = Inner::new(0, nb() | EfdFlags::SEMAPHORE).unwrap();
@@ -587,7 +803,7 @@ mod tests {
             })
             .collect();
         let consumed: u64 = handles.into_iter().map(|t| t.join().unwrap()).sum();
-        let left = e.shared.counter.peek();
+        let left = e.shared.peek();
         assert_eq!(consumed + left, 4 * 2000);
         assert_eq!(now(&e), left > 0);
         assert_eq!(
@@ -598,6 +814,6 @@ mod tests {
         e.set_nonblocking(true).unwrap();
         while e.read().is_ok() {}
         assert!(!now(&e));
-        assert_eq!(e.shared.counter.peek(), 0);
+        assert_eq!(e.shared.peek(), 0);
     }
 }

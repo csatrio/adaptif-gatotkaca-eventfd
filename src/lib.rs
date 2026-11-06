@@ -7,7 +7,7 @@
 //! | Platform | Backend | Pollable object |
 //! |---|---|---|
 //! | Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself |
-//! | macOS, iOS, OpenBSD, DragonFly | user-space counter + pipe | read end of the pipe (`AsFd`) |
+//! | macOS, iOS, OpenBSD, DragonFly | counter in fork-shared memory + pipe | read end of the pipe (`AsFd`) |
 //! | Windows | user-space counter + loopback socket pair | read socket (`AsSocket`) |
 //!
 //! On the shim platforms the pollable object is readable exactly while the
@@ -36,7 +36,9 @@ use core::ffi::c_int;
 use std::fmt;
 use std::io;
 
-#[cfg_attr(gk_native, allow(dead_code))]
+// The Mutex/Condvar counter is only used by the Windows shim; the unix shim
+// keeps its counter in cross-process shared memory (src/sys/shm.rs).
+#[cfg_attr(not(windows), allow(dead_code))]
 mod counter;
 mod error;
 mod flags;
