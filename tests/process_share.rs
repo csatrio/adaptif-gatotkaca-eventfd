@@ -5,7 +5,9 @@
 //!   an environment variable);
 //! * unix: `send_to` / `recv_from` over a unix socket the child connects to
 //!   (`SCM_RIGHTS`, as for unrelated processes);
-//! * Windows: `export_to(pid)` + `import` (token on the child's stdin).
+//! * Windows: `export_to(pid)` + `import` (token on the child's stdin);
+//! * the uniform process API: `GkProcess::spawn` + `send` in the parent,
+//!   `GkProcess::from_parent` + `recv` in the child.
 //!
 //! Each test re-runs this test binary as the child, filtered to
 //! `child_entry`, with `GK_CHILD_ROLE` naming what the child should do. The
@@ -17,7 +19,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd};
+use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd, GkListener, GkProcess};
 
 /// How the child gets the eventfd.
 enum Via<'a> {
@@ -51,17 +53,31 @@ fn spawn(role: &str, via: Via<'_>) -> Child {
     cmd.spawn().unwrap()
 }
 
+/// A spawned child, plus the connection that must outlive the hand-over
+/// (Windows `GkProcess` keeps the offered section until dropped).
+struct Spawned(Child, Option<GkProcess>);
+
 /// Spawns a child via inheritance (all OS).
-fn spawn_inherited(efd: &GkEventFd, role: &str) -> Child {
+fn spawn_inherited(efd: &GkEventFd, role: &str) -> Spawned {
     let export = efd.export_inheritable().unwrap();
     let child = spawn(role, Via::Env(export.token()));
     drop(export);
-    child
+    Spawned(child, None)
+}
+
+/// Spawns a child through the uniform process API (all OS).
+fn spawn_process(efd: &GkEventFd, role: &str) -> Spawned {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+        .env("GK_CHILD_ROLE", role);
+    let (child, mut peer) = GkProcess::spawn(&mut cmd).unwrap();
+    peer.send(efd).unwrap();
+    Spawned(child, Some(peer))
 }
 
 /// Spawns a child that gets the eventfd the "unrelated process" way: over a
 /// unix socket on unix, `export_to` + stdin on Windows.
-fn spawn_passed(efd: &GkEventFd, role: &str) -> Child {
+fn spawn_passed(efd: &GkEventFd, role: &str) -> Spawned {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixListener;
@@ -78,7 +94,7 @@ fn spawn_passed(efd: &GkEventFd, role: &str) -> Child {
         let (stream, _) = listener.accept().unwrap();
         efd.send_to(&stream).unwrap();
         let _ = std::fs::remove_file(&path);
-        child
+        Spawned(child, None)
     }
     #[cfg(windows)]
     {
@@ -87,12 +103,12 @@ fn spawn_passed(efd: &GkEventFd, role: &str) -> Child {
         let token = efd.export_to(child.id()).unwrap();
         let mut stdin = child.stdin.take().unwrap();
         writeln!(stdin, "{token}").unwrap();
-        child
+        Spawned(child, None)
     }
 }
 
 /// Waits up to 20 s for the child and asserts it succeeded.
-fn join(mut child: Child) {
+fn join(Spawned(mut child, _keep): Spawned) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -149,6 +165,11 @@ fn child_entry() {
     let efd = if let Ok(token) = std::env::var("GK_TOKEN") {
         // SAFETY: the parent made this token for this process, once.
         unsafe { GkEventFd::import(&token) }.expect("import")
+    } else if std::env::var_os(adaptif_gatotkaca_eventfd::process::PARENT_ENV).is_some() {
+        GkProcess::from_parent()
+            .unwrap()
+            .recv()
+            .expect("GkProcess::recv")
     } else {
         receive()
     };
@@ -191,10 +212,11 @@ fn receive() -> GkEventFd {
     unsafe { GkEventFd::import(&line) }.expect("import")
 }
 
-/// Runs `test` with both ways of handing the eventfd over.
-fn both(test: impl Fn(fn(&GkEventFd, &str) -> Child)) {
+/// Runs `test` with every way of handing the eventfd over.
+fn both(test: impl Fn(fn(&GkEventFd, &str) -> Spawned)) {
     test(spawn_inherited);
     test(spawn_passed);
+    test(spawn_process);
 }
 
 #[test]
@@ -215,7 +237,7 @@ fn blocking_read_in_child_woken_by_parent() {
         let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
         let mut child = spawn(&efd, "blocking_read42");
         thread::sleep(Duration::from_millis(300));
-        assert!(child.try_wait().unwrap().is_none(), "child did not block");
+        assert!(child.0.try_wait().unwrap().is_none(), "child did not block");
         efd.write(42).unwrap();
         join(child);
     });
@@ -238,7 +260,7 @@ fn children_contend_without_losing_counts() {
     let children = vec![
         spawn_inherited(&efd, "write_ones"),
         spawn_passed(&efd, "write_ones"),
-        spawn_inherited(&efd, "write_ones"),
+        spawn_process(&efd, "write_ones"),
     ];
     let mut consumed = 0u64;
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -319,4 +341,38 @@ fn same_process_round_trips() {
     assert!(readable_within(&b, 0));
     assert_eq!(a.read().unwrap(), 4);
     assert!(!readable_within(&c, 0));
+}
+
+/// The uniform process API between two threads: bind/accept and connect,
+/// send and recv in both directions.
+#[test]
+fn listener_and_connect() {
+    let name = format!("test-{}", std::process::id());
+    let listener = GkListener::bind(&name).unwrap();
+    let client = thread::spawn(move || {
+        let mut peer = GkProcess::connect(&name).unwrap();
+        let efd = peer.recv().unwrap();
+        efd.write(5).unwrap();
+        let back = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
+        peer.send(&back).unwrap();
+        // Keep `peer` until the other side has received `back`.
+        thread::sleep(Duration::from_millis(500));
+        back.read().unwrap()
+    });
+    let mut peer = listener.accept().unwrap();
+    let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+    peer.send(&efd).unwrap();
+    assert_eq!(efd.read().unwrap(), 5);
+    let back = peer.recv().unwrap();
+    back.write(8).unwrap();
+    assert_eq!(client.join().unwrap(), 8);
+}
+
+#[test]
+fn from_parent_without_parent_fails() {
+    if std::env::var_os(adaptif_gatotkaca_eventfd::process::PARENT_ENV).is_some() {
+        return; // running as a spawned child
+    }
+    let err = GkProcess::from_parent().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 }

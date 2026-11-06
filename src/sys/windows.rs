@@ -535,6 +535,81 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// For `GkProcess`: an offer that process `peer_pid` can pull with
+    /// [`Inner::take_offer`] (`gkefd1:p:<section>:<reader info>:<writer info>`).
+    /// The section value is a handle in *this* process; the returned handle
+    /// must stay open until the peer has taken the offer.
+    pub(crate) fn offer_to(&self, peer_pid: u32) -> io::Result<(String, OwnedHandle)> {
+        let keep = self.shared.page.section().try_clone_to_owned()?;
+        let r = protocol_info(self.shared.pair.reader.as_socket(), peer_pid)?;
+        let w = protocol_info(self.shared.pair.writer.as_socket(), peer_pid)?;
+        let token = format!(
+            "{TOKEN_PREFIX}:p:{:x}:{}:{}",
+            keep.as_raw_handle() as usize,
+            hex(&r),
+            hex(&w)
+        );
+        Ok((token, keep))
+    }
+
+    /// Takes an offer made by process `peer_pid` with [`Inner::offer_to`]:
+    /// duplicates the section out of the peer and creates the sockets from
+    /// their protocol infos, so every handle is a fresh one we own. Safe: a
+    /// bad offer can't make us take over a handle we already had.
+    pub(crate) fn take_offer(token: &str, peer_pid: u32) -> io::Result<Self> {
+        init_winsock();
+        let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid eventfd offer");
+        let mut parts = token.trim().split(':');
+        if parts.next() != Some(TOKEN_PREFIX) || parts.next() != Some("p") {
+            return Err(bad());
+        }
+        let section = parse_hex_usize(parts.next().ok_or_else(bad)?).ok_or_else(bad)?;
+        let r = unhex_info(parts.next().ok_or_else(bad)?).ok_or_else(bad)?;
+        let w = unhex_info(parts.next().ok_or_else(bad)?).ok_or_else(bad)?;
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        // SAFETY: plain call; the handle is owned right below.
+        let peer = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, peer_pid) };
+        if peer.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh process handle that we own.
+        let peer = unsafe { OwnedHandle::from_raw_handle(peer) };
+        let mut ours: HANDLE = ptr::null_mut();
+        // SAFETY: duplicates a handle *out of* the peer into a fresh handle
+        // of ours; a bogus value just makes the call fail.
+        let ok = unsafe {
+            DuplicateHandle(
+                peer.as_raw_handle(),
+                section as HANDLE,
+                GetCurrentProcess(),
+                &mut ours,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh handle we own.
+        let page = SharedPage::from_owned(unsafe { OwnedHandle::from_raw_handle(ours) })?;
+        let reader = socket_from_info(&r)?;
+        let writer = socket_from_info(&w)?;
+        check_pair(reader.as_raw_socket(), writer.as_raw_socket())?;
+        let reader = TcpStream::from(reader);
+        let writer = TcpStream::from(writer);
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Self::with_shared(Arc::new(Shared {
+            page,
+            pair: SocketPair { reader, writer },
+        }))
+    }
+}
+
 /// `WSADuplicateSocketW` of `sock` for process `pid`, as raw bytes.
 fn protocol_info(sock: BorrowedSocket<'_>, pid: u32) -> io::Result<Vec<u8>> {
     let mut info = MaybeUninit::<WSAPROTOCOL_INFOW>::zeroed();

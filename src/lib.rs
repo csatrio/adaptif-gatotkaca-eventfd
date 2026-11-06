@@ -44,8 +44,10 @@ mod sys;
 pub mod compat;
 #[cfg(feature = "ffi")]
 mod ffi;
+pub mod process;
 
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
+pub use process::{GkListener, GkProcess};
 
 /// A cross-platform eventfd. See the [crate docs](crate).
 ///

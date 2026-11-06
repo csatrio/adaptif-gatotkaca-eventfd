@@ -719,6 +719,16 @@ impl SharedPage {
         unsafe { os::adopt(raw) }
     }
 
+    /// Like [`adopt`](Self::adopt) for a handle we already own (closed if it
+    /// does not validate).
+    pub(crate) fn from_owned(section: std::os::windows::io::OwnedHandle) -> io::Result<Self> {
+        let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&section);
+        // SAFETY: we own `section`; on success ownership moves into the page.
+        let page = unsafe { os::adopt(raw) }?;
+        std::mem::forget(section);
+        Ok(page)
+    }
+
     /// The section handle, to duplicate into other processes.
     pub(crate) fn section(&self) -> std::os::windows::io::BorrowedHandle<'_> {
         std::os::windows::io::AsHandle::as_handle(&self.section)

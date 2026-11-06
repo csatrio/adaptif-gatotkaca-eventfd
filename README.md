@@ -164,6 +164,42 @@ the process whose `efd.read()` observes that write (a syscall on Linux, the
 shim's cross-process lock elsewhere), so the eventfd can guard data in
 shared memory.
 
+### One API for every OS: `GkProcess`
+
+`GkProcess` is a connection to another process that eventfds can be sent
+over, with the same code on Linux, macOS and Windows. Underneath it is a
+unix socket (descriptors travel with `SCM_RIGHTS`) or, on Windows, a named
+pipe that records the peer's process id so the peer can pull the handles
+into itself. It is a thin layer over the per-OS calls below, which stay
+available.
+
+```rust,no_run
+use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd, GkListener, GkProcess};
+use std::process::Command;
+
+fn main() -> std::io::Result<()> {
+    // A spawned child:
+    let efd = GkEventFd::new(0, EfdFlags::NONE)?;
+    let (mut child, mut worker) = GkProcess::spawn(&mut Command::new("./worker"))?;
+    worker.send(&efd)?;
+    let rung = efd.read()?; // woken by the worker
+    child.wait()?;
+
+    // ... and in the worker: GkProcess::from_parent()?.recv()?
+
+    // Unrelated processes meet by name ($TMPDIR/gkefd-doorbell.sock on unix,
+    // \\.\pipe\gkefd-doorbell on Windows):
+    let listener = GkListener::bind("doorbell")?;
+    let mut peer = listener.accept()?; // the other side: GkProcess::connect("doorbell")?
+    peer.send(&efd)?;
+    Ok(())
+}
+```
+
+`recv` is safe on every OS: received descriptors are always fresh ones this
+process owns. On Windows, keep the sending `GkProcess` alive until the other
+side has received (it holds the offered section handle).
+
 ### Spawned children
 
 ```rust,no_run

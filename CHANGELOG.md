@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `export_to(pid)`. C-style `compat::eventfd_export_inheritable`,
   `eventfd_export_release`, `eventfd_import` (all OS), `eventfd_send`,
   `eventfd_recv` (unix) and the matching `gk_eventfd_*` exports.
+- `GkProcess` and `GkListener` (module `process`): one API on every OS to
+  hand eventfds to other processes. `GkProcess::spawn` / `from_parent` for
+  children, `GkListener::bind` / `accept` and `GkProcess::connect` for
+  unrelated processes, then `send` / `recv`. Unix sockets underneath on
+  unix; named pipes on Windows, recording the peer's pid so the receiver
+  pulls the handles into itself (safe `recv`, no token import).
 
 ### Changed
 

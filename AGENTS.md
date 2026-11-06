@@ -205,6 +205,14 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 | fd passed to an unrelated process (`SCM_RIGHTS`) | unix: `efd.send_to(&stream)` / `GkEventFd::recv_from(&stream)` on a connected `UnixStream` | don't interleave other writes on that stream with it |
 | (Windows equivalent of the above) | `let token = efd.export_to(pid)?;` send the text, `unsafe { GkEventFd::import(&token) }` there | needs `PROCESS_DUP_HANDLE` on the target |
 
+- **Uniform API (recommended):** `GkProcess` does the above with the same
+  code on every OS. Parent: `let (child, mut peer) = GkProcess::spawn(&mut cmd)?;
+  peer.send(&efd)?;` Child: `let efd = GkProcess::from_parent()?.recv()?;`
+  Unrelated processes: `GkListener::bind(name)?.accept()?` /
+  `GkProcess::connect(name)?`, then `send`/`recv`. Unix: unix socket
+  (`$TMPDIR/gkefd-<name>.sock`); Windows: named pipe `\\.\pipe\gkefd-<name>`
+  with the peer's pid recorded. `recv` is safe (no `unsafe import`). On
+  Windows keep the sending `GkProcess` alive until the peer has received.
 - After sharing, both processes use one counter: writes, blocking reads,
   readiness and `set_nonblocking` work across them. Data written before
   `efd.write()` is visible to the process whose `efd.read()` sees that write,
