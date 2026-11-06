@@ -15,6 +15,12 @@ faithful shim: a user-space counter paired with a pollable descriptor that is
 readable exactly while the counter is non-zero. So it plugs into `poll`,
 `kqueue`, `select`, `WSAPoll`, mio and tokio.
 
+On top of it come [`GkChannel`](#channels-gkchannel), a fast one-way channel
+through shared memory (messages plus bulk transfers of any size), and
+[`GkSharedMemory`](#shared-memory-gksharedmemory), shared memory with optional
+huge pages. All of them can be handed to other processes with one API on
+every OS.
+
 It also ships a `<sys/eventfd.h>`-style `compat` module and an optional C ABI.
 C code written for Linux eventfd can be ported with almost no changes.
 
@@ -35,7 +41,7 @@ in the counter, so always read and write through this crate (see
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-eventfd = "0.1"
+adaptif-gatotkaca-eventfd = "0.2"
 ```
 
 ```rust
@@ -466,6 +472,12 @@ fn worker() -> std::io::Result<()> {
 
   `populate: true` touches every page at creation, so later accesses don't
   fault.
+- **Trust:** a process you share memory with can write anything in it, so
+  check what you read. It can't resize it: on Linux, Android and FreeBSD the
+  size is sealed (and unsealed objects are refused on receipt), and macOS
+  and Windows don't allow it. On NetBSD, illumos, OpenBSD and DragonFly a
+  peer could shrink it and crash your process on its next access; share only
+  with processes you trust there. The same applies to channels.
 - **C:** `gk_shm_new`, `gk_shm_new_ex` (`gk_shm_options`,
   `GK_HUGE_PAGES_*`), `gk_shm_ptr`, `gk_shm_len`, `gk_shm_page_size`,
   `gk_shm_is_huge`, `gk_shm_fd` / `gk_shm_handle`, `gk_shm_free`,

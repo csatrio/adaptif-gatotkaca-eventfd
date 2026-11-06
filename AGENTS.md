@@ -61,8 +61,8 @@ visible to your crate.
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-eventfd = "0.1"                       # sync API
-# adaptif-gatotkaca-eventfd = { version = "0.1", features = ["mio"] }
+adaptif-gatotkaca-eventfd = "0.2"                       # sync API
+# adaptif-gatotkaca-eventfd = { version = "0.2", features = ["mio"] }
 ```
 
 ### Blocking wakeup between threads (all platforms)
@@ -318,6 +318,10 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   huge pages; `Require` fails with `Unsupported`, `PermissionDenied` or
   `OutOfMemory`. Check `is_huge()`.
 - `AsFd` (unix) / `AsHandle` (Windows) expose the object; don't resize it.
+- Trust: validate what you read from shared memory. Size is sealed on
+  Linux/Android/FreeBSD (unsealed objects are refused on receipt) and fixed
+  on macOS/Windows; on NetBSD, illumos, OpenBSD and DragonFly a peer could
+  shrink it (SIGBUS here), so share only with trusted processes there.
 - C: `gk_shm_options_default`, `gk_shm_new`, `gk_shm_new_ex(len, &opts | NULL)`
   (`GK_HUGE_PAGES_OFF/PREFER/REQUIRE`, `huge_page_size` 0 = default),
   `gk_shm_ptr`, `gk_shm_len`, `gk_shm_page_size`, `gk_shm_is_huge`,

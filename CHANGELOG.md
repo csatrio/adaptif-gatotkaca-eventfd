@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Planned as 0.2.0.
+## [0.2.0] - 2026-11-07
 
 ### Added
 
@@ -71,6 +71,22 @@ Planned as 0.2.0.
   `gk_process_recv_shm`. errno now also maps `Unsupported` to `ENOTSUP`,
   and on Windows a missing privilege to `EPERM`. Example:
   `examples/c/shared_memory.c`.
+
+### Changed
+
+- Shared memory internals (eventfd shim counters, channel rings) now round
+  their size up to the page size. FreeBSD creates them with
+  `memfd_create` instead of `shm_open(SHM_ANON)`.
+
+### Security
+
+- Linux, Android and FreeBSD: shared memory objects are created with their
+  size sealed (`F_SEAL_SHRINK | F_SEAL_GROW`), and objects received from
+  another process are refused (`InvalidData`) unless sealed. Before, a peer
+  could shrink a shared object and crash this process with `SIGBUS` on its
+  next access. macOS objects can't be resized after creation. NetBSD,
+  illumos, OpenBSD and DragonFly have no sealing: there a peer you share
+  with can still do this.
 
 ### Fixed
 
@@ -136,5 +152,6 @@ First release.
 - `force-shim` feature: use the unix shim on native platforms, for testing
   the shim against the kernel eventfd.
 
-[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/releases/tag/v0.1.0

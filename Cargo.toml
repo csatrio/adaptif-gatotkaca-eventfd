@@ -4,13 +4,13 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["PT Adaptif Sinergi Dinamis"]
-description = "Cross-platform eventfd with Linux semantics everywhere: the kernel eventfd on Linux and the BSDs, a faithful shim on macOS and Windows, shareable across processes, with a C ABI matching <sys/eventfd.h>."
+description = "Cross-platform eventfd with Linux semantics everywhere (the kernel eventfd on Linux and the BSDs, a faithful shim on macOS and Windows), plus shared-memory channels and shared memory with huge pages, all shareable across processes, with a C ABI matching <sys/eventfd.h>."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://adaptif.co.id/"
 repository = "https://github.com/csatrio/adaptif-gatotkaca-eventfd"
 documentation = "https://docs.rs/adaptif-gatotkaca-eventfd"
-keywords = ["eventfd", "ipc", "notification", "mio", "cross-platform"]
+keywords = ["eventfd", "ipc", "shared-memory", "mio", "cross-platform"]
 categories = ["os", "asynchronous", "concurrency", "api-bindings"]
 include = ["build.rs", "src/**", "include/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "AGENTS.md", "CHANGELOG.md", "LICENSE-*"]
 
