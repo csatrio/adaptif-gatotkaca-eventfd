@@ -99,7 +99,9 @@ fn invalid_data() -> io::Error {
 }
 
 impl SharedRegion {
-    /// A fresh, zero-filled region of `len` bytes.
+    /// A fresh, zero-filled region of `len` bytes (normal pages).
+    // Only the eventfd shims' counter page uses it outside tests.
+    #[cfg_attr(gk_native, allow(dead_code))]
     pub(crate) fn create(len: usize) -> io::Result<Self> {
         Self::create_with(len, &RegionOptions::default())
     }

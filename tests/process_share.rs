@@ -503,6 +503,28 @@ fn channel_child_sends_parent_receives() {
     join(Spawned(child, Some(peer)));
 }
 
+/// The bulk test over a channel on huge pages where available (Prefer), or
+/// required with `GK_TEST_HUGEPAGES=1`: the child maps the same pages.
+#[test]
+fn channel_bulk_to_child_on_huge_pages() {
+    let huge_pages = if std::env::var_os("GK_TEST_HUGEPAGES").is_some() {
+        adaptif_gatotkaca_eventfd::HugePages::Require
+    } else {
+        adaptif_gatotkaca_eventfd::HugePages::Prefer
+    };
+    let (mut tx, rx) = GkChannel::with_options(ChannelOptions {
+        huge_pages,
+        ..Default::default()
+    })
+    .unwrap();
+    let (child, mut peer) = spawn_channel_child("channel_bulk");
+    peer.send(&rx).unwrap();
+    drop(rx);
+    let id = tx.send_bulk_kind(0xb01c, &bulk_data()).unwrap();
+    tx.send_kind(0xfffe, &id.to_le_bytes()).unwrap();
+    join(Spawned(child, Some(peer)));
+}
+
 #[test]
 fn channel_bulk_to_child() {
     let (mut tx, rx) = channel();

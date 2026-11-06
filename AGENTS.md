@@ -243,7 +243,8 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 ## 6a. Channels (`GkChannel`)
 
 - `let (mut tx, mut rx) = GkChannel::new()?;` or
-  `GkChannel::with_options(ChannelOptions { capacity, max_message, bulk_capacity, chunk })`.
+  `GkChannel::with_options(ChannelOptions { capacity, max_message, bulk_capacity, chunk, huge_pages })`
+  (`huge_pages: HugePages::{Off, Prefer, Require}`, as in 6b; default Off).
   Defaults: message ring 1 MiB, bulk ring 4 MiB, 64 KiB messages and chunks
   (Windows: 256 KiB / 1 MiB rings). Rings: powers of two >= 64;
   `max_message <= capacity / 2 - 8`; `chunk <= bulk_capacity / 2 - 32`.

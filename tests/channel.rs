@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::io::{Read, Write};
 
 use adaptif_gatotkaca_eventfd::{
-    ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED,
+    ChannelOptions, GkChannel, GkReceiver, GkSender, HugePages, KIND_UNSPECIFIED,
 };
 
 fn small() -> (GkSender, GkReceiver) {
@@ -371,6 +371,54 @@ fn bulk_kinds() {
     assert_eq!(t.join().unwrap(), (a, b, c));
 }
 
+/// Messages and a bulk transfer through a channel on huge pages.
+fn exercise(mut tx: GkSender, mut rx: GkReceiver) {
+    let data = pattern(20 << 20, 11);
+    let expect = data.clone();
+    let t = thread::spawn(move || {
+        for i in 0..1000u32 {
+            tx.send_kind(i as u16, &i.to_le_bytes()).unwrap();
+        }
+        tx.send_bulk(&data).unwrap()
+    });
+    let mut buf = [0u8; 4];
+    for i in 0..1000u32 {
+        assert_eq!(rx.recv_kind(&mut buf).unwrap(), (i as u16, 4));
+        assert_eq!(u32::from_le_bytes(buf), i);
+    }
+    let mut out = Vec::new();
+    let id = rx.recv_bulk_vec(&mut out, 64 << 20).unwrap();
+    assert_eq!(id, t.join().unwrap());
+    assert!(out == expect);
+}
+
+#[test]
+fn huge_page_channels() {
+    let opts = |huge_pages| ChannelOptions {
+        huge_pages,
+        ..Default::default()
+    };
+    // Prefer always works (normal pages where huge ones aren't available).
+    let (tx, rx) = GkChannel::with_options(opts(HugePages::Prefer)).unwrap();
+    exercise(tx, rx);
+    match GkChannel::with_options(opts(HugePages::Require)) {
+        Ok((tx, rx)) => exercise(tx, rx),
+        Err(e) => {
+            assert!(
+                std::env::var_os("GK_TEST_HUGEPAGES").is_none(),
+                "GK_TEST_HUGEPAGES is set but Require failed: {e}"
+            );
+            assert!(
+                matches!(
+                    e.kind(),
+                    ErrorKind::Unsupported | ErrorKind::OutOfMemory | ErrorKind::PermissionDenied
+                ),
+                "{e}"
+            );
+        }
+    }
+}
+
 /// A channel with a small bulk ring, so transfers wrap many times.
 fn small_bulk() -> (GkSender, GkReceiver) {
     GkChannel::with_options(ChannelOptions {
@@ -378,6 +426,7 @@ fn small_bulk() -> (GkSender, GkReceiver) {
         max_message: 1000,
         bulk_capacity: 1 << 16,
         chunk: 16 << 10,
+        ..Default::default()
     })
     .unwrap()
 }

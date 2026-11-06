@@ -362,6 +362,8 @@ fn worker() -> std::io::Result<()> {
   is committed when the channel is created, the defaults are a 256 KiB
   message ring and a 1 MiB bulk ring. Transfers themselves have no size
   limit; `recv_bulk_vec` takes a limit to protect the receiver's memory.
+  `huge_pages: HugePages::Prefer` (or `Require`) puts the rings on huge
+  pages, as for [`GkSharedMemory`](#shared-memory-gksharedmemory).
 - **Blocking / non-blocking:** `set_nonblocking(true)` makes calls fail with
   `WouldBlock`; bulk writes may then be partial, like any `io::Write`.
   `send_bulk` always blocks until the data is in the ring.

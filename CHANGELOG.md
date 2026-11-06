@@ -27,6 +27,8 @@ Planned as 0.2.0.
     `recv_vec_kind`, `recv_with_kind`, `next_kind`, `send_bulk_kind`,
     `bulk_writer_kind`, `recv_bulk_vec_kind`, `BulkReader::kind`. The plain
     calls send `KIND_UNSPECIFIED` (0).
+  `ChannelOptions::huge_pages` puts the rings on huge pages (`HugePages`,
+  as for `GkSharedMemory`; C: `gk_channel_options.huge_pages`).
   `ChannelOptions` defaults: message ring 1 MiB, bulk ring 4 MiB, 64 KiB
   messages and chunks (Windows: 256 KiB and 1 MiB rings). Blocking and
   non-blocking modes, polling (`AsFd`/`AsSocket`, mio) with one doorbell

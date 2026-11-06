@@ -432,6 +432,7 @@ typedef struct gk_channel_options {
     size_t max_message;   /* largest message, bytes */
     size_t bulk_capacity; /* bulk ring, bytes */
     size_t chunk;         /* largest bulk chunk, bytes (transfers: any size) */
+    int huge_pages;       /* GK_HUGE_PAGES_* (see gk_shm); default OFF */
 } gk_channel_options;
 
 /* Fills *opts with the defaults. */

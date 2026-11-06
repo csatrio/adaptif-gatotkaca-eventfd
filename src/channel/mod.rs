@@ -89,8 +89,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::time::Duration;
 
-use crate::sys::{SharedRegion, current_pid, process_alive};
-use crate::{EfdFlags, GkEventFd};
+use crate::sys::{RegionOptions, SharedRegion, current_pid, process_alive};
+use crate::{EfdFlags, GkEventFd, HugePages};
 use lane::{Lane, Layout, Line, Sizes};
 
 /// The kind of messages and transfers sent without one: "unspecified".
@@ -115,6 +115,10 @@ pub struct ChannelOptions {
     /// Largest chunk of a bulk transfer in bytes; at most
     /// `bulk_capacity / 2 - 32`. Transfers themselves have no size limit.
     pub chunk: usize,
+    /// Back the rings with huge pages (see [`HugePages`]). The channel's
+    /// memory then grows to a whole number of huge pages (at least one,
+    /// e.g. 2 MiB). Default: [`HugePages::Off`].
+    pub huge_pages: HugePages,
 }
 
 impl ChannelOptions {
@@ -144,6 +148,7 @@ impl Default for ChannelOptions {
             max_message: Self::DEFAULT_MAX_MESSAGE,
             bulk_capacity: Self::DEFAULT_BULK_CAPACITY,
             chunk: Self::DEFAULT_CHUNK,
+            huge_pages: HugePages::Off,
         }
     }
 }
@@ -171,7 +176,13 @@ impl Ring {
         }
         let len = usize::try_from(sizes.region_len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "channel too large"))?;
-        let region = SharedRegion::create(len)?;
+        let region = SharedRegion::create_with(
+            len,
+            &RegionOptions {
+                huge: opts.huge_pages,
+                ..Default::default()
+            },
+        )?;
         // SAFETY: fresh, zeroed, page-aligned and `region_len` long.
         unsafe { Layout::init(region.ptr(), sizes, current_pid()) };
         Ok(Self::with_region(region))

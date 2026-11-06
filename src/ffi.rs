@@ -526,6 +526,7 @@ pub struct GkChannelOptionsC {
     max_message: usize,
     bulk_capacity: usize,
     chunk: usize,
+    huge_pages: c_int,
 }
 
 impl From<ChannelOptions> for GkChannelOptionsC {
@@ -535,6 +536,7 @@ impl From<ChannelOptions> for GkChannelOptionsC {
             max_message: o.max_message,
             bulk_capacity: o.bulk_capacity,
             chunk: o.chunk,
+            huge_pages: huge_to_c(o.huge_pages),
         }
     }
 }
@@ -570,12 +572,19 @@ pub unsafe extern "C" fn gk_channel_new(
         }
         // SAFETY: the caller guarantees `opts` is null or readable.
         let o = match unsafe { opts.as_ref() } {
-            Some(o) => ChannelOptions {
-                capacity: o.capacity,
-                max_message: o.max_message,
-                bulk_capacity: o.bulk_capacity,
-                chunk: o.chunk,
-            },
+            Some(o) => {
+                let Some(huge_pages) = huge_from_c(o.huge_pages) else {
+                    compat::set_errno(crate::error::errno::EINVAL);
+                    return -1;
+                };
+                ChannelOptions {
+                    capacity: o.capacity,
+                    max_message: o.max_message,
+                    bulk_capacity: o.bulk_capacity,
+                    chunk: o.chunk,
+                    huge_pages,
+                }
+            }
             None => ChannelOptions::default(),
         };
         match GkChannel::with_options(o) {
@@ -1258,6 +1267,24 @@ const GK_HUGE_PAGES_OFF: c_int = 0;
 const GK_HUGE_PAGES_PREFER: c_int = 1;
 const GK_HUGE_PAGES_REQUIRE: c_int = 2;
 
+fn huge_to_c(h: HugePages) -> c_int {
+    match h {
+        HugePages::Off => GK_HUGE_PAGES_OFF,
+        HugePages::Prefer => GK_HUGE_PAGES_PREFER,
+        HugePages::Require => GK_HUGE_PAGES_REQUIRE,
+    }
+}
+
+/// `None` for an unknown value.
+fn huge_from_c(h: c_int) -> Option<HugePages> {
+    match h {
+        GK_HUGE_PAGES_OFF => Some(HugePages::Off),
+        GK_HUGE_PAGES_PREFER => Some(HugePages::Prefer),
+        GK_HUGE_PAGES_REQUIRE => Some(HugePages::Require),
+        _ => None,
+    }
+}
+
 /// `gk_shm_options` in C.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1271,11 +1298,7 @@ pub struct GkShmOptionsC {
 impl From<SharedMemoryOptions> for GkShmOptionsC {
     fn from(o: SharedMemoryOptions) -> Self {
         Self {
-            huge_pages: match o.huge_pages {
-                HugePages::Off => GK_HUGE_PAGES_OFF,
-                HugePages::Prefer => GK_HUGE_PAGES_PREFER,
-                HugePages::Require => GK_HUGE_PAGES_REQUIRE,
-            },
+            huge_pages: huge_to_c(o.huge_pages),
             huge_page_size: o.huge_page_size.unwrap_or(0),
             populate: c_int::from(o.populate),
         }
@@ -1285,12 +1308,7 @@ impl From<SharedMemoryOptions> for GkShmOptionsC {
 impl GkShmOptionsC {
     /// The Rust options, or `None` for an unknown `huge_pages` value.
     fn to_options(self) -> Option<SharedMemoryOptions> {
-        let huge_pages = match self.huge_pages {
-            GK_HUGE_PAGES_OFF => HugePages::Off,
-            GK_HUGE_PAGES_PREFER => HugePages::Prefer,
-            GK_HUGE_PAGES_REQUIRE => HugePages::Require,
-            _ => return None,
-        };
+        let huge_pages = huge_from_c(self.huge_pages)?;
         Some(SharedMemoryOptions {
             huge_pages,
             huge_page_size: (self.huge_page_size != 0).then_some(self.huge_page_size),
