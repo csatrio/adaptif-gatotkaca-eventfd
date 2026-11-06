@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/c/process.c`.
 - C-style `compat::eventfd_process_send` / `eventfd_process_recv`.
 
+### Changed
+
+- Unix shims (macOS, iOS, OpenBSD, DragonFly): the counter page is an
+  unnamed shared memory object (`memfd_create`, `SHM_ANON`, or `shm_open` +
+  immediate `shm_unlink`) instead of an anonymous mapping, so it can be
+  inherited across `exec` and passed over unix sockets. Each eventfd uses one
+  more descriptor.
+
 ### Fixed
 
 - Windows: `GkListener::bind` / `gk_listener_bind` on a name already in use now
