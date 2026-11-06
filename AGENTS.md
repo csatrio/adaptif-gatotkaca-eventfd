@@ -229,6 +229,14 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - C: `gk_eventfd_export_inheritable` (then `gk_eventfd_export_release` after
   spawning), `gk_eventfd_import`, `gk_eventfd_send`/`gk_eventfd_recv` (unix),
   `gk_eventfd_export_to` (Windows); token buffers of `GK_EVENTFD_TOKEN_MAX`.
+- C process API (opaque `gk_process *` / `gk_listener *`, NULL or -1 +
+  errno on failure): `gk_listener_bind`/`accept`/`free`,
+  `gk_process_connect`, `gk_process_from_parent`, `gk_process_send(p, fd)`,
+  `gk_process_recv(p)` -> fd, `gk_process_free`. To spawn:
+  `gk_process_for_child(buf, len)` gives the value for the child's
+  `GK_EVENTFD_PARENT` (`GK_EVENTFD_PARENT_ENV`); spawn it yourself, then
+  optionally `gk_process_expect_pid(p, pid)` and `gk_process_send`. See
+  `examples/c/process.c`.
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 

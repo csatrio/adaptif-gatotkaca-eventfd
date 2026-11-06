@@ -23,14 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrelated processes, then `send` / `recv`. Unix sockets underneath on
   unix; named pipes on Windows, recording the peer's pid so the receiver
   pulls the handles into itself (safe `recv`, no token import).
-
-### Changed
-
-- Unix shims (macOS, iOS, OpenBSD, DragonFly): the counter page is an
-  unnamed shared memory object (`memfd_create`, `SHM_ANON`, or `shm_open` +
-  immediate `shm_unlink`) instead of an anonymous mapping, so it can be
-  inherited across `exec` and passed over unix sockets. Each eventfd uses one
-  more descriptor.
+- C process API: opaque `gk_process` / `gk_listener` handles with
+  `gk_listener_bind`/`accept`/`free`, `gk_process_connect`,
+  `gk_process_from_parent`, `gk_process_for_child` +
+  `gk_process_expect_pid` (spawn the child yourself), `gk_process_send`,
+  `gk_process_recv`, `gk_process_free`, and `GK_EVENTFD_PARENT_ENV`. Example:
+  `examples/c/process.c`.
+- C-style `compat::eventfd_process_send` / `eventfd_process_recv`.
 
 ### Fixed
 

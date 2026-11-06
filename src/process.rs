@@ -66,9 +66,10 @@ impl GkListener {
     /// unless `name` contains `/`), or the named pipe
     /// `\\.\pipe\gkefd-<name>` on Windows (unless `name` starts with `\\`).
     ///
-    /// On unix a stale socket file left by a dead listener is replaced; an
-    /// active listener under the same name makes this fail with
-    /// [`io::ErrorKind::AddrInUse`]. The socket file is removed on drop.
+    /// On unix the listener holds a lock on `<path>.lock` while it lives, so
+    /// a socket file left by a dead listener is replaced, and a live listener
+    /// under the same name makes this fail with
+    /// [`io::ErrorKind::AddrInUse`]. Both files are removed on drop.
     pub fn bind(name: &str) -> io::Result<Self> {
         Ok(Self(imp::Listener::bind(name)?))
     }
@@ -92,8 +93,30 @@ impl GkProcess {
     /// side sends or receives, which waits for the child to call
     /// `from_parent`. On Windows only that child (by pid) is accepted.
     pub fn spawn(cmd: &mut Command) -> io::Result<(Child, Self)> {
-        let (child, process) = imp::Process::spawn(cmd)?;
-        Ok((child, Self(process)))
+        let (mut process, name) = Self::for_child()?;
+        let child = cmd.env(PARENT_ENV, name).spawn()?;
+        process.expect_pid(child.id());
+        Ok((child, process))
+    }
+
+    /// A connection waiting for a child the caller spawns itself (C API):
+    /// returns it and the value for the child's [`PARENT_ENV`].
+    pub(crate) fn for_child() -> io::Result<(Self, String)> {
+        let (process, name) = imp::Process::for_child()?;
+        Ok((Self(process), name))
+    }
+
+    /// Only accept the child with this process id (Windows; no-op on unix,
+    /// where the private socket path is the protection).
+    pub(crate) fn expect_pid(&mut self, pid: u32) {
+        self.0.expect_pid(pid);
+    }
+
+    /// The connected unix socket (connecting a pending child first).
+    #[cfg(unix)]
+    #[cfg_attr(gk_native, allow(dead_code))]
+    pub(crate) fn unix_stream(&mut self) -> io::Result<&std::os::unix::net::UnixStream> {
+        self.0.stream()
     }
 
     /// In a child started by [`GkProcess::spawn`]: connects to the parent.
@@ -164,12 +187,11 @@ fn unique_name() -> String {
 
 #[cfg(unix)]
 mod imp {
-    use super::{PARENT_ENV, unique_name};
+    use super::unique_name;
     use crate::GkEventFd;
     use std::io;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
-    use std::process::{Child, Command};
 
     fn path_for(name: &str) -> PathBuf {
         if name.contains('/') {
@@ -183,24 +205,67 @@ mod imp {
     pub(super) struct Listener {
         sock: UnixListener,
         path: PathBuf,
+        lock_path: PathBuf,
+        /// Holds a write lock on `lock_path` for the listener's lifetime.
+        _lock: std::fs::File,
+    }
+
+    /// Takes the lock that marks `path` as owned by a live listener. The
+    /// kernel drops it when the process exits, so a socket file left by a
+    /// dead listener is recognised without connecting to it (a probe
+    /// connection would land in a live listener's accept queue).
+    fn lock(lock_path: &PathBuf) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)?;
+        // flock locks belong to the open file, so a second bind in the same
+        // process is refused too (fcntl record locks would allow it).
+        // SAFETY: plain flock on our open file.
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } == -1
+        {
+            let err = io::Error::last_os_error();
+            return Err(if err.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "another listener is bound to this name",
+                )
+            } else {
+                err
+            });
+        }
+        Ok(file)
     }
 
     impl Listener {
         pub(super) fn bind(name: &str) -> io::Result<Self> {
             let path = path_for(name);
-            let sock = match UnixListener::bind(&path) {
-                Ok(sock) => sock,
-                // A leftover file: replace it unless someone is listening.
-                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                    if UnixStream::connect(&path).is_ok() {
-                        return Err(e);
-                    }
-                    std::fs::remove_file(&path)?;
-                    UnixListener::bind(&path)?
-                }
+            let mut lock_path = path.clone().into_os_string();
+            lock_path.push(".lock");
+            let lock_path = PathBuf::from(lock_path);
+            let lock = lock(&lock_path)?;
+            // We own the name: any socket file left there is stale.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
-            };
-            Ok(Self { sock, path })
+            }
+            let sock = UnixListener::bind(&path)?;
+            Ok(Self {
+                sock,
+                path,
+                lock_path,
+                _lock: lock,
+            })
         }
 
         pub(super) fn accept(&self) -> io::Result<Process> {
@@ -211,6 +276,7 @@ mod imp {
     impl Drop for Listener {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.lock_path);
         }
     }
 
@@ -226,13 +292,15 @@ mod imp {
             Ok(Self::Ready(UnixStream::connect(path_for(name))?))
         }
 
-        pub(super) fn spawn(cmd: &mut Command) -> io::Result<(Child, Self)> {
+        pub(super) fn for_child() -> io::Result<(Self, String)> {
             let listener = Listener::bind(&unique_name())?;
-            let child = cmd.env(PARENT_ENV, &listener.path).spawn()?;
-            Ok((child, Self::Pending(listener)))
+            let name = listener.path.to_string_lossy().into_owned();
+            Ok((Self::Pending(listener), name))
         }
 
-        fn stream(&mut self) -> io::Result<&UnixStream> {
+        pub(super) fn expect_pid(&mut self, _pid: u32) {}
+
+        pub(super) fn stream(&mut self) -> io::Result<&UnixStream> {
             if let Self::Pending(listener) = self {
                 let ready = listener.accept()?;
                 // Dropping the listener removes the socket file.
@@ -260,13 +328,12 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::{PARENT_ENV, unique_name};
+    use super::unique_name;
     use crate::GkEventFd;
     use crate::compat::TOKEN_MAX;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::process::{Child, Command};
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
@@ -370,10 +437,10 @@ mod imp {
             pipe: File,
             pid: u32,
         },
-        /// `spawn`ed: waiting for that child (by pid) to connect.
+        /// Waiting for a spawned child to connect (only that pid, if known).
         Pending {
             listener: Listener,
-            child: u32,
+            child: Option<u32>,
         },
     }
 
@@ -432,21 +499,26 @@ mod imp {
             Ok(Self::ready(pipe, pid))
         }
 
-        pub(super) fn spawn(cmd: &mut Command) -> io::Result<(Child, Self)> {
+        pub(super) fn for_child() -> io::Result<(Self, String)> {
             let name = pipe_name(&unique_name());
             let listener = Listener::bind(&name)?;
-            let child = cmd.env(PARENT_ENV, &name).spawn()?;
             let state = State::Pending {
                 listener,
-                child: child.id(),
+                child: None,
             };
             Ok((
-                child,
                 Self {
                     state,
                     offered: Vec::new(),
                 },
+                name,
             ))
+        }
+
+        pub(super) fn expect_pid(&mut self, pid: u32) {
+            if let State::Pending { child, .. } = &mut self.state {
+                *child = Some(pid);
+            }
         }
 
         fn connection(&mut self) -> io::Result<(&mut File, u32)> {
@@ -454,7 +526,7 @@ mod imp {
                 // Only our child may connect; anyone else is dropped.
                 let ready = loop {
                     let p = listener.accept()?;
-                    if p.pid() == Some(*child) {
+                    if child.is_none() || p.pid() == *child {
                         break p.state;
                     }
                 };

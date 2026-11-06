@@ -197,7 +197,16 @@ fn main() -> std::io::Result<()> {
 ```
 
 `recv` is safe on every OS: received descriptors are always fresh ones this
-process owns. On Windows, keep the sending `GkProcess` alive until the other
+process owns.
+
+In C the same API uses opaque handles: `gk_listener_bind`,
+`gk_listener_accept`, `gk_listener_free`, `gk_process_connect`,
+`gk_process_from_parent`, `gk_process_send`, `gk_process_recv`,
+`gk_process_free`. Since C has no `Command`, spawning is split in two:
+`gk_process_for_child(env_value, len)` returns the waiting connection and
+the value to put in the child's `GK_EVENTFD_PARENT`; spawn the child any way
+you like (`fork`+`exec`, `posix_spawn`, `CreateProcess`), optionally call
+`gk_process_expect_pid`, then `gk_process_send`. On Windows, keep the sending `GkProcess` alive until the other
 side has received (it holds the offered section handle).
 
 ### Spawned children
@@ -361,8 +370,10 @@ cl /MD /Iinclude main.c target\release\adaptif_gatotkaca_eventfd.lib ws2_32.lib 
 On Windows, link the C program against the same dynamic CRT as Rust (`/MD`)
 so both sides see the same `errno`.
 
-[`examples/c/smoke.c`](examples/c/smoke.c) and
-[`examples/c/wrap_io.c`](examples/c/wrap_io.c) are fuller examples. They
+[`examples/c/smoke.c`](examples/c/smoke.c),
+[`examples/c/wrap_io.c`](examples/c/wrap_io.c) and
+[`examples/c/process.c`](examples/c/process.c) (a parent and a spawned
+child sharing an eventfd through the process API) are fuller examples. They
 build warning-free with `-std=c11 -Wall -Wextra -Werror` (gcc, clang) and
 `/W3 /WX` (MSVC), and exit 0 when every check passes.
 

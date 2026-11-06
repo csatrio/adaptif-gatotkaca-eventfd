@@ -336,6 +336,26 @@ pub fn eventfd_recv(sock: c_int) -> c_int {
     }
 }
 
+/// Hands eventfd `fd` to the process at the other end of `process`, like
+/// [`GkProcess::send`](crate::GkProcess::send). Returns `0`, or `-1` with
+/// `errno`.
+pub fn eventfd_process_send(process: &mut crate::GkProcess, fd: c_int) -> c_int {
+    match imp::process_send(process, fd) {
+        Ok(()) => 0,
+        Err(e) => fail_share(&e),
+    }
+}
+
+/// Receives an eventfd from `process`, like
+/// [`GkProcess::recv`](crate::GkProcess::recv). Returns a new descriptor
+/// sharing the sender's counter, or `-1` with `errno`.
+pub fn eventfd_process_recv(process: &mut crate::GkProcess) -> c_int {
+    match process.recv().and_then(imp::adopt) {
+        Ok(fd) => fd,
+        Err(e) => fail_share(&e),
+    }
+}
+
 /// Windows: duplicates `fd` into the running process `pid`, writing a
 /// NUL-terminated token for it into `buf`: the Windows counterpart of
 /// `eventfd_send` (Windows can't pass handles over a socket). Send the
@@ -589,6 +609,15 @@ mod imp {
         Ok(std::os::fd::IntoRawFd::into_raw_fd(crate::GkEventFd {
             inner,
         }))
+    }
+
+    pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> std::io::Result<()> {
+        let efd = view(fd)?;
+        process.send(&efd)
+    }
+
+    pub(super) fn adopt(efd: crate::GkEventFd) -> std::io::Result<c_int> {
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(efd))
     }
 }
 
@@ -1012,6 +1041,31 @@ mod imp {
         let inner =
             crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
         register(GkEventFd { inner })
+    }
+
+    #[cfg(unix)]
+    pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> io::Result<()> {
+        let core = lookup(fd).ok_or_else(crate::error::bad_descriptor)?;
+        core.send_to(std::os::fd::AsFd::as_fd(process.unix_stream()?))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn adopt(efd: GkEventFd) -> io::Result<c_int> {
+        register(efd)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> io::Result<()> {
+        let efd = lookup(fd).ok_or_else(crate::error::bad_descriptor)?;
+        process.send(&efd)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn adopt(efd: GkEventFd) -> io::Result<c_int> {
+        match write_lock().insert_new(std::sync::Arc::new(efd)) {
+            -1 => Err(io::Error::other("too many eventfds")),
+            fd => Ok(fd),
+        }
     }
 
     // -- common ---------------------------------------------------------------

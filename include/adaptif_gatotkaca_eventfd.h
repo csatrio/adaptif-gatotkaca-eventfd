@@ -317,6 +317,80 @@ int gk_eventfd_send(int fd, int sock);
 int gk_eventfd_recv(int sock);
 #endif
 
+/*
+ * Process API: one way to hand eventfds to other processes on every OS
+ * (the C form of the Rust GkProcess / GkListener). Underneath it is a unix
+ * socket ($TMPDIR/gkefd-<name>.sock, descriptors passed with SCM_RIGHTS)
+ * or, on Windows, a named pipe (\\.\pipe\gkefd-<name>) that records the
+ * peer's process id so the receiver pulls the handles into itself.
+ *
+ * Handles are opaque. Functions returning a handle return NULL with errno
+ * set on failure; the others return -1 with errno. A gk_process is not
+ * thread-safe; a gk_listener may be accepted from several threads.
+ */
+typedef struct gk_process gk_process;
+typedef struct gk_listener gk_listener;
+
+/* Environment variable gk_process_for_child's value goes in. */
+#define GK_EVENTFD_PARENT_ENV "GK_EVENTFD_PARENT"
+
+/*
+ * Listens under `name` (a socket path if it contains '/', else
+ * $TMPDIR/gkefd-<name>.sock; on Windows \\.\pipe\gkefd-<name> unless it
+ * starts with "\\"). Fails with EADDRINUSE if someone already listens.
+ */
+gk_listener *gk_listener_bind(const char *name);
+
+/* Waits for the next process to gk_process_connect. */
+gk_process *gk_listener_accept(gk_listener *listener);
+
+/* Closes the listener (removes the socket file on unix). NULL is ignored. */
+void gk_listener_free(gk_listener *listener);
+
+/* Connects to the process listening under `name`. */
+gk_process *gk_process_connect(const char *name);
+
+/*
+ * In a child spawned via gk_process_for_child: connects to the parent.
+ * Fails with ENOENT if GK_EVENTFD_PARENT is not set.
+ */
+gk_process *gk_process_from_parent(void);
+
+/*
+ * Parent side for a child you spawn yourself (fork+exec, posix_spawn,
+ * CreateProcess, ...): returns a connection waiting for that child and
+ * writes the value for the child's GK_EVENTFD_PARENT into env_value (len
+ * bytes; GK_EVENTFD_TOKEN_MAX is enough, ERANGE otherwise). Put
+ * GK_EVENTFD_PARENT=<env_value> in the child's environment, spawn it, and
+ * optionally call gk_process_expect_pid. The connection completes on the
+ * first gk_process_send/gk_process_recv, which waits for the child.
+ */
+gk_process *gk_process_for_child(char *env_value, size_t len);
+
+/*
+ * Windows: only accept the child with this process id (no-op on unix,
+ * where the private socket path protects the connection). Returns 0.
+ */
+int gk_process_expect_pid(gk_process *process, unsigned long pid);
+
+/*
+ * Hands eventfd `fd` to the other process, which calls gk_process_recv;
+ * both then share the counter. Returns 0, or -1 with errno. On Windows the
+ * peer pulls the handles out of this process: keep `process` until the peer
+ * has received.
+ */
+int gk_process_send(gk_process *process, int fd);
+
+/*
+ * Receives an eventfd sent with gk_process_send. Returns a new descriptor
+ * sharing the sender's counter (close it with gk_eventfd_close), or -1 with
+ * errno (EINVAL if the message is not an eventfd).
+ */
+int gk_process_recv(gk_process *process);
+
+/* Closes the connection. NULL is ignored. */
+void gk_process_free(gk_process *process);
+
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)
 
 /* <sys/eventfd.h> names, mapped onto the gk_* functions. */

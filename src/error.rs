@@ -26,6 +26,10 @@ pub(crate) mod errno {
     pub const EIO: c_int = libc::EIO;
     #[cfg(unix)]
     pub const ERANGE: c_int = libc::ERANGE;
+    #[cfg(unix)]
+    pub const ENOENT: c_int = libc::ENOENT;
+    #[cfg(unix)]
+    pub const EADDRINUSE: c_int = libc::EADDRINUSE;
 
     #[cfg(windows)]
     pub const EAGAIN: c_int = 11;
@@ -43,6 +47,10 @@ pub(crate) mod errno {
     pub const EIO: c_int = 5;
     #[cfg(windows)]
     pub const ERANGE: c_int = 34;
+    #[cfg(windows)]
+    pub const ENOENT: c_int = 2;
+    #[cfg(windows)]
+    pub const EADDRINUSE: c_int = 100;
 }
 
 /// `EAGAIN`: the operation would block on a non-blocking eventfd.
@@ -101,6 +109,8 @@ pub(crate) fn to_errno(e: &io::Error) -> c_int {
         io::ErrorKind::InvalidInput => errno::EINVAL,
         io::ErrorKind::OutOfMemory => errno::ENOMEM,
         io::ErrorKind::Interrupted => errno::EINTR,
+        io::ErrorKind::NotFound => errno::ENOENT,
+        io::ErrorKind::AddrInUse => errno::EADDRINUSE,
         #[cfg(windows)]
         _ if e.raw_os_error() == Some(6) => errno::EBADF,
         _ => errno::EIO,

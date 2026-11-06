@@ -285,6 +285,211 @@ pub extern "C" fn gk_eventfd_recv(sock: c_int) -> c_int {
     guard(-1, || compat::eventfd_recv(sock))
 }
 
+// ---------------------------------------------------------------------------
+// Process API (GkProcess / GkListener as opaque C handles)
+// ---------------------------------------------------------------------------
+
+use crate::{GkListener, GkProcess};
+use core::ffi::{CStr, c_char};
+
+/// Reads a NUL-terminated UTF-8 name, or sets `errno` (`EFAULT`/`EINVAL`).
+unsafe fn c_name<'a>(name: *const c_char) -> Option<&'a str> {
+    if name.is_null() {
+        compat::set_errno(crate::error::errno::EINVAL);
+        return None;
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string.
+    let s = unsafe { CStr::from_ptr(name) }.to_str().ok();
+    if s.is_none() {
+        compat::set_errno(crate::error::errno::EINVAL);
+    }
+    s
+}
+
+/// Boxes `r` for C, or returns null with `errno` set.
+fn boxed<T>(r: std::io::Result<T>) -> *mut T {
+    match r {
+        Ok(v) => Box::into_raw(Box::new(v)),
+        Err(e) => {
+            compat::set_errno(crate::error::to_errno(&e));
+            core::ptr::null_mut()
+        }
+    }
+}
+
+/// `gk_listener *gk_listener_bind(const char *name);`
+///
+/// # Safety
+/// `name` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_listener_bind(name: *const c_char) -> *mut GkListener {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: forwarded to the caller.
+        match unsafe { c_name(name) } {
+            Some(name) => boxed(GkListener::bind(name)),
+            None => core::ptr::null_mut(),
+        }
+    })
+}
+
+/// `gk_process *gk_listener_accept(gk_listener *listener);`
+///
+/// # Safety
+/// `listener` must come from `gk_listener_bind` and not be freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_listener_accept(listener: *mut GkListener) -> *mut GkProcess {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: the caller guarantees a live listener (or null).
+        match unsafe { listener.as_ref() } {
+            Some(l) => boxed(l.accept()),
+            None => {
+                compat::set_errno(crate::error::errno::EINVAL);
+                core::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// `void gk_listener_free(gk_listener *listener);` (null is ignored)
+///
+/// # Safety
+/// `listener` must come from `gk_listener_bind` and be freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_listener_free(listener: *mut GkListener) {
+    if !listener.is_null() {
+        // SAFETY: the caller guarantees ownership of a box we handed out.
+        guard((), || drop(unsafe { Box::from_raw(listener) }));
+    }
+}
+
+/// `gk_process *gk_process_connect(const char *name);`
+///
+/// # Safety
+/// `name` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_connect(name: *const c_char) -> *mut GkProcess {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: forwarded to the caller.
+        match unsafe { c_name(name) } {
+            Some(name) => boxed(GkProcess::connect(name)),
+            None => core::ptr::null_mut(),
+        }
+    })
+}
+
+/// `gk_process *gk_process_from_parent(void);`
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_process_from_parent() -> *mut GkProcess {
+    guard(core::ptr::null_mut(), || boxed(GkProcess::from_parent()))
+}
+
+/// `gk_process *gk_process_for_child(char *env_value, size_t len);`
+///
+/// For a child the caller spawns itself: returns a connection waiting for
+/// it, and writes the NUL-terminated value of `GK_EVENTFD_PARENT` for the
+/// child's environment into `env_value` (`len` bytes; `GK_EVENTFD_TOKEN_MAX`
+/// is enough).
+///
+/// # Safety
+/// `env_value` must be valid for writing `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_for_child(
+    env_value: *mut c_char,
+    len: usize,
+) -> *mut GkProcess {
+    guard(core::ptr::null_mut(), || match GkProcess::for_child() {
+        Ok((process, name)) => {
+            if env_value.is_null() || name.len() >= len {
+                compat::set_errno(crate::error::errno::ERANGE);
+                return core::ptr::null_mut();
+            }
+            // SAFETY: `env_value` is writable for `len > name.len()` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(name.as_ptr(), env_value.cast(), name.len());
+                *env_value.add(name.len()) = 0;
+            }
+            Box::into_raw(Box::new(process))
+        }
+        Err(e) => {
+            compat::set_errno(crate::error::to_errno(&e));
+            core::ptr::null_mut()
+        }
+    })
+}
+
+/// `int gk_process_expect_pid(gk_process *process, unsigned long pid);`
+///
+/// # Safety
+/// `process` must be a live handle from this API.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_expect_pid(
+    process: *mut GkProcess,
+    pid: core::ffi::c_ulong,
+) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        match unsafe { process.as_mut() } {
+            Some(p) => {
+                #[allow(clippy::unnecessary_cast)] // c_ulong is u32 on Windows
+                p.expect_pid(pid as u32);
+                0
+            }
+            None => {
+                compat::set_errno(crate::error::errno::EINVAL);
+                -1
+            }
+        }
+    })
+}
+
+/// `int gk_process_send(gk_process *process, int fd);`
+///
+/// # Safety
+/// `process` must be a live handle from this API.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send(process: *mut GkProcess, fd: c_int) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        match unsafe { process.as_mut() } {
+            Some(p) => compat::eventfd_process_send(p, fd),
+            None => {
+                compat::set_errno(crate::error::errno::EINVAL);
+                -1
+            }
+        }
+    })
+}
+
+/// `int gk_process_recv(gk_process *process);`
+///
+/// # Safety
+/// `process` must be a live handle from this API.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv(process: *mut GkProcess) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        match unsafe { process.as_mut() } {
+            Some(p) => compat::eventfd_process_recv(p),
+            None => {
+                compat::set_errno(crate::error::errno::EINVAL);
+                -1
+            }
+        }
+    })
+}
+
+/// `void gk_process_free(gk_process *process);` (null is ignored)
+///
+/// # Safety
+/// `process` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_free(process: *mut GkProcess) {
+    if !process.is_null() {
+        // SAFETY: the caller guarantees ownership of a box we handed out.
+        guard((), || drop(unsafe { Box::from_raw(process) }));
+    }
+}
+
 #[cfg(windows)]
 unsafe extern "C" {
     fn _dup(fd: c_int) -> c_int;
@@ -547,6 +752,111 @@ mod tests {
             assert!(!compat::is_eventfd(t));
             for x in [fd, t, r, w] {
                 assert_eq!(gk_close(x), 0);
+            }
+        }
+    }
+
+    /// Sends an eventfd from this thread to another over `p`/`name`.
+    fn round_trip(p: *mut GkProcess, connect: std::ffi::CString) {
+        let t = std::thread::spawn(move || {
+            // SAFETY: valid C strings and handles from this API.
+            unsafe {
+                let q = gk_process_connect(connect.as_ptr());
+                assert!(!q.is_null(), "connect: errno {}", compat::errno());
+                let fd = gk_process_recv(q);
+                assert!(fd >= 0, "recv: errno {}", compat::errno());
+                assert_eq!(gk_eventfd_write(fd, 6), 0);
+                assert_eq!(gk_eventfd_close(fd), 0);
+                gk_process_free(q);
+            }
+        });
+        // SAFETY: handles from this API.
+        unsafe {
+            let fd = gk_eventfd(0, 0);
+            assert!(fd >= 0);
+            assert_eq!(gk_process_send(p, fd), 0, "send: errno {}", compat::errno());
+            let mut v = 0;
+            assert_eq!(gk_eventfd_read(fd, &mut v), 0);
+            assert_eq!(v, 6);
+            t.join().unwrap();
+            assert_eq!(gk_eventfd_close(fd), 0);
+            gk_process_free(p);
+        }
+    }
+
+    #[test]
+    fn process_api_listener_and_connect() {
+        let _g = compat::tests::lock();
+        let name = std::ffi::CString::new(format!("ffi-{}", std::process::id())).unwrap();
+        // SAFETY: valid C string; handles from this API.
+        unsafe {
+            let l = gk_listener_bind(name.as_ptr());
+            assert!(!l.is_null(), "bind: errno {}", compat::errno());
+            assert!(gk_listener_bind(name.as_ptr()).is_null());
+            assert_eq!(compat::errno(), crate::error::errno::EADDRINUSE);
+            // Accept on a helper thread (the pointer travels as an address)
+            // while this thread connects.
+            let l_addr = l as usize;
+            // SAFETY (closure): `l` stays alive until this thread is joined.
+            let accepting =
+                std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+            let q = gk_process_connect(name.as_ptr());
+            assert!(!q.is_null());
+            let p = accepting.join().unwrap() as *mut GkProcess;
+            assert!(!p.is_null());
+            // p (accepted) sends to q (connected).
+            let fd = gk_eventfd(0, EFD_NONBLOCK_FOR_TESTS);
+            assert_eq!(gk_process_send(p, fd), 0, "send: errno {}", compat::errno());
+            let got = gk_process_recv(q);
+            assert!(got >= 0, "recv: errno {}", compat::errno());
+            assert_eq!(gk_eventfd_write(got, 4), 0);
+            let mut v = 0;
+            assert_eq!(gk_eventfd_read(fd, &mut v), 0);
+            assert_eq!(v, 4);
+            for x in [fd, got] {
+                assert_eq!(gk_eventfd_close(x), 0);
+            }
+            gk_process_free(p);
+            gk_process_free(q);
+            gk_listener_free(l);
+        }
+    }
+
+    const EFD_NONBLOCK_FOR_TESTS: c_int = compat::EFD_NONBLOCK;
+
+    #[test]
+    fn process_api_for_child() {
+        let _g = compat::tests::lock();
+        let mut env = vec![0 as core::ffi::c_char; compat::TOKEN_MAX];
+        // SAFETY: buffers valid for their lengths; handles from this API.
+        unsafe {
+            let mut small = [0 as core::ffi::c_char; 2];
+            assert!(gk_process_for_child(small.as_mut_ptr(), 2).is_null());
+            assert_eq!(compat::errno(), crate::error::errno::ERANGE);
+            let p = gk_process_for_child(env.as_mut_ptr(), env.len());
+            assert!(!p.is_null());
+            #[allow(clippy::useless_conversion)] // c_ulong is u32 on Windows
+            let pid: core::ffi::c_ulong = std::process::id().into();
+            assert_eq!(gk_process_expect_pid(p, pid), 0);
+            // The "child" is a thread of this process, connecting with the
+            // value it would find in GK_EVENTFD_PARENT.
+            let value = std::ffi::CStr::from_ptr(env.as_ptr()).to_owned();
+            round_trip(p, value);
+        }
+    }
+
+    #[test]
+    fn process_api_errors() {
+        // SAFETY: null and invalid arguments are rejected.
+        unsafe {
+            assert!(gk_listener_bind(core::ptr::null()).is_null());
+            assert_eq!(gk_process_send(core::ptr::null_mut(), 0), -1);
+            assert_eq!(gk_process_recv(core::ptr::null_mut()), -1);
+            gk_process_free(core::ptr::null_mut());
+            gk_listener_free(core::ptr::null_mut());
+            if std::env::var_os(crate::process::PARENT_ENV).is_none() {
+                assert!(gk_process_from_parent().is_null());
+                assert_eq!(compat::errno(), crate::error::errno::ENOENT);
             }
         }
     }
