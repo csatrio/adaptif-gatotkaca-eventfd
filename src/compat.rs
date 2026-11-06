@@ -475,7 +475,6 @@ fn errno_location() -> *mut c_int {
             target_os = "android",
             target_os = "openbsd",
             target_os = "netbsd",
-            target_os = "cygwin",
             target_os = "nuttx",
         ))]
         return libc::__errno();

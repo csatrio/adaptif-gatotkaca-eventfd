@@ -3,10 +3,14 @@ name = "adaptif-gatotkaca-eventfd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Cross-platform eventfd: native eventfd on Linux, faithful shim on macOS and Windows, with a C ABI matching <sys/eventfd.h>."
+authors = ["PT Adaptif Sinergi Dinamis"]
+description = "Cross-platform eventfd with Linux semantics everywhere: the kernel eventfd on Linux and the BSDs, a faithful shim on macOS and Windows, shareable across processes, with a C ABI matching <sys/eventfd.h>."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["eventfd", "event", "notify", "mio", "cross-platform"]
+homepage = "https://adaptif.co.id/"
+repository = "https://github.com/csatrio/adaptif-gatotkaca-eventfd"
+documentation = "https://docs.rs/adaptif-gatotkaca-eventfd"
+keywords = ["eventfd", "ipc", "notification", "mio", "cross-platform"]
 categories = ["os", "asynchronous", "concurrency", "api-bindings"]
 include = ["build.rs", "src/**", "include/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "AGENTS.md", "CHANGELOG.md", "LICENSE-*"]
 
@@ -48,5 +52,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 proptest = "1"
 
 [package.metadata.docs.rs]
-all-features = true
+# Not all-features: `force-shim` would document the Linux shim instead of the
+# kernel eventfd.
+features = ["mio", "ffi"]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]

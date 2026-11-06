@@ -57,7 +57,7 @@
  *       library built with the `force-shim` testing feature (-DGK_EVENTFD_NATIVE=0).
  *
  * SPDX-License-Identifier: MIT OR Apache-2.0
- * Copyright (c) 2026 Adaptif.
+ * Copyright (c) 2026 PT Adaptif Sinergi Dinamis (https://adaptif.co.id/).
  */
 
 #ifndef ADAPTIF_GATOTKACA_EVENTFD_H

@@ -3,6 +3,9 @@
 [![crates.io](https://img.shields.io/crates/v/adaptif-gatotkaca-eventfd.svg)](https://crates.io/crates/adaptif-gatotkaca-eventfd)
 [![docs.rs](https://docs.rs/adaptif-gatotkaca-eventfd/badge.svg)](https://docs.rs/adaptif-gatotkaca-eventfd)
 ![MSRV 1.85](https://img.shields.io/badge/MSRV-1.85-blue)
+[![license](https://img.shields.io/crates/l/adaptif-gatotkaca-eventfd.svg)](#license)
+
+Developed and maintained by **[PT Adaptif Sinergi Dinamis](https://adaptif.co.id/)**.
 
 **A cross-platform `eventfd(2)` with full Linux semantics on every OS.**
 
@@ -456,6 +459,12 @@ DragonFly, Windows, and any platform built with `force-shim`):
 
 The minimum supported Rust version is **1.85** (edition 2024). Raising the MSRV counts as a minor version bump.
 
+## About
+
+`adaptif-gatotkaca-eventfd` is developed and maintained by
+[PT Adaptif Sinergi Dinamis](https://adaptif.co.id/). Source code, issues and
+contributions: <https://github.com/csatrio/adaptif-gatotkaca-eventfd>.
+
 ## License
 
 Licensed under either of
@@ -469,4 +478,4 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
 
-Copyright © 2026 Adaptif.
+Copyright © 2026 [PT Adaptif Sinergi Dinamis](https://adaptif.co.id/).
