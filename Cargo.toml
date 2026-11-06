@@ -44,6 +44,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
