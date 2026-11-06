@@ -192,8 +192,7 @@ cl /Iinclude main.c target\release\adaptif_gatotkaca_eventfd.lib ws2_32.lib user
 ```
 
 The functions follow C conventions: they return `-1` and set `errno` on
-failure. See [`examples/c/smoke.c`](examples/c/smoke.c) for a fuller example,
-which CI runs on Linux, macOS and Windows.
+failure. See [`examples/c/smoke.c`](examples/c/smoke.c) for a fuller example.
 
 From Rust, the same functions are available without the `ffi` feature in
 `adaptif_gatotkaca_eventfd::compat`: `eventfd(initval, flags) -> c_int`,
@@ -253,8 +252,7 @@ DragonFly, Windows, and any platform built with `force-shim`):
 
 ## MSRV
 
-The minimum supported Rust version is **1.85** (edition 2024). CI tests
-against it. Raising the MSRV counts as a minor version bump.
+The minimum supported Rust version is **1.85** (edition 2024). Raising the MSRV counts as a minor version bump.
 
 ## License
 
