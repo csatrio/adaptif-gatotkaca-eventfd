@@ -1,0 +1,44 @@
+[package]
+name = "adaptif-gatotkaca-eventfd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cross-platform eventfd: native eventfd on Linux, faithful shim on macOS and Windows, with a C ABI matching <sys/eventfd.h>."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["eventfd", "event", "notify", "mio", "cross-platform"]
+categories = ["os", "asynchronous", "concurrency", "api-bindings"]
+include = ["src/**", "include/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-*"]
+
+[lib]
+name = "adaptif_gatotkaca_eventfd"
+
+[features]
+default = []
+# Export the C ABI (gk_eventfd*, see include/adaptif_gatotkaca_eventfd.h).
+ffi = []
+# Implement mio::event::Source for GkEventFd.
+mio = ["dep:mio"]
+# Use the portable unix shim even on Linux (for differential testing only).
+force-shim = []
+
+[dependencies]
+mio = { version = "1", optional = true, features = ["os-ext", "net"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+proptest = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
