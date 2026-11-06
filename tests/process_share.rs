@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use adaptif_gatotkaca_eventfd::{
     ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkProcess, GkReceiver, GkSender,
+    GkSharedMemory,
 };
 
 /// How the child gets the eventfd.
@@ -166,6 +167,10 @@ fn child_entry() {
     };
     if role.starts_with("channel_") {
         channel_child(&role);
+        return;
+    }
+    if role == "shm_reply" {
+        shm_child();
         return;
     }
     let efd = if let Ok(token) = std::env::var("GK_TOKEN") {
@@ -508,4 +513,66 @@ fn channel_bulk_to_child() {
     let id = tx.send_bulk_kind(0xb01c, &bulk_data()).unwrap();
     tx.send_kind(0xfffe, &id.to_le_bytes()).unwrap();
     join(Spawned(child, Some(peer)));
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory handed to another process through GkProcess
+// ---------------------------------------------------------------------------
+
+const SHM_LEN: usize = 2 << 20;
+
+fn shm_byte(i: usize) -> u8 {
+    (i.wrapping_mul(2654435761) >> 9) as u8
+}
+
+/// Receives the memory and two doorbells, checks the parent's pattern in the
+/// first half and writes a reply into the second.
+fn shm_child() {
+    let mut parent = GkProcess::from_parent().unwrap();
+    let shm: GkSharedMemory = parent.recv_as().expect("recv_as::<GkSharedMemory>");
+    let ping = parent.recv().expect("ping");
+    let pong = parent.recv().expect("pong");
+    assert_eq!(shm.len(), SHM_LEN);
+    assert_eq!(ping.read().unwrap(), 1);
+    let half = SHM_LEN / 2;
+    {
+        // SAFETY: the parent no longer writes the first half, and only this
+        // process writes the second until `pong`.
+        let mem = unsafe { shm.as_mut_slice() };
+        assert!((0..half).all(|i| mem[i] == shm_byte(i)), "pattern differs");
+        for (i, b) in mem.iter_mut().enumerate().skip(half) {
+            *b = !shm_byte(i);
+        }
+    }
+    pong.write(1).unwrap();
+}
+
+#[test]
+fn shared_memory_with_child() {
+    let shm = GkSharedMemory::new(SHM_LEN).unwrap();
+    let ping = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+    let pong = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+    let (child, mut peer) = spawn_channel_child("shm_reply");
+    peer.send(&shm).unwrap();
+    peer.send(&ping).unwrap();
+    peer.send(&pong).unwrap();
+    let half = SHM_LEN / 2;
+    {
+        // SAFETY: the child reads the first half only after `ping`.
+        let mem = unsafe { shm.as_mut_slice() };
+        for (i, b) in mem.iter_mut().enumerate().take(half) {
+            *b = shm_byte(i);
+        }
+    }
+    ping.write(1).unwrap();
+    assert_eq!(pong.read().unwrap(), 1);
+    join(Spawned(child, Some(peer)));
+    // The child has exited; this process still has the memory.
+    // SAFETY: no other process uses it any more.
+    let mem = unsafe { shm.as_slice() };
+    assert!(
+        (half..SHM_LEN).all(|i| mem[i] == !shm_byte(i)),
+        "reply differs"
+    );
+    assert!((0..half).all(|i| mem[i] == shm_byte(i)));
 }

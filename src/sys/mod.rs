@@ -33,9 +33,7 @@ mod shm;
 
 /// Shared memory regions (eventfd shims, channels).
 mod region;
-#[allow(unused_imports)]
-pub(crate) use region::{HugePages, RegionOptions};
-pub(crate) use region::{SharedRegion, current_pid, process_alive};
+pub(crate) use region::{RegionOptions, SharedRegion, current_pid, process_alive};
 #[cfg(all(unix, not(gk_native)))]
 mod unix_shim;
 #[cfg(all(unix, not(gk_native)))]

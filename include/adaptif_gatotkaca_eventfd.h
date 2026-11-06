@@ -549,6 +549,73 @@ int gk_process_send_receiver(gk_process *process, gk_receiver *rx);
 gk_sender *gk_process_recv_sender(gk_process *process);
 gk_receiver *gk_process_recv_receiver(gk_process *process);
 
+/*
+ * Shared memory: zero-filled memory that can be handed to other processes
+ * (the C form of the Rust GkSharedMemory). The length is rounded up to the
+ * page size. Sharing gives the other process a view of the same memory;
+ * both keep using it, and it is freed when the last view is freed. Nothing
+ * in it is synchronised: use atomics, or an eventfd as a doorbell.
+ *
+ * Errors: NULL (or -1) with errno EINVAL (zero length, NULL handle, bad
+ * option), ENOTSUP (huge pages required but not available on this OS or of
+ * that size), ENOMEM (no huge pages / memory free), EPERM or EACCES
+ * (Windows: large pages need the "Lock pages in memory" right).
+ */
+typedef struct gk_shm gk_shm;
+
+/* gk_shm_options.huge_pages */
+#define GK_HUGE_PAGES_OFF 0     /* normal pages (default) */
+#define GK_HUGE_PAGES_PREFER 1  /* huge pages if available now, else normal */
+#define GK_HUGE_PAGES_REQUIRE 2 /* huge pages or an error */
+
+typedef struct gk_shm_options {
+    int huge_pages;        /* GK_HUGE_PAGES_* */
+    size_t huge_page_size; /* bytes; 0: the system default */
+    int populate;          /* non-zero: touch every page at creation */
+} gk_shm_options;
+
+/* Fills *opts with the defaults (normal pages, no populate). */
+void gk_shm_options_default(gk_shm_options *opts);
+
+/* Creates shared memory of at least len bytes. */
+gk_shm *gk_shm_new(size_t len);
+
+/* gk_shm_new with options (opts NULL: the defaults). */
+gk_shm *gk_shm_new_ex(size_t len, const gk_shm_options *opts);
+
+/* Start of the memory (page-aligned), valid until gk_shm_free. */
+void *gk_shm_ptr(const gk_shm *shm);
+
+/* Length in bytes (a multiple of the page size). */
+size_t gk_shm_len(const gk_shm *shm);
+
+/* Size of the pages backing it (the huge page size if huge). */
+size_t gk_shm_page_size(const gk_shm *shm);
+
+/* 1 if it uses huge (large) pages, 0 if not. */
+int gk_shm_is_huge(const gk_shm *shm);
+
+#ifdef _WIN32
+/* The section HANDLE, still owned by shm (advanced use). */
+void *gk_shm_handle(const gk_shm *shm);
+#else
+/* The shared memory object's descriptor, still owned by shm (advanced use;
+ * don't close or resize it). */
+int gk_shm_fd(const gk_shm *shm);
+#endif
+
+/* Unmaps this process's view. NULL is ignored. */
+void gk_shm_free(gk_shm *shm);
+
+/*
+ * Hands shared memory to the process at the other end of `process`, which
+ * receives it with gk_process_recv_shm (EINVAL if something else was sent).
+ * This process keeps its view. On Windows keep `process` until the peer has
+ * received.
+ */
+int gk_process_send_shm(gk_process *process, const gk_shm *shm);
+gk_shm *gk_process_recv_shm(gk_process *process);
+
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)
 
 /* <sys/eventfd.h> names, mapped onto the gk_* functions. */

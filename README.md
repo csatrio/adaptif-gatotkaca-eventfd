@@ -401,6 +401,75 @@ A message sent while a 512 MiB transfer is in progress arrives in about
 0.6 µs (99th percentile 1.8 µs). Your numbers will differ; run the
 benchmark on your machine.
 
+## Shared memory: `GkSharedMemory`
+
+Plain shared memory that you can hand to other processes the same way as
+an eventfd: zero-filled, rounded up to whole pages, the same API on every
+OS. Sharing gives the other process a view of the same memory; both keep
+using it, and it is freed when the last process drops it. `fork()` shares
+it with no code.
+
+Nothing in it is synchronised for you. Use atomics in the memory, or an
+eventfd as a doorbell: data written before `efd.write()` is visible to the
+process whose `efd.read()` sees that write.
+
+```rust,no_run
+use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd, GkProcess, GkSharedMemory};
+use std::process::Command;
+
+fn main() -> std::io::Result<()> {
+    let shm = GkSharedMemory::new(64 << 20)?; // 64 MiB
+    let ready = GkEventFd::new(0, EfdFlags::NONE)?;
+    let (mut child, mut worker) = GkProcess::spawn(&mut Command::new("./worker"))?;
+    worker.send(&shm)?;
+    worker.send(&ready)?;
+
+    // SAFETY: the worker reads only after the doorbell.
+    unsafe { shm.as_mut_slice()[..5].copy_from_slice(b"hello") };
+    ready.write(1)?;
+    child.wait()?;
+    Ok(())
+}
+
+// In ./worker:
+fn worker() -> std::io::Result<()> {
+    let mut parent = GkProcess::from_parent()?;
+    let shm: GkSharedMemory = parent.recv_as()?;
+    let ready = parent.recv()?;
+    ready.read()?;
+    // SAFETY: the parent no longer writes these bytes.
+    assert_eq!(unsafe { &shm.as_slice()[..5] }, b"hello");
+    Ok(())
+}
+```
+
+- **Access:** `as_ptr()` (page-aligned), `len()`, and the `unsafe`
+  `as_slice()` / `as_mut_slice()`: other threads and processes can write the
+  memory at any time, so Rust can't check the borrows for you.
+- **Sharing:** `GkProcess::send(&shm)` / `recv_as::<GkSharedMemory>()` on
+  every OS, `send_to`/`recv_from` over a `UnixStream` on unix, and `fork()`.
+  `AsFd` (unix) and `AsHandle` (Windows) give the underlying object.
+- **Huge pages** (`SharedMemoryOptions { huge_pages, huge_page_size,
+  populate }`): `HugePages::Prefer` uses them if the system can provide them
+  and falls back to normal pages; `HugePages::Require` fails instead
+  (`Unsupported`, `PermissionDenied` or `OutOfMemory`). `is_huge()` and
+  `page_size()` tell what you got.
+
+  | OS | Huge pages |
+  |---|---|
+  | Linux | hugetlb pages, reserved beforehand (`vm.nr_hugepages`); `Prefer` without a reservation asks for transparent huge pages |
+  | FreeBSD | large pages |
+  | Windows | large pages; the user needs the "Lock pages in memory" right |
+  | macOS, iOS, other unix | none: `Prefer` gives normal pages, `Require` fails with `Unsupported` |
+
+  `populate: true` touches every page at creation, so later accesses don't
+  fault.
+- **C:** `gk_shm_new`, `gk_shm_new_ex` (`gk_shm_options`,
+  `GK_HUGE_PAGES_*`), `gk_shm_ptr`, `gk_shm_len`, `gk_shm_page_size`,
+  `gk_shm_is_huge`, `gk_shm_fd` / `gk_shm_handle`, `gk_shm_free`,
+  `gk_process_send_shm`, `gk_process_recv_shm` (see
+  [`examples/c/shared_memory.c`](examples/c/shared_memory.c)).
+
 ## C usage
 
 Build with the `ffi` feature to export a C ABI that matches
@@ -494,7 +563,10 @@ so both sides see the same `errno`.
 [`examples/c/smoke.c`](examples/c/smoke.c),
 [`examples/c/wrap_io.c`](examples/c/wrap_io.c) and
 [`examples/c/process.c`](examples/c/process.c) (a parent and a spawned
-child sharing an eventfd through the process API) are fuller examples. They
+child sharing an eventfd through the process API),
+[`examples/c/channel.c`](examples/c/channel.c) and
+[`examples/c/shared_memory.c`](examples/c/shared_memory.c) are fuller
+examples. They
 build warning-free with `-std=c11 -Wall -Wextra -Werror` (gcc, clang) and
 `/W3 /WX` (MSVC), and exit 0 when every check passes.
 

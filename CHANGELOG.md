@@ -53,6 +53,22 @@ Planned as 0.2.0.
   Example: `examples/c/channel.c`.
 - `examples/channel_bench.rs`: messages, bulk throughput and message
   latency during a transfer, against a pipe and a unix socket.
+- `GkSharedMemory` (module `shared_memory`): zero-filled shared memory with
+  the same API on every OS (`new`, `with_options`, `as_ptr`, `len`,
+  `page_size`, `is_huge`, `unsafe as_slice` / `as_mut_slice`, `AsFd` on
+  unix, `AsHandle` on Windows). Shared with `GkProcess::send` /
+  `recv_as::<GkSharedMemory>()` on every OS, `send_to` / `recv_from` over a
+  `UnixStream` on unix, and across `fork()`; both processes keep using it.
+- `SharedMemoryOptions` and `HugePages` (`Off`, `Prefer`, `Require`): huge
+  (large) pages where the OS has them (Linux hugetlb or transparent huge
+  pages, FreeBSD large pages, Windows large pages), and `populate`.
+- C: `gk_shm` with `gk_shm_options` (`GK_HUGE_PAGES_*`),
+  `gk_shm_options_default`, `gk_shm_new`, `gk_shm_new_ex`, `gk_shm_ptr`,
+  `gk_shm_len`, `gk_shm_page_size`, `gk_shm_is_huge`, `gk_shm_fd` (unix) /
+  `gk_shm_handle` (Windows), `gk_shm_free`, `gk_process_send_shm`,
+  `gk_process_recv_shm`. errno now also maps `Unsupported` to `ENOTSUP`,
+  and on Windows a missing privilege to `EPERM`. Example:
+  `examples/c/shared_memory.c`.
 
 ### Fixed
 
@@ -61,6 +77,8 @@ Planned as 0.2.0.
   eventfds, each with two socket protocol infos, plus a section handle), over
   the pipe transport's 4096-byte receive cap. The cap is now 16 KiB, still a
   bound on the allocation.
+- Windows: `GkProcess::recv` reports `InvalidData` (not `InvalidInput`) when
+  something other than an eventfd was sent, as on unix.
 
 ## [0.1.0] - 2026-11-06
 

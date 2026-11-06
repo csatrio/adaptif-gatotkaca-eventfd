@@ -294,6 +294,36 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   `gk_process_recv_sender`/`_receiver`; errno `EAGAIN`, `EPIPE`, `EMSGSIZE`,
   `EACCES`, `ECONNABORTED`. See `examples/c/channel.c`.
 
+## 6b. Shared memory (`GkSharedMemory`)
+
+- `let shm = GkSharedMemory::new(len)?;` (zero-filled, `len` rounded up to
+  the page size; `len == 0` is `InvalidInput`) or
+  `GkSharedMemory::with_options(len, SharedMemoryOptions { huge_pages, huge_page_size, populate })`.
+- Access: `as_ptr()` (page-aligned), `len()`, `page_size()`, `is_huge()`,
+  `unsafe as_slice()` / `unsafe as_mut_slice()` (`&self`: other threads and
+  processes may write at any time; you guarantee no overlapping writer).
+  Synchronise with atomics in the memory or an eventfd doorbell (writes
+  before `efd.write()` are visible after the matching `efd.read()`).
+- Share: `GkProcess::send(&shm)` + `recv_as::<GkSharedMemory>()` (all OS);
+  unix also `shm.send_to(&stream)` / `GkSharedMemory::recv_from(&stream)`;
+  `fork()` shares it with no code. Nothing is detached: both processes keep
+  using it; the memory is freed when the last one drops it. Wrong kind of
+  object received: `InvalidData`. Windows: keep the sending `GkProcess`
+  alive until the peer has received.
+- Huge pages (`HugePages::Off` default, `Prefer`, `Require`): Linux hugetlb
+  needs `vm.nr_hugepages` reserved (`Prefer` otherwise asks for transparent
+  huge pages); FreeBSD large pages; Windows needs the "Lock pages in memory"
+  right; macOS/iOS and other unix have none. `Prefer` never fails because of
+  huge pages; `Require` fails with `Unsupported`, `PermissionDenied` or
+  `OutOfMemory`. Check `is_huge()`.
+- `AsFd` (unix) / `AsHandle` (Windows) expose the object; don't resize it.
+- C: `gk_shm_options_default`, `gk_shm_new`, `gk_shm_new_ex(len, &opts | NULL)`
+  (`GK_HUGE_PAGES_OFF/PREFER/REQUIRE`, `huge_page_size` 0 = default),
+  `gk_shm_ptr`, `gk_shm_len`, `gk_shm_page_size`, `gk_shm_is_huge`,
+  `gk_shm_fd` (unix) / `gk_shm_handle` (Windows), `gk_shm_free`,
+  `gk_process_send_shm`, `gk_process_recv_shm`; errno `EINVAL`, `ENOTSUP`,
+  `ENOMEM`, `EPERM`/`EACCES`. See `examples/c/shared_memory.c`.
+
 ## 7. Per-platform checklists
 
 **Linux / Android / FreeBSD 13+ / NetBSD 10+ / illumos (native)**

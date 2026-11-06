@@ -25,19 +25,7 @@ mod os;
 #[path = "windows.rs"]
 mod os;
 
-/// Whether a shared memory region should use huge (large) pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)] // TODO(foundation): used once the public API lands
-pub enum HugePages {
-    /// Normal pages.
-    #[default]
-    Off,
-    /// Huge pages if the system can provide them now, normal pages if not.
-    Prefer,
-    /// Huge pages or an error (`Unsupported`, `PermissionDenied`,
-    /// `OutOfMemory`).
-    Require,
-}
+pub(crate) use crate::shared_memory::HugePages;
 
 /// How to create a region.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

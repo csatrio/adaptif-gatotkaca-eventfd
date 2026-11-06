@@ -38,6 +38,10 @@ pub(crate) mod errno {
     pub const EACCES: c_int = libc::EACCES;
     #[cfg(unix)]
     pub const ECONNABORTED: c_int = libc::ECONNABORTED;
+    #[cfg(unix)]
+    pub const EPERM: c_int = libc::EPERM;
+    #[cfg(unix)]
+    pub const ENOTSUP: c_int = libc::ENOTSUP;
 
     #[cfg(windows)]
     pub const EAGAIN: c_int = 11;
@@ -67,6 +71,10 @@ pub(crate) mod errno {
     pub const EACCES: c_int = 13;
     #[cfg(windows)]
     pub const ECONNABORTED: c_int = 106;
+    #[cfg(windows)]
+    pub const EPERM: c_int = 1;
+    #[cfg(windows)]
+    pub const ENOTSUP: c_int = 129;
 }
 
 /// `EAGAIN`: the operation would block on a non-blocking eventfd.
@@ -120,6 +128,14 @@ pub(crate) fn to_errno(e: &io::Error) -> c_int {
     if let Some(code) = e.raw_os_error() {
         return code;
     }
+    #[cfg(windows)]
+    match e.raw_os_error() {
+        // ERROR_PRIVILEGE_NOT_HELD (large pages without the right).
+        Some(1314) => return errno::EPERM,
+        // ERROR_NO_SYSTEM_RESOURCES, ERROR_COMMITMENT_LIMIT.
+        Some(1450 | 1455) => return errno::ENOMEM,
+        _ => {}
+    }
     match e.kind() {
         io::ErrorKind::WouldBlock => errno::EAGAIN,
         io::ErrorKind::InvalidInput => errno::EINVAL,
@@ -130,6 +146,7 @@ pub(crate) fn to_errno(e: &io::Error) -> c_int {
         io::ErrorKind::BrokenPipe => errno::EPIPE,
         io::ErrorKind::PermissionDenied => errno::EACCES,
         io::ErrorKind::ConnectionAborted => errno::ECONNABORTED,
+        io::ErrorKind::Unsupported => errno::ENOTSUP,
         #[cfg(windows)]
         _ if e.raw_os_error() == Some(6) => errno::EBADF,
         _ => errno::EIO,
@@ -147,5 +164,14 @@ mod tests {
         assert_eq!(to_errno(&would_block()), errno::EAGAIN);
         assert_eq!(to_errno(&invalid_input()), errno::EINVAL);
         assert_eq!(to_errno(&bad_descriptor()), errno::EBADF);
+        for (kind, want) in [
+            (io::ErrorKind::Unsupported, errno::ENOTSUP),
+            (io::ErrorKind::OutOfMemory, errno::ENOMEM),
+            (io::ErrorKind::PermissionDenied, errno::EACCES),
+        ] {
+            assert_eq!(to_errno(&io::Error::new(kind, "x")), want, "{kind:?}");
+        }
+        #[cfg(windows)]
+        assert_eq!(to_errno(&io::Error::from_raw_os_error(1314)), errno::EPERM);
     }
 }

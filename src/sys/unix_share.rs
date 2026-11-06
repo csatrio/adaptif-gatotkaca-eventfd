@@ -5,7 +5,8 @@
 //! pipe write end).
 //!
 //! Everything is identified by an 8-byte tag: `gkefd1:n` / `gkefd1:u` for
-//! an eventfd (native / unix shim), `gkch1:Sn` etc. for channel ends. Tokens
+//! an eventfd (native / unix shim), `gkch1:Sn` etc. for channel ends,
+//! `gkshm1:r` for shared memory. Tokens
 //! are text: `<tag>:<fd>[:<fd>...]` with decimal descriptor numbers. A
 //! native eventfd token is simply
 //! the inherited eventfd's number.

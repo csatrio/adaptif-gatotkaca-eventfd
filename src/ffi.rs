@@ -1234,6 +1234,241 @@ pub unsafe extern "C" fn gk_process_recv_receiver(p: *mut GkProcess) -> *mut GkR
     })
 }
 
+// ---------------------------------------------------------------------------
+// Shared memory (GkSharedMemory as an opaque C handle)
+// ---------------------------------------------------------------------------
+
+use crate::{GkSharedMemory, HugePages, SharedMemoryOptions};
+
+/// Like `with` for a handle used through a shared reference (`const` in
+/// C, may be used from several threads at once).
+fn with_ref<T, R>(p: *const T, err: R, f: impl FnOnce(&T) -> R) -> R {
+    // SAFETY: callers pass handles from this API (or null).
+    match unsafe { p.as_ref() } {
+        Some(v) => f(v),
+        None => {
+            compat::set_errno(crate::error::errno::EINVAL);
+            err
+        }
+    }
+}
+
+/// `GK_HUGE_PAGES_*` in C.
+const GK_HUGE_PAGES_OFF: c_int = 0;
+const GK_HUGE_PAGES_PREFER: c_int = 1;
+const GK_HUGE_PAGES_REQUIRE: c_int = 2;
+
+/// `gk_shm_options` in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GkShmOptionsC {
+    huge_pages: c_int,
+    /// 0: the system default.
+    huge_page_size: usize,
+    populate: c_int,
+}
+
+impl From<SharedMemoryOptions> for GkShmOptionsC {
+    fn from(o: SharedMemoryOptions) -> Self {
+        Self {
+            huge_pages: match o.huge_pages {
+                HugePages::Off => GK_HUGE_PAGES_OFF,
+                HugePages::Prefer => GK_HUGE_PAGES_PREFER,
+                HugePages::Require => GK_HUGE_PAGES_REQUIRE,
+            },
+            huge_page_size: o.huge_page_size.unwrap_or(0),
+            populate: c_int::from(o.populate),
+        }
+    }
+}
+
+impl GkShmOptionsC {
+    /// The Rust options, or `None` for an unknown `huge_pages` value.
+    fn to_options(self) -> Option<SharedMemoryOptions> {
+        let huge_pages = match self.huge_pages {
+            GK_HUGE_PAGES_OFF => HugePages::Off,
+            GK_HUGE_PAGES_PREFER => HugePages::Prefer,
+            GK_HUGE_PAGES_REQUIRE => HugePages::Require,
+            _ => return None,
+        };
+        Some(SharedMemoryOptions {
+            huge_pages,
+            huge_page_size: (self.huge_page_size != 0).then_some(self.huge_page_size),
+            populate: self.populate != 0,
+        })
+    }
+}
+
+/// `void gk_shm_options_default(gk_shm_options *opts);`
+///
+/// # Safety
+/// `opts` must be null or valid for writing a `gk_shm_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_options_default(opts: *mut GkShmOptionsC) {
+    // SAFETY: forwarded to the caller.
+    unsafe { put(opts, SharedMemoryOptions::default().into()) };
+}
+
+/// `gk_shm *gk_shm_new(size_t len);`
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_shm_new(len: usize) -> *mut GkSharedMemory {
+    guard(core::ptr::null_mut(), || boxed(GkSharedMemory::new(len)))
+}
+
+/// `gk_shm *gk_shm_new_ex(size_t len, const gk_shm_options *opts);`
+/// (`opts` NULL: the defaults)
+///
+/// # Safety
+/// `opts` must be null or valid for reading a `gk_shm_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_new_ex(
+    len: usize,
+    opts: *const GkShmOptionsC,
+) -> *mut GkSharedMemory {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: the caller guarantees `opts` is null or readable.
+        let opts = match unsafe { opts.as_ref() } {
+            None => SharedMemoryOptions::default(),
+            Some(o) => match o.to_options() {
+                Some(o) => o,
+                None => {
+                    compat::set_errno(crate::error::errno::EINVAL);
+                    return core::ptr::null_mut();
+                }
+            },
+        };
+        boxed(GkSharedMemory::with_options(len, opts))
+    })
+}
+
+/// `void *gk_shm_ptr(const gk_shm *shm);` (NULL + `EINVAL` for NULL)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_ptr(shm: *const GkSharedMemory) -> *mut c_void {
+    guard(core::ptr::null_mut(), || {
+        with_ref(shm, core::ptr::null_mut(), |s| s.as_ptr().cast::<c_void>())
+    })
+}
+
+/// `size_t gk_shm_len(const gk_shm *shm);` (0 + `EINVAL` for NULL)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_len(shm: *const GkSharedMemory) -> usize {
+    guard(0, || with_ref(shm, 0, |s| s.len()))
+}
+
+/// `size_t gk_shm_page_size(const gk_shm *shm);` (0 + `EINVAL` for NULL)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_page_size(shm: *const GkSharedMemory) -> usize {
+    guard(0, || with_ref(shm, 0, |s| s.page_size()))
+}
+
+/// `int gk_shm_is_huge(const gk_shm *shm);` (1, 0, or -1 + `EINVAL`)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_is_huge(shm: *const GkSharedMemory) -> c_int {
+    guard(-1, || with_ref(shm, -1, |s| c_int::from(s.is_huge())))
+}
+
+/// `int gk_shm_fd(const gk_shm *shm);` (unix: the shared memory object,
+/// still owned by `shm`)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_fd(shm: *const GkSharedMemory) -> c_int {
+    guard(-1, || {
+        with_ref(shm, -1, |s| {
+            std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(s))
+        })
+    })
+}
+
+/// `void *gk_shm_handle(const gk_shm *shm);` (Windows: the section handle,
+/// still owned by `shm`)
+///
+/// # Safety
+/// `shm` must be a live handle (or null).
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_handle(shm: *const GkSharedMemory) -> *mut c_void {
+    guard(core::ptr::null_mut(), || {
+        with_ref(shm, core::ptr::null_mut(), |s| {
+            std::os::windows::io::AsRawHandle::as_raw_handle(
+                &std::os::windows::io::AsHandle::as_handle(s),
+            )
+            .cast()
+        })
+    })
+}
+
+/// `void gk_shm_free(gk_shm *shm);` (unmaps this process's view; NULL ok)
+///
+/// # Safety
+/// `shm` must be a handle from this API, freed only once, with no pointer
+/// into the memory used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_free(shm: *mut GkSharedMemory) {
+    if !shm.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(shm) }));
+    }
+}
+
+/// `int gk_process_send_shm(gk_process *p, const gk_shm *shm);`
+///
+/// # Safety
+/// Both must be live handles (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_shm(
+    p: *mut GkProcess,
+    shm: *const GkSharedMemory,
+) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let Some(shm) = (unsafe { shm.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(p, -1, |p| match p.send(shm) {
+            Ok(()) => 0,
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `gk_shm *gk_process_recv_shm(gk_process *p);`
+///
+/// # Safety
+/// `p` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_shm(p: *mut GkProcess) -> *mut GkSharedMemory {
+    guard(core::ptr::null_mut(), || {
+        with(p, core::ptr::null_mut(), |p| {
+            // Something else sent (or a bad offer): EINVAL, as gk_process_recv.
+            boxed(p.recv_as::<GkSharedMemory>().map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+                    crate::error::invalid_input()
+                }
+                _ => e,
+            }))
+        })
+    })
+}
+
 #[cfg(windows)]
 unsafe extern "C" {
     fn _dup(fd: c_int) -> c_int;
@@ -1602,6 +1837,105 @@ mod tests {
                 assert!(gk_process_from_parent().is_null());
                 assert_eq!(compat::errno(), crate::error::errno::ENOENT);
             }
+        }
+    }
+
+    #[test]
+    fn shm_api() {
+        use crate::error::errno::{EINVAL, ENOMEM, ENOTSUP, EPERM};
+        let _g = compat::tests::lock();
+        // SAFETY: handles and buffers from this API, used within bounds.
+        unsafe {
+            let shm = gk_shm_new(5000);
+            assert!(!shm.is_null(), "errno {}", compat::errno());
+            let page = gk_shm_page_size(shm);
+            assert!(page.is_power_of_two());
+            assert_eq!(gk_shm_len(shm), 5000usize.div_ceil(page) * page);
+            assert_eq!(gk_shm_is_huge(shm), 0);
+            #[cfg(unix)]
+            assert!(gk_shm_fd(shm) >= 0);
+            #[cfg(windows)]
+            assert!(!gk_shm_handle(shm).is_null());
+            let p = gk_shm_ptr(shm).cast::<u8>();
+            assert_eq!(*p.add(4999), 0);
+            *p.add(4999) = 7;
+
+            // Hand it to another thread through the process API.
+            let name = std::ffi::CString::new(format!("ffi-shm-{}", std::process::id())).unwrap();
+            let l = gk_listener_bind(name.as_ptr());
+            assert!(!l.is_null());
+            let l_addr = l as usize;
+            let accepting =
+                std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+            let q = gk_process_connect(name.as_ptr());
+            let a = accepting.join().unwrap() as *mut GkProcess;
+            assert!(!q.is_null() && !a.is_null());
+            assert_eq!(gk_process_send_shm(a, shm), 0, "errno {}", compat::errno());
+            let got = gk_process_recv_shm(q);
+            assert!(!got.is_null(), "errno {}", compat::errno());
+            assert_eq!(gk_shm_len(got), gk_shm_len(shm));
+            let g = gk_shm_ptr(got).cast::<u8>();
+            assert_eq!(*g.add(4999), 7);
+            *g.add(1) = 9;
+            assert_eq!(*p.add(1), 9);
+            // An eventfd where shared memory is expected: refused.
+            let fd = gk_eventfd(0, 0);
+            assert_eq!(gk_process_send(a, fd), 0);
+            assert!(gk_process_recv_shm(q).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_eventfd_close(fd), 0);
+            gk_shm_free(got);
+            gk_process_free(a);
+            gk_process_free(q);
+            gk_listener_free(l);
+            gk_shm_free(shm);
+
+            // Options.
+            let mut opts = GkShmOptionsC {
+                huge_pages: 9,
+                huge_page_size: 1,
+                populate: 9,
+            };
+            gk_shm_options_default(&mut opts);
+            assert_eq!(opts.huge_pages, GK_HUGE_PAGES_OFF);
+            assert_eq!(opts.huge_page_size, 0);
+            assert_eq!(opts.populate, 0);
+            opts.huge_pages = GK_HUGE_PAGES_PREFER;
+            opts.populate = 1;
+            let shm = gk_shm_new_ex(1 << 20, &opts);
+            assert!(!shm.is_null(), "errno {}", compat::errno());
+            gk_shm_free(shm);
+            let shm = gk_shm_new_ex(1, core::ptr::null());
+            assert!(!shm.is_null());
+            gk_shm_free(shm);
+            opts.huge_pages = GK_HUGE_PAGES_REQUIRE;
+            let shm = gk_shm_new_ex(1 << 21, &opts);
+            if shm.is_null() {
+                let e = compat::errno();
+                assert!(
+                    [ENOTSUP, ENOMEM, EPERM, crate::error::errno::EACCES].contains(&e),
+                    "errno {e}"
+                );
+            } else {
+                assert_eq!(gk_shm_is_huge(shm), 1);
+                gk_shm_free(shm);
+            }
+            opts.huge_pages = 3;
+            assert!(gk_shm_new_ex(1, &opts).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+
+            // Errors.
+            assert!(gk_shm_new(0).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+            assert!(gk_shm_ptr(core::ptr::null()).is_null());
+            assert_eq!(gk_shm_len(core::ptr::null()), 0);
+            assert_eq!(gk_shm_is_huge(core::ptr::null()), -1);
+            assert_eq!(
+                gk_process_send_shm(core::ptr::null_mut(), core::ptr::null()),
+                -1
+            );
+            assert!(gk_process_recv_shm(core::ptr::null_mut()).is_null());
+            gk_shm_free(core::ptr::null_mut());
         }
     }
 

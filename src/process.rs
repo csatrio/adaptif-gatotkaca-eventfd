@@ -2,7 +2,8 @@
 //!
 //! [`GkProcess`] is a connection to another process. [`GkProcess::send`]
 //! hands it an eventfd and [`GkProcess::recv`] receives one, with the same
-//! code on every OS. Afterwards both processes share the counter.
+//! code on every OS. Afterwards both processes share the counter. Channel
+//! ends and shared memory travel the same way ([`GkProcess::recv_as`]).
 //!
 //! | | unix (Linux, macOS, BSDs, ...) | Windows |
 //! |---|---|---|
@@ -131,14 +132,16 @@ impl GkProcess {
         Self::connect(&name)
     }
 
-    /// Hands `obj` (a [`GkEventFd`], [`GkSender`](crate::GkSender) or
-    /// [`GkReceiver`](crate::GkReceiver)) to the other process, which
+    /// Hands `obj` (a [`GkEventFd`], [`GkSender`](crate::GkSender),
+    /// [`GkReceiver`](crate::GkReceiver) or
+    /// [`GkSharedMemory`](crate::GkSharedMemory)) to the other process, which
     /// receives it with [`recv`](Self::recv) (eventfd) or
     /// [`recv_as`](Self::recv_as); both then share it. Don't interleave other
     /// traffic on the same connection.
     ///
     /// A channel end sent this way now belongs to the other process: this
     /// process's copy is detached (dropping it doesn't close the channel).
+    /// Shared memory is not: both processes keep using it.
     ///
     /// Windows: the other process pulls the handles out of this one, so a
     /// copy of the shared memory section stays open in this `GkProcess` until
@@ -170,7 +173,8 @@ impl GkProcess {
 }
 
 /// Objects [`GkProcess`] can hand to other processes: [`GkEventFd`],
-/// [`GkSender`](crate::GkSender) and [`GkReceiver`](crate::GkReceiver).
+/// [`GkSender`](crate::GkSender), [`GkReceiver`](crate::GkReceiver) and
+/// [`GkSharedMemory`](crate::GkSharedMemory).
 /// Sealed: it can't be implemented outside this crate.
 pub trait Shareable: private::Sealed {}
 
@@ -211,6 +215,14 @@ impl private::Sealed for GkEventFd {
     }
     #[cfg(windows)]
     fn take(token: &str, pid: u32) -> io::Result<Self> {
+        // Another kind of object (channel end, shared memory): InvalidData,
+        // as on unix.
+        if !token.trim_start().starts_with("gkefd1:") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not the expected kind of object",
+            ));
+        }
         Ok(Self {
             inner: crate::sys::Inner::take_offer(token, pid)?,
         })
