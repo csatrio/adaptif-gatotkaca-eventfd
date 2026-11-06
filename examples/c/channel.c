@@ -1,12 +1,14 @@
 /*
- * Channel example: a parent streams messages to a child it spawns through a
- * shared-memory channel. The same code runs on Linux, macOS and Windows;
- * only the spawning differs.
+ * Channel example: a parent streams messages and one large bulk transfer to
+ * a child it spawns, through a shared-memory channel. The same code runs on
+ * Linux, macOS and Windows; only the spawning differs.
  *
  *   parent: gk_channel_new -> gk_process_for_child -> spawn ->
- *           gk_process_send_receiver -> gk_sender_send x N -> gk_sender_free
+ *           gk_process_send_receiver -> gk_sender_send x N ->
+ *           gk_sender_send_bulk (BULK bytes) -> gk_sender_free
  *   child:  gk_process_from_parent -> gk_process_recv_receiver ->
- *           gk_receiver_recv until EPIPE
+ *           gk_receiver_recv x N -> gk_receiver_bulk_begin/read ->
+ *           gk_receiver_recv fails with EPIPE
  *
  * Run it without arguments; it re-runs itself with "child".
  * Exits 0 on success; otherwise prints the failed check and exits 1.
@@ -33,6 +35,11 @@
 
 #define MESSAGES 1000
 #define MAX_MESSAGE 2048
+#define BULK (24u << 20) /* 24 MiB through a 1 MiB bulk ring */
+
+static unsigned char bulk_byte(size_t i) {
+    return (unsigned char)((i * 2654435761u) >> 7);
+}
 
 static int failures = 0;
 
@@ -71,6 +78,28 @@ static int child(void) {
             break;
         }
     }
+    {
+        /* The bulk transfer, read in pieces. */
+        int64_t len = 0;
+        uint64_t id = 0;
+        size_t total = 0, k;
+        intptr_t n;
+        CHECK(gk_receiver_bulk_begin(rx, &len, &id) == 0);
+        CHECK(len == (int64_t)BULK);
+        while ((n = gk_receiver_bulk_read(rx, got, sizeof got)) > 0) {
+            for (k = 0; k < (size_t)n; k++) {
+                if (got[k] != bulk_byte(total + k)) {
+                    fprintf(stderr, "bulk byte %zu differs\n", total + k);
+                    failures++;
+                    break;
+                }
+            }
+            total += (size_t)n;
+        }
+        CHECK(n == 0);
+        CHECK(total == BULK);
+        CHECK(gk_receiver_bulk_end(rx) == 0);
+    }
     errno = 0;
     CHECK(gk_receiver_recv(rx, got, sizeof got) == -1); /* sender closed */
     CHECK(errno == EPIPE);
@@ -89,7 +118,12 @@ int main(int argc, char **argv) {
 
     if (argc > 1 && strcmp(argv[1], "child") == 0) return child();
 
-    CHECK(gk_channel_new(1u << 16, MAX_MESSAGE, &tx, &rx) == 0);
+    gk_channel_options opts;
+    gk_channel_options_default(&opts);
+    opts.capacity = 1u << 16;
+    opts.max_message = MAX_MESSAGE;
+    opts.bulk_capacity = 1u << 20;
+    CHECK(gk_channel_new(&opts, &tx, &rx) == 0);
     gk_process *kid = gk_process_for_child(env_value, sizeof env_value);
     CHECK(kid != NULL);
     if (tx == NULL || rx == NULL || kid == NULL) return 1;
@@ -119,7 +153,19 @@ int main(int argc, char **argv) {
         size_t len = fill(msg, i);
         CHECK(gk_sender_send(tx, msg, len) == 0);
     }
-    gk_sender_free(tx); /* the child sees EPIPE after the last message */
+    {
+        unsigned char *big = malloc(BULK);
+        uint64_t id = 0;
+        size_t k;
+        CHECK(big != NULL);
+        if (big != NULL) {
+            for (k = 0; k < BULK; k++) big[k] = bulk_byte(k);
+            CHECK(gk_sender_send_bulk(tx, big, BULK, &id) == 0);
+            CHECK(id != 0);
+            free(big);
+        }
+    }
+    gk_sender_free(tx); /* the child sees EPIPE after everything */
 
 #ifdef _WIN32
     CHECK(_cwait(&status, h, 0) != -1);

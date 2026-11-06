@@ -19,6 +19,7 @@ fn channel_rate(size: usize, count: usize) -> f64 {
     let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
         capacity: 16 << 20,
         max_message: 1 << 20,
+        ..Default::default()
     })
     .unwrap();
     let start = Instant::now();
@@ -40,11 +41,13 @@ fn channel_ping_pong(rounds: usize) -> f64 {
     let (mut to_b, mut from_a) = GkChannel::with_options(ChannelOptions {
         capacity: 1 << 16,
         max_message: 64,
+        ..Default::default()
     })
     .unwrap();
     let (mut to_a, mut from_b) = GkChannel::with_options(ChannelOptions {
         capacity: 1 << 16,
         max_message: 64,
+        ..Default::default()
     })
     .unwrap();
     let b = thread::spawn(move || {
@@ -126,6 +129,128 @@ fn socket_ping_pong(rounds: usize) -> f64 {
     rtt * 1e6
 }
 
+/// One bulk transfer of `total` bytes through the default bulk ring.
+fn bulk_rate(total: usize) -> f64 {
+    let (mut tx, mut rx) = GkChannel::new().unwrap();
+    let start = Instant::now();
+    let writer = thread::spawn(move || {
+        let piece = vec![7u8; 1 << 20];
+        let mut w = tx.bulk_writer(Some(total as u64)).unwrap();
+        for _ in 0..total / piece.len() {
+            w.write_all(&piece).unwrap();
+        }
+        w.finish().unwrap();
+    });
+    // Copy the data out like the pipe/socket readers do (one copy per side).
+    let mut r = rx.bulk_reader().unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0;
+    loop {
+        match r.read(&mut buf).unwrap() {
+            0 => break,
+            n => got += n,
+        }
+    }
+    assert_eq!(got, total);
+    drop(r);
+    writer.join().unwrap();
+    total as f64 / start.elapsed().as_secs_f64() / (1u64 << 30) as f64
+}
+
+/// The same amount through a byte stream with large writes.
+#[cfg(unix)]
+fn stream_bulk_rate<S: Read + Write + Send + 'static>((mut a, mut b): (S, S), total: usize) -> f64 {
+    let start = Instant::now();
+    let writer = thread::spawn(move || {
+        let piece = vec![7u8; 1 << 20];
+        for _ in 0..total / piece.len() {
+            a.write_all(&piece).unwrap();
+        }
+    });
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0;
+    while got < total {
+        got += b.read(&mut buf).unwrap();
+    }
+    writer.join().unwrap();
+    total as f64 / start.elapsed().as_secs_f64() / (1u64 << 30) as f64
+}
+
+/// Latency of messages sent while a large bulk transfer is in progress:
+/// the sender interleaves messages with bulk chunks; the receiver reads
+/// only messages, timestamping them on arrival.
+fn message_latency_during_bulk() -> (f64, f64) {
+    let (mut tx, mut rx) = GkChannel::new().unwrap();
+    let origin = Instant::now();
+    let total: u64 = 512 << 20;
+    let writer = thread::spawn(move || {
+        let piece = vec![7u8; 64 << 10];
+        let mut sent = 0u64;
+        let mut i = 0u64;
+        while sent < total {
+            let mut w = if sent == 0 {
+                tx.bulk_writer(Some(total)).unwrap()
+            } else {
+                tx.resume_bulk().unwrap()
+            };
+            w.write_all(&piece).unwrap();
+            sent += piece.len() as u64;
+            if sent < total {
+                w.pause();
+            } else {
+                w.finish().unwrap();
+                drop(w);
+            }
+            if i % 16 == 0 {
+                let t = origin.elapsed().as_nanos() as u64;
+                tx.send(&t.to_le_bytes()).unwrap();
+            }
+            i += 1;
+        }
+    });
+    // Messages first (as a latency-sensitive consumer would), then one bulk
+    // chunk at a time so the transfer keeps moving.
+    let reader = thread::spawn(move || {
+        let mut lat = Vec::new();
+        let mut buf = [0u8; 8];
+        let mut bulk_done = false;
+        rx.set_nonblocking(true);
+        loop {
+            loop {
+                match rx.recv(&mut buf) {
+                    Ok(_) => {
+                        let sent = u64::from_le_bytes(buf);
+                        lat.push(origin.elapsed().as_nanos() as u64 - sent);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => return lat,
+                }
+            }
+            if !bulk_done {
+                let mut r = match rx.bulk_reader() {
+                    Ok(r) => r,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => return lat,
+                };
+                // One chunk, then check messages again.
+                let mut chunk = [0u8; 64 << 10];
+                match r.read(&mut chunk) {
+                    Ok(0) => bulk_done = true,
+                    Ok(_) => r.pause(),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => r.pause(),
+                    Err(_) => return lat,
+                }
+            }
+        }
+    });
+    writer.join().unwrap();
+    let mut lat = reader.join().unwrap();
+    lat.sort_unstable();
+    let p50 = lat[lat.len() / 2] as f64 / 1e3;
+    let p99 = lat[lat.len() * 99 / 100] as f64 / 1e3;
+    (p50, p99)
+}
+
 fn main() {
     println!("messages per second (two threads, higher is better)");
     println!(
@@ -146,6 +271,22 @@ fn main() {
             println!("{size:>8}  {ch:>14.0}");
         }
     }
+    println!();
+    println!("bulk transfer of 1 GiB, GiB/s (higher is better)");
+    let gb = 1 << 30;
+    #[cfg(unix)]
+    println!(
+        "  GkChannel: {:.2}   pipe: {:.2}   unix socket: {:.2}",
+        bulk_rate(gb),
+        stream_bulk_rate(pipe(), gb),
+        stream_bulk_rate(std::os::unix::net::UnixStream::pair().unwrap(), gb)
+    );
+    #[cfg(not(unix))]
+    println!("  GkChannel: {:.2}", bulk_rate(gb));
+    let (p50, p99) = message_latency_during_bulk();
+    println!();
+    println!("message latency while a 512 MiB transfer is in progress, microseconds");
+    println!("  median: {p50:.1}   99th percentile: {p99:.1}");
     println!();
     println!("ping-pong round trip, microseconds (lower is better)");
     println!("  GkChannel:   {:.2}", channel_ping_pong(100_000));

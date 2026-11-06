@@ -36,6 +36,8 @@ pub(crate) mod errno {
     pub const EMSGSIZE: c_int = libc::EMSGSIZE;
     #[cfg(unix)]
     pub const EACCES: c_int = libc::EACCES;
+    #[cfg(unix)]
+    pub const ECONNABORTED: c_int = libc::ECONNABORTED;
 
     #[cfg(windows)]
     pub const EAGAIN: c_int = 11;
@@ -63,6 +65,8 @@ pub(crate) mod errno {
     pub const EMSGSIZE: c_int = 115;
     #[cfg(windows)]
     pub const EACCES: c_int = 13;
+    #[cfg(windows)]
+    pub const ECONNABORTED: c_int = 106;
 }
 
 /// `EAGAIN`: the operation would block on a non-blocking eventfd.
@@ -125,6 +129,7 @@ pub(crate) fn to_errno(e: &io::Error) -> c_int {
         io::ErrorKind::AddrInUse => errno::EADDRINUSE,
         io::ErrorKind::BrokenPipe => errno::EPIPE,
         io::ErrorKind::PermissionDenied => errno::EACCES,
+        io::ErrorKind::ConnectionAborted => errno::ECONNABORTED,
         #[cfg(windows)]
         _ if e.raw_os_error() == Some(6) => errno::EBADF,
         _ => errno::EIO,

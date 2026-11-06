@@ -51,7 +51,9 @@ pub mod compat;
 mod ffi;
 pub mod process;
 
-pub use channel::{ChannelOptions, GkChannel, GkReceiver, GkSender, SendSlot};
+pub use channel::{
+    BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, SendSlot,
+};
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
 pub use process::{GkListener, GkProcess, Shareable};
 

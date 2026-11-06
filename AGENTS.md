@@ -240,36 +240,48 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 
-## 6a. Message channels (`GkChannel`)
+## 6a. Channels (`GkChannel`)
 
-- `let (mut tx, mut rx) = GkChannel::new()?;` (16 MiB ring, 1 MiB max
-  message) or `GkChannel::with_options(ChannelOptions { capacity, max_message })`
-  (capacity a power of two >= 64, `max_message <= capacity / 2 - 8`).
-- One sender, one receiver; the ends are not `Clone`. Messages keep their
-  boundaries, may be empty, arrive in order.
-- `tx.send(&[u8])`, `tx.reserve(len)?` + write + `slot.commit(n)` (in place);
-  `rx.recv(&mut buf)` (`InvalidInput` if `buf` is too small, the message
-  stays queued; `rx.next_len()` peeks), `rx.recv_vec(&mut vec)`,
-  `rx.recv_with(|msg| ...)` (in place).
-- Errors: `WouldBlock` (non-blocking, empty/full), `BrokenPipe` (other end
-  dropped or its process died; the receiver gets it after draining),
-  `InvalidInput` (sizes), `PermissionDenied` (end owned by another process).
-- Polling: register the end itself (mio `Source`, `AsFd`/`AsSocket`, tokio
-  `AsyncFd` on unix) for READABLE; drain until `WouldBlock`, then wait.
+- `let (mut tx, mut rx) = GkChannel::new()?;` or
+  `GkChannel::with_options(ChannelOptions { capacity, max_message, bulk_capacity, chunk })`.
+  Defaults: message ring 1 MiB, bulk ring 4 MiB, 64 KiB messages and chunks
+  (Windows: 256 KiB / 1 MiB rings). Rings: powers of two >= 64;
+  `max_message <= capacity / 2 - 8`; `chunk <= bulk_capacity / 2 - 32`.
+- Two independent lanes, NOT ordered relative to each other:
+  - messages: `tx.send(&[u8])`, `tx.reserve(len)?` + `slot.commit(n)`;
+    `rx.recv(&mut buf)` (`InvalidInput` if `buf` too small, message stays;
+    `rx.next_len()` peeks), `rx.recv_vec`, `rx.recv_with(|msg| ..)`.
+  - bulk (any size): `tx.send_bulk(&data)? -> id` (blocks until queued),
+    `tx.bulk_writer(Some(len) | None)?` (`io::Write`, `finish()`),
+    `rx.recv_bulk_vec(&mut vec, limit)? -> id`, `rx.bulk_reader()?`
+    (`io::Read`, `id()`, `len()`, `for_each_chunk`). Link lanes by sending
+    the transfer id as a message.
+- One sender, one receiver; ends are not `Clone`.
+- Errors: `WouldBlock` (non-blocking; bulk writes may be partial),
+  `BrokenPipe` (other end gone, or its process died; after draining),
+  `ConnectionAborted` (the sender abandoned a transfer: unfinished
+  `BulkWriter` dropped), `InvalidData` (length mismatch or corruption),
+  `InvalidInput` (sizes, limit), `PermissionDenied` (end owned by another
+  process).
+- Event loops: register the end (mio `Source`, `AsFd`/`AsSocket`, tokio
+  `AsyncFd` on unix) for READABLE; drain every lane you use until
+  `WouldBlock`, then wait. To serve messages mid-transfer, `pause()` the
+  `BulkReader` (resume with `rx.bulk_reader()`) or `BulkWriter` (resume with
+  `tx.resume_bulk()`); dropping them instead discards / abandons the
+  transfer.
 - Across processes: `GkProcess::send(&end)` + `recv_as::<GkReceiver>()` /
   `recv_as::<GkSender>()` (all OS); unix also `end.send_to(&stream)` /
-  `GkReceiver::recv_from(&stream)`. The sending process's copy is detached
-  (unusable, and dropping it does not close the channel). After `fork()`: the
-  process that keeps an end calls `claim()`; the other calls `detach()` on
-  its copy (dropping the owner's copy would close the channel).
-- Channel ends are not shared with `export_inheritable`/`import`; use
-  `GkProcess::spawn` for children.
-- C: `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
-  `gk_receiver_next_len`, `gk_*_set_nonblocking`, `gk_*_claim`,
-  `gk_*_detach`, `gk_*_free`, `gk_sender_fd`/`gk_receiver_fd` (unix),
-  `gk_*_socket` (Windows), `gk_process_send_sender`/`_receiver`,
+  `GkReceiver::recv_from(&stream)`. The sending process's copy is detached.
+  After `fork()`: the keeping process calls `claim()`, the other
+  `detach()`es its copy. Not shared via `export_inheritable`/`import`.
+- C: `gk_channel_options_default`, `gk_channel_new(&opts | NULL, &tx, &rx)`,
+  `gk_sender_send`, `gk_receiver_recv`, `gk_receiver_next_len`,
+  `gk_sender_send_bulk`, `gk_sender_bulk_begin`/`_write`/`_finish`/`_abort`,
+  `gk_receiver_bulk_begin`/`_read`/`_end`, `gk_*_set_nonblocking`,
+  `gk_*_claim`, `gk_*_detach`, `gk_*_free`, `gk_sender_fd`/`gk_receiver_fd`
+  (unix), `gk_*_socket` (Windows), `gk_process_send_sender`/`_receiver`,
   `gk_process_recv_sender`/`_receiver`; errno `EAGAIN`, `EPIPE`, `EMSGSIZE`,
-  `EACCES`. See `examples/c/channel.c`.
+  `EACCES`, `ECONNABORTED`. See `examples/c/channel.c`.
 
 ## 7. Per-platform checklists
 
@@ -333,8 +345,8 @@ docker run --rm -v "$(pwd)":/w -w /w -v cargo-cache:/usr/local/cargo/registry \
   compares it against the kernel eventfd with random operation sequences.
   Run this after any change to `src/sys/shm.rs` (shared by the unix and
   Windows shims) or `src/sys/unix_shim.rs`.
-- Channel ring logic under Miri (nightly):
-  `cargo +nightly miri test --lib channel::ring_tests`.
+- Channel lane logic under Miri (nightly):
+  `cargo +nightly miri test --lib channel::lane`.
 - Channel benchmark: `cargo run --release --example channel_bench`.
 - Windows tests only run on a Windows machine:
   `cargo test --features mio,ffi`. `tests/windows_share.rs` and the

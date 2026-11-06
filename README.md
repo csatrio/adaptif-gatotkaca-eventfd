@@ -283,34 +283,51 @@ without closing anything. In C: `gk_eventfd_export_inheritable`,
 `gk_eventfd_recv` (unix) and `gk_eventfd_export_to` (Windows); see the
 header.
 
-## Message channels: `GkChannel`
+## Channels: `GkChannel`
 
-A one-way, one-sender/one-receiver message channel between threads or
-processes, through shared memory, with two eventfds as doorbells. Messages
-keep their boundaries (any length up to the maximum, including zero) and
-arrive in order. While both sides are busy, a message costs a few atomic
-operations and one copy, with no system call; a blocking call spins for a
-few microseconds before sleeping, so quick replies cost none either.
+A one-way channel between threads or processes, through shared memory, with
+two eventfds as doorbells. It has two independent lanes:
+
+- **Messages:** atomic messages of up to `max_message` bytes (including
+  zero), delivered whole and in order. Blocking or non-blocking.
+- **Bulk transfers:** data of any size, sliced into chunks and reassembled,
+  or streamed with `io::Write` / `io::Read`. Each transfer has an id and is
+  checked end to end: a lost or out-of-order chunk, a wrong length, or a
+  transfer abandoned by the sender is reported, never delivered as data.
+
+The lanes are not ordered relative to each other: a message sent during a
+1 GB transfer arrives at once instead of waiting behind it. Mention a
+transfer's id in a message to link the two.
+
+While both sides are busy, a message or chunk costs a few atomic operations
+and one copy, with no system call; blocking calls spin for a few
+microseconds before sleeping, so quick replies cost none either.
 
 ```rust,no_run
-use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel, GkProcess, GkReceiver};
+use adaptif_gatotkaca_eventfd::{GkChannel, GkProcess, GkReceiver};
+use std::io::{Read, Write};
 use std::process::Command;
 
 fn main() -> std::io::Result<()> {
-    // Default: 16 MiB ring, 1 MiB maximum message (both configurable).
-    let (mut tx, rx) = GkChannel::with_options(ChannelOptions::default())?;
+    let (mut tx, rx) = GkChannel::new()?;
 
     // Hand the receiving end to a child process...
     let (mut child, mut worker) = GkProcess::spawn(&mut Command::new("./worker"))?;
     worker.send(&rx)?;
     drop(rx); // our copy now belongs to the child: dropping it doesn't close
 
-    // ...and stream messages to it.
+    // ...then send messages and bulk data.
     tx.send(b"job 1")?;
-    let mut slot = tx.reserve(1024)?; // or write in place, without a copy
-    slot[..5].copy_from_slice(b"job 2");
-    slot.commit(5);
-    drop(tx); // the worker gets BrokenPipe after the last message
+    let id = tx.send_bulk(&vec![0u8; 200 << 20])?; // 200 MiB, any size
+    tx.send(&id.to_le_bytes())?;
+
+    // Or stream (length known or not), e.g. a file:
+    let mut w = tx.bulk_writer(None)?;
+    std::io::copy(&mut std::fs::File::open("data.bin")?, &mut w)?;
+    w.finish()?;
+    drop(w);
+
+    drop(tx); // the worker gets BrokenPipe after the last data
     child.wait()?;
     Ok(())
 }
@@ -318,45 +335,58 @@ fn main() -> std::io::Result<()> {
 // In ./worker:
 fn worker() -> std::io::Result<()> {
     let mut rx: GkReceiver = GkProcess::from_parent()?.recv_as()?;
-    let mut buf = Vec::new();
-    while let Ok(n) = rx.recv_vec(&mut buf) {
-        println!("got {n} bytes");
-    }
+    let mut msg = Vec::new();
+    rx.recv_vec(&mut msg)?;                         // "job 1"
+    let mut data = Vec::new();
+    rx.recv_bulk_vec(&mut data, 1 << 30)?;          // reassembled, limit 1 GiB
+    let mut file = Vec::new();
+    rx.bulk_reader()?.read_to_end(&mut file)?;      // or stream it
     Ok(())
 }
 ```
 
-- `send` / `recv` block by default; `set_nonblocking(true)` makes them fail
-  with `WouldBlock`. `recv_with(|msg| ...)` reads a message in place.
-- Polling: a `GkReceiver` is readable (`AsFd`/`AsSocket`, mio, tokio's
-  `AsyncFd` on unix) when a message may be waiting, a `GkSender` when space
-  may have been freed. Read/write until `WouldBlock`, then wait for the next
-  event.
-- Closing: dropping one end makes the other side fail with `BrokenPipe` (the
-  receiver after draining). A peer *process* that dies is detected by
-  blocking calls within about a quarter second.
-- Sharing: `GkProcess::send(&end)` / `recv_as::<GkSender>()` /
+- **Sizes** (`ChannelOptions`, all configurable): message ring 1 MiB, bulk
+  ring 4 MiB, messages and chunks up to 64 KiB. On Windows, where the memory
+  is committed when the channel is created, the defaults are a 256 KiB
+  message ring and a 1 MiB bulk ring. Transfers themselves have no size
+  limit; `recv_bulk_vec` takes a limit to protect the receiver's memory.
+- **Blocking / non-blocking:** `set_nonblocking(true)` makes calls fail with
+  `WouldBlock`; bulk writes may then be partial, like any `io::Write`.
+  `send_bulk` always blocks until the data is in the ring.
+- **Event loops:** a `GkReceiver` is readable (`AsFd`/`AsSocket`, mio,
+  tokio's `AsyncFd` on unix) when data may be waiting in a lane it drained
+  to `WouldBlock`; a `GkSender` when space may have been freed. Drain each
+  lane you use until `WouldBlock`, then wait. `BulkReader::pause` /
+  `BulkWriter::pause` (+ `GkSender::resume_bulk`) keep a transfer open while
+  you serve the other lane.
+- **In place:** `reserve` / `commit` for messages, `recv_with` and
+  `BulkReader::for_each_chunk` to read without copying.
+- **Closing:** dropping one end makes the other side fail with `BrokenPipe`
+  (the receiver after draining). A dropped unfinished `BulkWriter` abandons
+  its transfer: the reader gets `ConnectionAborted`. A peer *process* that
+  dies is detected by blocking calls within about a quarter second.
+- **Sharing:** `GkProcess::send(&end)` / `recv_as::<GkSender>()` /
   `recv_as::<GkReceiver>()` on every OS, `send_to`/`recv_from` over a
   `UnixStream` on unix, and `fork()` (the process that keeps an end calls
   `claim()`, the other `detach()`es its copy).
-- Memory: the ring is `capacity` bytes of shared memory; on unix it is only
-  allocated as it is first written, on Windows it counts against the commit
-  limit from the start.
-- C: `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
-  `gk_process_send_receiver`, ... (see the header and
+- **C:** `gk_channel_new`, `gk_sender_send`, `gk_receiver_recv`,
+  `gk_sender_send_bulk`, `gk_sender_bulk_begin`/`_write`/`_finish`,
+  `gk_receiver_bulk_begin`/`_read`/`_end`, ... (see the header and
   [`examples/c/channel.c`](examples/c/channel.c)).
 
 Rough numbers between two threads (`cargo run --release --example
-channel_bench`), messages per second, macOS on Apple Silicon:
+channel_bench`), macOS on Apple Silicon:
 
-| message | `GkChannel` | pipe | unix socket |
+| | `GkChannel` | pipe | unix socket |
 |---|---|---|---|
-| 64 B | ~14.6 M | ~1.2 M | ~0.9 M |
-| 1 KiB | ~15.9 M | ~1.0 M | ~0.8 M |
-| 64 KiB | ~0.49 M | ~0.14 M | ~0.04 M |
+| 64 B messages per second | ~13.7 M | ~1.1 M | ~0.9 M |
+| 1 KiB messages per second | ~13.2 M | ~0.9 M | ~0.8 M |
+| 1 GiB bulk transfer (one copy each side) | ~29.6 GiB/s | ~12.8 GiB/s | ~2.6 GiB/s |
+| ping-pong round trip | ~0.27 µs | | ~3.7 µs |
 
-Ping-pong round trip: ~0.24 µs for `GkChannel` against ~3.5 µs for a unix
-socket. Your numbers will differ; run the benchmark on your machine.
+A message sent while a 512 MiB transfer is in progress arrives in about
+0.6 µs (99th percentile 1.8 µs). Your numbers will differ; run the
+benchmark on your machine.
 
 ## C usage
 

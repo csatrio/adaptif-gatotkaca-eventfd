@@ -518,14 +518,48 @@ fn with<T, R>(p: *mut T, err: R, f: impl FnOnce(&mut T) -> R) -> R {
     }
 }
 
-/// `int gk_channel_new(size_t capacity, size_t max_message, gk_sender **tx, gk_receiver **rx);`
-///
-/// # Safety
-/// `tx` and `rx` must be valid for writing a pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_channel_new(
+/// `gk_channel_options` in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GkChannelOptionsC {
     capacity: usize,
     max_message: usize,
+    bulk_capacity: usize,
+    chunk: usize,
+}
+
+impl From<ChannelOptions> for GkChannelOptionsC {
+    fn from(o: ChannelOptions) -> Self {
+        Self {
+            capacity: o.capacity,
+            max_message: o.max_message,
+            bulk_capacity: o.bulk_capacity,
+            chunk: o.chunk,
+        }
+    }
+}
+
+/// `void gk_channel_options_default(gk_channel_options *opts);`
+///
+/// # Safety
+/// `opts` must be null or valid for writing a `gk_channel_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_channel_options_default(opts: *mut GkChannelOptionsC) {
+    if !opts.is_null() {
+        // SAFETY: checked non-null; the caller guarantees validity.
+        unsafe { opts.write(ChannelOptions::default().into()) };
+    }
+}
+
+/// `int gk_channel_new(const gk_channel_options *opts, gk_sender **tx, gk_receiver **rx);`
+/// (`opts` NULL: the defaults)
+///
+/// # Safety
+/// `opts` must be null or valid for reading; `tx` and `rx` valid for writing
+/// a pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_channel_new(
+    opts: *const GkChannelOptionsC,
     tx: *mut *mut GkSender,
     rx: *mut *mut GkReceiver,
 ) -> c_int {
@@ -534,10 +568,17 @@ pub unsafe extern "C" fn gk_channel_new(
             compat::set_errno(crate::error::errno::EINVAL);
             return -1;
         }
-        match GkChannel::with_options(ChannelOptions {
-            capacity,
-            max_message,
-        }) {
+        // SAFETY: the caller guarantees `opts` is null or readable.
+        let o = match unsafe { opts.as_ref() } {
+            Some(o) => ChannelOptions {
+                capacity: o.capacity,
+                max_message: o.max_message,
+                bulk_capacity: o.bulk_capacity,
+                chunk: o.chunk,
+            },
+            None => ChannelOptions::default(),
+        };
+        match GkChannel::with_options(o) {
             Ok((s, r)) => {
                 // SAFETY: checked non-null; the caller guarantees validity.
                 unsafe {
@@ -796,6 +837,232 @@ pub unsafe extern "C" fn gk_receiver_detach(rx: *mut GkReceiver) {
         // SAFETY: the caller hands back a box we created.
         guard((), || unsafe { Box::from_raw(rx) }.detach());
     }
+}
+
+/// Writes `id` through an optional out pointer.
+///
+/// # Safety
+/// `out` must be null or valid for writing.
+unsafe fn put<T>(out: *mut T, v: T) {
+    if !out.is_null() {
+        // SAFETY: forwarded.
+        unsafe { out.write(v) };
+    }
+}
+
+/// Bytes `buf`/`len` from C (empty if `len` is 0), or `EINVAL` for null.
+///
+/// # Safety
+/// `buf` must be valid for reading `len` bytes.
+unsafe fn c_bytes<'a>(buf: *const c_void, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if buf.is_null() {
+        compat::set_errno(crate::error::errno::EINVAL);
+        return None;
+    }
+    // SAFETY: forwarded.
+    Some(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) })
+}
+
+/// Sets `errno` for a bulk error (`ECONNABORTED`, `EPIPE`, ...).
+fn bulk_errno(e: &std::io::Error) {
+    compat::set_errno(crate::error::to_errno(e));
+}
+
+/// `int gk_sender_send_bulk(gk_sender *tx, const void *buf, size_t len, uint64_t *id);`
+///
+/// # Safety
+/// `tx` live; `buf` readable for `len` bytes; `id` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_send_bulk(
+    tx: *mut GkSender,
+    buf: *const c_void,
+    len: usize,
+    id: *mut u64,
+) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| {
+            // SAFETY: forwarded to the caller.
+            let Some(data) = (unsafe { c_bytes(buf, len) }) else {
+                return -1;
+            };
+            match tx.send_bulk(data) {
+                Ok(v) => {
+                    // SAFETY: forwarded to the caller.
+                    unsafe { put(id, v) };
+                    0
+                }
+                Err(e) => {
+                    bulk_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `int gk_sender_bulk_begin(gk_sender *tx, int64_t len, uint64_t *id);`
+/// (`len < 0`: unknown length, ended by `gk_sender_bulk_finish`)
+///
+/// # Safety
+/// `tx` live; `id` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_bulk_begin(tx: *mut GkSender, len: i64, id: *mut u64) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| match tx.bulk_begin(u64::try_from(len).ok()) {
+            Ok(v) => {
+                // SAFETY: forwarded to the caller.
+                unsafe { put(id, v) };
+                0
+            }
+            Err(e) => {
+                bulk_errno(&e);
+                -1
+            }
+        })
+    })
+}
+
+/// `intptr_t gk_sender_bulk_write(gk_sender *tx, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` live; `buf` readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_bulk_write(
+    tx: *mut GkSender,
+    buf: *const c_void,
+    len: usize,
+) -> isize {
+    guard(-1, || {
+        with(tx, -1, |tx| {
+            // SAFETY: forwarded to the caller.
+            let Some(data) = (unsafe { c_bytes(buf, len) }) else {
+                return -1;
+            };
+            match tx.bulk_write(data) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    bulk_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `int gk_sender_bulk_finish(gk_sender *tx);`
+///
+/// # Safety
+/// `tx` live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_bulk_finish(tx: *mut GkSender) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| match tx.bulk_finish() {
+            Ok(()) => 0,
+            Err(e) => {
+                bulk_errno(&e);
+                -1
+            }
+        })
+    })
+}
+
+/// `int gk_sender_bulk_abort(gk_sender *tx);`
+///
+/// # Safety
+/// `tx` live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_bulk_abort(tx: *mut GkSender) -> c_int {
+    guard(-1, || {
+        with(tx, -1, |tx| match tx.bulk_abort() {
+            Ok(()) => 0,
+            Err(e) => {
+                bulk_errno(&e);
+                -1
+            }
+        })
+    })
+}
+
+/// `int gk_receiver_bulk_begin(gk_receiver *rx, int64_t *len, uint64_t *id);`
+/// (`*len` is -1 for an unknown length)
+///
+/// # Safety
+/// `rx` live; `len`, `id` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_bulk_begin(
+    rx: *mut GkReceiver,
+    len: *mut i64,
+    id: *mut u64,
+) -> c_int {
+    guard(-1, || {
+        with(rx, -1, |rx| match rx.bulk_begin() {
+            Ok((v, total)) => {
+                // SAFETY: forwarded to the caller.
+                unsafe {
+                    put(id, v);
+                    put(
+                        len,
+                        total.map_or(-1, |t| i64::try_from(t).unwrap_or(i64::MAX)),
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                bulk_errno(&e);
+                -1
+            }
+        })
+    })
+}
+
+/// `intptr_t gk_receiver_bulk_read(gk_receiver *rx, void *buf, size_t cap);`
+/// (0 at the end of the transfer)
+///
+/// # Safety
+/// `rx` live; `buf` writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_bulk_read(
+    rx: *mut GkReceiver,
+    buf: *mut c_void,
+    cap: usize,
+) -> isize {
+    guard(-1, || {
+        with(rx, -1, |rx| {
+            let out = if cap == 0 {
+                &mut [][..]
+            } else if buf.is_null() {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return -1;
+            } else {
+                // SAFETY: the caller guarantees `cap` writable bytes.
+                unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), cap) }
+            };
+            match rx.bulk_read(out) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    bulk_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `int gk_receiver_bulk_end(gk_receiver *rx);` (discards the unread rest)
+///
+/// # Safety
+/// `rx` live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_bulk_end(rx: *mut GkReceiver) -> c_int {
+    guard(-1, || {
+        with(rx, -1, |rx| {
+            rx.bulk_end();
+            0
+        })
+    })
 }
 
 /// `int gk_process_send_sender(gk_process *p, gk_sender *tx);`

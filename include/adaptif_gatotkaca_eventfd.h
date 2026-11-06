@@ -392,12 +392,17 @@ int gk_process_recv(gk_process *process);
 void gk_process_free(gk_process *process);
 
 /*
- * Channels: one-way message passing between threads or processes through
+ * Channels: one-way data passing between threads or processes through
  * shared memory (the C form of the Rust GkChannel / GkSender / GkReceiver).
- * Messages keep their boundaries, may be empty, and are read in order. The
- * eventfd doorbells make each end pollable: the receiver's descriptor is
- * readable when a message may be waiting, the sender's when space may have
- * been freed (read/write until EAGAIN, then poll).
+ * A channel has two independent lanes, not ordered relative to each other:
+ *   - messages: atomic, up to max_message bytes (may be empty), in order;
+ *   - bulk transfers: any size, sliced into chunks and reassembled, in
+ *     order, each with an id (gk_sender_send_bulk / gk_sender_bulk_*,
+ *     gk_receiver_bulk_*).
+ * The eventfd doorbells make each end pollable: the receiver's descriptor is
+ * readable when data may be waiting in a lane it drained to EAGAIN, the
+ * sender's when space may have been freed (read/write until EAGAIN, then
+ * poll).
  *
  * Errors: -1 (or NULL) with errno EAGAIN (non-blocking and empty/full),
  * EPIPE (the other end is gone; the receiver gets it after draining),
@@ -409,15 +414,27 @@ void gk_process_free(gk_process *process);
 typedef struct gk_sender gk_sender;
 typedef struct gk_receiver gk_receiver;
 
-/* Default sizes: a 16 MiB ring and 1 MiB messages. */
-#define GK_CHANNEL_DEFAULT_CAPACITY (16u << 20)
-#define GK_CHANNEL_DEFAULT_MAX_MESSAGE (1u << 20)
+/*
+ * Channel sizes. Defaults (gk_channel_options_default): message ring 1 MiB,
+ * bulk ring 4 MiB, 64 KiB messages and chunks; on Windows a 256 KiB message
+ * ring and a 1 MiB bulk ring. Rings are powers of two >= 64; max_message is
+ * at most capacity / 2 - 8; chunk at most bulk_capacity / 2 - 32.
+ */
+typedef struct gk_channel_options {
+    size_t capacity;      /* message ring, bytes */
+    size_t max_message;   /* largest message, bytes */
+    size_t bulk_capacity; /* bulk ring, bytes */
+    size_t chunk;         /* largest bulk chunk, bytes (transfers: any size) */
+} gk_channel_options;
+
+/* Fills *opts with the defaults. */
+void gk_channel_options_default(gk_channel_options *opts);
 
 /*
- * Creates a channel. capacity is a power of two >= 64; max_message is at
- * most capacity / 2 - 8 (EINVAL otherwise). Returns 0 and the two ends.
+ * Creates a channel (opts NULL: the defaults). Returns 0 and the two ends,
+ * or -1 with errno = EINVAL for invalid sizes.
  */
-int gk_channel_new(size_t capacity, size_t max_message, gk_sender **tx,
+int gk_channel_new(const gk_channel_options *opts, gk_sender **tx,
                    gk_receiver **rx);
 
 /* Sends one message of len bytes (blocks while full unless non-blocking). */
@@ -431,6 +448,42 @@ intptr_t gk_receiver_recv(gk_receiver *rx, void *buf, size_t cap);
 
 /* Length of the next message without waiting; -1 + EAGAIN if empty. */
 intptr_t gk_receiver_next_len(gk_receiver *rx);
+
+/*
+ * Bulk transfers. Errors as above, plus ECONNABORTED (the sender abandoned
+ * the transfer) and EINVAL (more or less data than a declared length, or no
+ * transfer in progress).
+ */
+
+/* Sends len bytes (any size) as one transfer; blocks until all of it is in
+ * the ring (even in non-blocking mode). *id (if not NULL) gets its id. */
+int gk_sender_send_bulk(gk_sender *tx, const void *buf, size_t len,
+                        uint64_t *id);
+
+/* Starts a streamed transfer; len < 0 means unknown (ended by finish). */
+int gk_sender_bulk_begin(gk_sender *tx, int64_t len, uint64_t *id);
+
+/* Writes data of the transfer; returns the bytes taken (may be fewer than
+ * len in non-blocking mode), or -1 with errno (EAGAIN when full). */
+intptr_t gk_sender_bulk_write(gk_sender *tx, const void *buf, size_t len);
+
+/* Ends the transfer (EINVAL if shorter than declared: then abandoned). */
+int gk_sender_bulk_finish(gk_sender *tx);
+
+/* Abandons the transfer: the receiver gets ECONNABORTED. */
+int gk_sender_bulk_abort(gk_sender *tx);
+
+/* Waits for the next transfer (or continues an unfinished one): *len gets
+ * its declared length or -1, *id its id (either pointer may be NULL). */
+int gk_receiver_bulk_begin(gk_receiver *rx, int64_t *len, uint64_t *id);
+
+/* Reads data of the transfer into buf; returns the bytes read, 0 at its
+ * end, or -1 with errno (EAGAIN, ECONNABORTED, EPIPE, ...). */
+intptr_t gk_receiver_bulk_read(gk_receiver *rx, void *buf, size_t cap);
+
+/* Stops reading the transfer; the unread rest is discarded before the next
+ * transfer. Returns 0. */
+int gk_receiver_bulk_end(gk_receiver *rx);
 
 /* Non-zero: fail with EAGAIN instead of blocking. Returns 0. */
 int gk_sender_set_nonblocking(gk_sender *tx, int nonblocking);

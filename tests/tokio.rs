@@ -170,6 +170,7 @@ async fn channel_receiver_with_asyncfd() {
     let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
         capacity: 4096,
         max_message: 64,
+        ..Default::default()
     })
     .unwrap();
     rx.set_nonblocking(true);

@@ -399,6 +399,7 @@ fn channel() -> (GkSender, GkReceiver) {
     GkChannel::with_options(ChannelOptions {
         capacity: 1 << 16,
         max_message: 4000,
+        ..Default::default()
     })
     .unwrap()
 }
@@ -427,8 +428,27 @@ fn channel_child(role: &str) {
                 tx.send(&message(i)).unwrap();
             }
         }
+        // Receive the receiver, then a large bulk transfer and a message.
+        "channel_bulk" => {
+            let mut rx: GkReceiver = parent.recv_as().expect("recv_as::<GkReceiver>");
+            let mut data = Vec::new();
+            let id = rx.recv_bulk_vec(&mut data, 64 << 20).unwrap();
+            assert_eq!(data.len(), BULK_LEN);
+            assert!(data == bulk_data(), "bulk data differs");
+            let mut buf = [0u8; 8];
+            assert_eq!(rx.recv(&mut buf).unwrap(), 8);
+            assert_eq!(u64::from_le_bytes(buf), id);
+        }
         other => panic!("unknown role {other}"),
     }
+}
+
+const BULK_LEN: usize = 12 << 20;
+
+fn bulk_data() -> Vec<u8> {
+    (0..BULK_LEN as u32)
+        .map(|i| i.wrapping_mul(2654435761).rotate_left(7) as u8)
+        .collect()
 }
 
 fn spawn_channel_child(role: &str) -> (Child, GkProcess) {
@@ -474,5 +494,16 @@ fn channel_child_sends_parent_receives() {
         rx.recv_vec(&mut buf).unwrap_err().kind(),
         ErrorKind::BrokenPipe
     );
+    join(Spawned(child, Some(peer)));
+}
+
+#[test]
+fn channel_bulk_to_child() {
+    let (mut tx, rx) = channel();
+    let (child, mut peer) = spawn_channel_child("channel_bulk");
+    peer.send(&rx).unwrap();
+    drop(rx);
+    let id = tx.send_bulk(&bulk_data()).unwrap(); // 12 MiB through the default ring
+    tx.send(&id.to_le_bytes()).unwrap();
     join(Spawned(child, Some(peer)));
 }
