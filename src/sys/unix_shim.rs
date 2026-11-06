@@ -358,6 +358,133 @@ impl Inner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sharing with other processes: the shared memory object and both pipe ends.
+// ---------------------------------------------------------------------------
+
+use super::unix_share::{self, InheritableExport};
+
+impl Shared {
+    fn fds(&self) -> [BorrowedFd<'_>; 3] {
+        [self.page.fd(), self.pipe_r.as_fd(), self.pipe_w.as_fd()]
+    }
+
+    fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        InheritableExport::new('u', &self.fds())
+    }
+
+    fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
+        unix_share::send(sock, 'u', &self.fds())
+    }
+
+    /// Builds from the three descriptors once `page` validated; the pipe
+    /// ends must already have been checked.
+    fn assemble(page: SharedPage, pipe_r: OwnedFd, pipe_w: OwnedFd) -> io::Result<Self> {
+        for fd in [page.fd(), pipe_r.as_fd(), pipe_w.as_fd()] {
+            unix_share::set_cloexec(fd)?;
+        }
+        for fd in [&pipe_r, &pipe_w] {
+            // SAFETY: plain fcntl on descriptors we own.
+            let fl = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+            // SAFETY: as above.
+            cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) })?;
+        }
+        Ok(Self {
+            page,
+            pipe_r,
+            pipe_w,
+        })
+    }
+
+    /// # Safety
+    /// See `GkEventFd::import`.
+    unsafe fn import(token: &str) -> io::Result<Self> {
+        let fds = unix_share::parse(token, 'u', 3)?;
+        check_pipe_ends(fds[1], fds[2])?;
+        // SAFETY: the caller guarantees the token's descriptors may be ours;
+        // `adopt` only takes the page over if it validates.
+        let page = unsafe { SharedPage::adopt(fds[0]) }?;
+        // SAFETY: validated above; owned from here on.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[1]), OwnedFd::from_raw_fd(fds[2])) };
+        Self::assemble(page, r, w)
+    }
+
+    fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
+        let mut fds = unix_share::recv(sock, 'u', 3)?.into_iter();
+        let (shm, r, w) = (
+            fds.next().unwrap(),
+            fds.next().unwrap(),
+            fds.next().unwrap(),
+        );
+        check_pipe_ends(r.as_raw_fd(), w.as_raw_fd())?;
+        Self::assemble(SharedPage::from_owned(shm)?, r, w)
+    }
+}
+
+/// Checks, without taking ownership, that `r` and `w` are the read and
+/// write ends of a pipe.
+fn check_pipe_ends(r: RawFd, w: RawFd) -> io::Result<()> {
+    let mode = |fd: RawFd, want: libc::c_int| {
+        let is_fifo = {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat writes a stat through a valid pointer.
+            let ok = unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0;
+            // SAFETY: only read if fstat succeeded.
+            ok && (unsafe { st.assume_init() }.st_mode & libc::S_IFMT) == libc::S_IFIFO
+        };
+        // SAFETY: query only.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        is_fifo && fl != -1 && (fl & libc::O_ACCMODE) == want
+    };
+    if mode(r, libc::O_RDONLY) && mode(w, libc::O_WRONLY) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "eventfd token: descriptors are not an eventfd's pipe",
+        ))
+    }
+}
+
+impl Inner {
+    fn from_shared(shared: Shared) -> io::Result<Self> {
+        let fd = dup(shared.pipe_r.as_fd(), true)?;
+        Ok(Self {
+            shared: Arc::new(shared),
+            fd,
+        })
+    }
+
+    pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        self.shared.export_inheritable()
+    }
+
+    /// # Safety
+    /// See `GkEventFd::import`.
+    pub(crate) unsafe fn import(token: &str) -> io::Result<Self> {
+        // SAFETY: forwarded to the caller.
+        Self::from_shared(unsafe { Shared::import(token) }?)
+    }
+
+    pub(crate) fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
+        self.shared.send_to(sock)
+    }
+
+    pub(crate) fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
+        Self::from_shared(Shared::recv_from(sock)?)
+    }
+}
+
+impl Core {
+    pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        self.0.export_inheritable()
+    }
+
+    pub(crate) fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
+        self.0.send_to(sock)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +803,33 @@ mod tests {
         assert!(!now(&e));
         assert_eq!(e.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
         reap(child);
+    }
+
+    #[test]
+    fn import_validates_before_taking_ownership() {
+        let e = Inner::new(1, nb()).unwrap();
+        let export = e.export_inheritable().unwrap();
+        let fds = unix_share::parse(export.token(), 'u', 3).unwrap();
+        let (shm, r, w) = (fds[0], fds[1], fds[2]);
+        for (token, kind) in [
+            // Pipe ends swapped.
+            (
+                format!("gkefd1:u:{shm}:{w}:{r}"),
+                io::ErrorKind::InvalidInput,
+            ),
+            // A pipe where the shared memory object should be.
+            (format!("gkefd1:u:{r}:{r}:{w}"), io::ErrorKind::InvalidData),
+            // Native token on the shim.
+            (format!("gkefd1:n:{shm}"), io::ErrorKind::InvalidInput),
+        ] {
+            // SAFETY: rejected during validation; nothing is taken over.
+            let err = unsafe { Inner::import(&token) }.unwrap_err();
+            assert_eq!(err.kind(), kind, "{token}");
+        }
+        // Nothing was closed: the export's copies are all still open.
+        assert!(fds.iter().all(|&fd| unix_share::is_open(fd)));
+        drop(export);
+        assert_eq!(e.read().unwrap(), 1);
     }
 
     #[test]

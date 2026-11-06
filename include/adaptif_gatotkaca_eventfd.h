@@ -250,21 +250,39 @@ int gk_dup3(int oldfd, int newfd, int flags);
 uintptr_t gk_eventfd_socket(int fd);
 
 /*
- * Sharing with other processes (Windows has no fork). The parent exports
- * the eventfd as a text token; the other process imports it and shares the
- * counter (writes, blocking reads and readiness work across processes).
+ * Windows counterpart of gk_eventfd_send (Windows can't pass handles over a
+ * socket): duplicates fd's handles into the running process `pid` (needs
+ * PROCESS_DUP_HANDLE access) and writes a NUL-terminated token for it into
+ * buf. Send the token to that process (stdin, a pipe, a socket, ...) and
+ * call gk_eventfd_import there. Nothing becomes inheritable.
+ * Returns the token length, or -1 with errno.
+ */
+int gk_eventfd_export_to(int fd, unsigned long pid, char *buf, size_t len);
+#endif
+
+/*
+ * Sharing with other processes, following Linux:
+ *   - fork():  the eventfd is shared automatically (unix).
+ *   - spawn/exec a child: gk_eventfd_export_inheritable + gk_eventfd_import
+ *     (on Linux and other native platforms the token is "gkefd1:n:<fd>",
+ *     an inheritable copy of the kernel eventfd).
+ *   - unrelated process: gk_eventfd_send/gk_eventfd_recv over a unix socket
+ *     (SCM_RIGHTS), or gk_eventfd_export_to on Windows.
+ * Afterwards both processes share the counter: writes, blocking reads and
+ * readiness work across them.
  */
 
 /* Buffer size that always fits an export token, including the NUL. */
 #define GK_EVENTFD_TOKEN_MAX 4096
 
 /*
- * For a child spawned next: makes inheritable copies of fd's handles and
- * writes a NUL-terminated token into buf (len bytes, GK_EVENTFD_TOKEN_MAX is
- * enough). Pass the token to the child (e.g. in an environment variable)
- * and spawn it with handle inheritance (CreateProcess bInheritHandles=TRUE).
- * Then call gk_eventfd_export_release(token) to close this process's copies.
- * Any other child spawned in between inherits them too.
+ * For a child spawned next: makes inheritable copies of fd's descriptors
+ * (handles on Windows) and writes a NUL-terminated token naming them into
+ * buf (len bytes; GK_EVENTFD_TOKEN_MAX is enough). Pass the token to the
+ * child (e.g. in an environment variable) and spawn it (fork+exec,
+ * posix_spawn, CreateProcess with bInheritHandles=TRUE). Then call
+ * gk_eventfd_export_release(token) to close this process's copies. Any
+ * other child spawned in between inherits them too.
  * Returns the token length, or -1 with errno (EBADF, ERANGE, EFAULT).
  */
 int gk_eventfd_export_inheritable(int fd, char *buf, size_t len);
@@ -276,20 +294,27 @@ int gk_eventfd_export_inheritable(int fd, char *buf, size_t len);
 int gk_eventfd_export_release(const char *token);
 
 /*
- * For a running process: duplicates fd's handles into process `pid`
- * (needs PROCESS_DUP_HANDLE access) and writes a NUL-terminated token for it
- * into buf. Send the token to that process (stdin, a pipe, ...). Nothing
- * becomes inheritable. Returns the token length, or -1 with errno.
- */
-int gk_eventfd_export_to(int fd, unsigned long pid, char *buf, size_t len);
-
-/*
  * Opens an eventfd from a token made for this process by one of the export
  * functions. Returns a new descriptor (close it with gk_eventfd_close), or
- * -1 with errno = EINVAL for a bad token (every handle it names is left
+ * -1 with errno = EINVAL for a bad token (every descriptor it names is left
  * open). Import each token only once.
  */
 int gk_eventfd_import(const char *token);
+
+#ifndef _WIN32
+/*
+ * Sends eventfd fd over the connected unix socket `sock` (SCM_RIGHTS), the
+ * way Linux passes an eventfd to an unrelated process. The receiver calls
+ * gk_eventfd_recv. Returns 0, or -1 with errno.
+ */
+int gk_eventfd_send(int fd, int sock);
+
+/*
+ * Receives an eventfd sent with gk_eventfd_send on `sock`. Returns a new
+ * descriptor sharing the sender's counter, or -1 with errno (EINVAL if the
+ * message is not an eventfd).
+ */
+int gk_eventfd_recv(int sock);
 #endif
 
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)

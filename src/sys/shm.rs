@@ -2,8 +2,10 @@
 //!
 //! Each eventfd keeps its counter in a [`SharedPage`]:
 //!
-//! * unix: an anonymous `MAP_SHARED` mapping, which `fork(2)` keeps *shared*
-//!   between parent and child;
+//! * unix: a `MAP_SHARED` mapping of an unnamed shared memory object
+//!   (`memfd_create`, `SHM_ANON`, or `shm_open` + immediate `shm_unlink`).
+//!   `fork(2)` keeps the mapping shared, and the object's descriptor can be
+//!   inherited across `exec` or passed over a unix socket like any fd;
 //! * Windows: an unnamed file-mapping section, whose handle can be passed to
 //!   child processes (see `src/sys/windows.rs`).
 //!
@@ -84,6 +86,9 @@ pub(crate) struct SharedPage {
     /// The section, kept open so it can be passed to other processes.
     #[cfg(windows)]
     section: std::os::windows::io::OwnedHandle,
+    /// The shared memory object, kept open so it can be passed along.
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
 }
 
 // SAFETY: `State` only contains atomics, which may be accessed from any thread
@@ -333,29 +338,149 @@ impl SharedPage {
 
 #[cfg(unix)]
 mod os {
-    use super::{SharedPage, State};
+    use super::{MAGIC, SharedPage, State};
     use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::ptr::NonNull;
     use std::sync::Once;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    pub(super) fn create() -> io::Result<SharedPage> {
-        // SAFETY: a fresh anonymous mapping, no address hint, no fd.
+    fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
+        if r == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(r)
+        }
+    }
+
+    /// An unnamed, close-on-exec shared memory object.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn anon_shm() -> io::Result<OwnedFd> {
+        // SAFETY: a static C string name (debugging only) and flags.
+        let fd = cvt(unsafe { libc::memfd_create(c"gk-eventfd".as_ptr(), libc::MFD_CLOEXEC) })?;
+        // SAFETY: a fresh descriptor we own.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// An unnamed, close-on-exec shared memory object.
+    #[cfg(target_os = "freebsd")]
+    fn anon_shm() -> io::Result<OwnedFd> {
+        // SAFETY: SHM_ANON creates an object that never has a name.
+        let fd =
+            cvt(unsafe { libc::shm_open(libc::SHM_ANON, libc::O_RDWR | libc::O_CLOEXEC, 0o600) })?;
+        // SAFETY: a fresh descriptor we own.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// An unnamed, close-on-exec shared memory object: created under a
+    /// unique name and unlinked right away, so no name is left behind.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    fn anon_shm() -> io::Result<OwnedFd> {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        loop {
+            // macOS limits names to 31 bytes: "/gkefd.<pid>.<seq>.<nanos>".
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let name = format!(
+                "/gkefd.{:x}.{:x}.{:x}",
+                current_pid(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+                nanos & 0xff_ffff
+            );
+            let cname = std::ffi::CString::new(name).expect("no NUL in name");
+            // SAFETY: valid C string; O_EXCL never opens someone else's object.
+            let fd = unsafe {
+                libc::shm_open(
+                    cname.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd == -1 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(err);
+            }
+            // SAFETY: a fresh descriptor we own.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            // SAFETY: removes the name we just created; the object lives on
+            // while it is open or mapped.
+            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            // SAFETY: plain fcntl on our descriptor.
+            cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+            return Ok(fd);
+        }
+    }
+
+    /// Maps `fd` (at least one `State` large) shared and writable.
+    fn map(fd: RawFd) -> io::Result<NonNull<State>> {
+        // SAFETY: a fresh shared mapping of `fd`, no address hint.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 size_of::<State>(),
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
+                libc::MAP_SHARED,
+                fd,
                 0,
             )
         };
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let ptr = NonNull::new(ptr.cast::<State>()).expect("mmap returned null");
-        Ok(SharedPage { ptr })
+        Ok(NonNull::new(ptr.cast::<State>()).expect("mmap returned null"))
+    }
+
+    pub(super) fn create() -> io::Result<SharedPage> {
+        let fd = anon_shm()?;
+        // SAFETY: sizes our fresh object.
+        cvt(unsafe { libc::ftruncate(fd.as_raw_fd(), size_of::<State>() as libc::off_t) })?;
+        let ptr = map(fd.as_raw_fd())?;
+        Ok(SharedPage { ptr, fd })
+    }
+
+    /// Takes over a shared memory object received from another process, if
+    /// it holds an eventfd page. On failure the descriptor is left open.
+    ///
+    /// # Safety
+    /// If it validates, `raw` must be a descriptor this process may own.
+    pub(super) unsafe fn adopt(raw: RawFd) -> io::Result<SharedPage> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not an adaptif-gatotkaca-eventfd shared memory object",
+            )
+        };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes a stat through a valid pointer; bad values fail.
+        if unsafe { libc::fstat(raw, st.as_mut_ptr()) } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared memory descriptor is not open",
+            ));
+        }
+        // SAFETY: fstat succeeded.
+        let st = unsafe { st.assume_init() };
+        // No file-type check: macOS reports POSIX shared memory objects
+        // without S_IFREG. The size and magic checks identify our pages.
+        #[allow(clippy::unnecessary_cast)]
+        if (st.st_size as u64) < size_of::<State>() as u64 {
+            return Err(invalid());
+        }
+        let ptr = map(raw)?;
+        // SAFETY: `ptr` is a live view of at least size_of::<State>() bytes.
+        if unsafe { ptr.as_ref() }.magic.load(Ordering::Acquire) != MAGIC {
+            // SAFETY: unmaps the view we just created.
+            unsafe { unmap(ptr) };
+            return Err(invalid());
+        }
+        // SAFETY: validated; the caller guarantees we may own it.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(SharedPage { ptr, fd })
     }
 
     /// # Safety
@@ -551,6 +676,34 @@ mod os {
         // SAFETY: as above.
         unsafe { CloseHandle(h) };
         !exited
+    }
+}
+
+#[cfg(unix)]
+impl SharedPage {
+    /// Takes over a shared memory descriptor received from another process,
+    /// if it holds an eventfd page (left open otherwise).
+    ///
+    /// # Safety
+    /// If it validates, `raw` must be a descriptor this process may own.
+    pub(crate) unsafe fn adopt(raw: std::os::fd::RawFd) -> io::Result<Self> {
+        // SAFETY: forwarded to the caller.
+        unsafe { os::adopt(raw) }
+    }
+
+    /// Like [`adopt`](Self::adopt) for a descriptor we already own (closed
+    /// if it does not validate).
+    pub(crate) fn from_owned(fd: std::os::fd::OwnedFd) -> io::Result<Self> {
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        // SAFETY: we own `fd`; on success ownership moves into the page.
+        let page = unsafe { os::adopt(raw) }?;
+        std::mem::forget(fd);
+        Ok(page)
+    }
+
+    /// The shared memory object, to inherit or pass to other processes.
+    pub(crate) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
     }
 }
 

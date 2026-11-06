@@ -215,11 +215,10 @@ pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
 }
 
 /// `int gk_eventfd_export_inheritable(int fd, char *buf, size_t len);`
-/// (Windows only; see `compat::eventfd_export_inheritable`).
+/// (see `compat::eventfd_export_inheritable`).
 ///
 /// # Safety
 /// `buf` must be valid for writing `len` bytes.
-#[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_eventfd_export_inheritable(
     fd: c_int,
@@ -232,11 +231,10 @@ pub unsafe extern "C" fn gk_eventfd_export_inheritable(
     })
 }
 
-/// `int gk_eventfd_export_release(const char *token);` (Windows only).
+/// `int gk_eventfd_export_release(const char *token);`
 ///
 /// # Safety
 /// `token` must be a valid NUL-terminated string.
-#[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_eventfd_export_release(token: *const core::ffi::c_char) -> c_int {
     // SAFETY: forwarded to the caller.
@@ -262,15 +260,29 @@ pub unsafe extern "C" fn gk_eventfd_export_to(
     })
 }
 
-/// `int gk_eventfd_import(const char *token);` (Windows only).
+/// `int gk_eventfd_import(const char *token);`
 ///
 /// # Safety
 /// See `compat::eventfd_import`.
-#[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_eventfd_import(token: *const core::ffi::c_char) -> c_int {
     // SAFETY: forwarded to the caller.
     guard(-1, || unsafe { compat::eventfd_import(token) })
+}
+
+/// `int gk_eventfd_send(int fd, int sock);` (unix only; see
+/// `compat::eventfd_send`).
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_eventfd_send(fd: c_int, sock: c_int) -> c_int {
+    guard(-1, || compat::eventfd_send(fd, sock))
+}
+
+/// `int gk_eventfd_recv(int sock);` (unix only; see `compat::eventfd_recv`).
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_eventfd_recv(sock: c_int) -> c_int {
+    guard(-1, || compat::eventfd_recv(sock))
 }
 
 #[cfg(windows)]

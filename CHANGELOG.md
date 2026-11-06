@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- One way to share an eventfd with other processes on every OS, modelled on
+  Linux: `GkEventFd::export_inheritable` + `GkEventFd::import` for spawned
+  children (all OS; on native platforms the token is the inherited eventfd's
+  number), and `GkEventFd::send_to` / `GkEventFd::recv_from` over a
+  `UnixStream` for unrelated processes on unix (`SCM_RIGHTS`); Windows keeps
+  `export_to(pid)`. C-style `compat::eventfd_export_inheritable`,
+  `eventfd_export_release`, `eventfd_import` (all OS), `eventfd_send`,
+  `eventfd_recv` (unix) and the matching `gk_eventfd_*` exports.
+
+### Changed
+
+- Unix shims (macOS, iOS, OpenBSD, DragonFly): the counter page is an
+  unnamed shared memory object (`memfd_create`, `SHM_ANON`, or `shm_open` +
+  immediate `shm_unlink`) instead of an anonymous mapping, so it can be
+  inherited across `exec` and passed over unix sockets. Each eventfd uses one
+  more descriptor.
+
 ### Fixed
 
 - Windows: `gk_read`, `gk_write`, `gk_close`, `gk_dup` and `gk_dup2` no longer

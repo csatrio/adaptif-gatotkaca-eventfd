@@ -169,12 +169,75 @@ pub unsafe fn eventfd_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
     unsafe { imp::eventfd_dup3(oldfd, newfd, flags) }
 }
 
-/// Windows: makes `fd` shareable with a child process spawned afterwards,
-/// writing a NUL-terminated token into `buf` (`len` bytes, at least
-/// `TOKEN_MAX`). Give the token to the child (e.g. in an environment
-/// variable) and call [`eventfd_import`] there. This process's inheritable
-/// copies stay open until [`eventfd_export_release`]; release them once the
-/// child is spawned. Any other child spawned meanwhile inherits them too.
+// ---------------------------------------------------------------------------
+// Sharing with other processes (see GkEventFd::export_inheritable, send_to,
+// export_to, import), with C conventions.
+// ---------------------------------------------------------------------------
+
+/// Buffer size that always fits a token from the export functions,
+/// including the NUL.
+pub const TOKEN_MAX: usize = 4096;
+
+/// Inheritable exports kept alive until `eventfd_export_release` (C callers
+/// have no destructor to end them).
+fn exports()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, crate::InheritableExport>> {
+    static EXPORTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, crate::InheritableExport>>,
+    > = std::sync::OnceLock::new();
+    EXPORTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `-1` with `errno` from `e`; bad tokens or descriptors of the wrong kind
+/// become `EINVAL`.
+fn fail_share(e: &std::io::Error) -> c_int {
+    use std::io::ErrorKind::{InvalidData, InvalidInput};
+    set_errno(match e.kind() {
+        InvalidInput | InvalidData => crate::error::errno::EINVAL,
+        _ => crate::error::to_errno(e),
+    });
+    -1
+}
+
+/// Copies `token` and a NUL into `buf` (`ERANGE` if it doesn't fit).
+/// Returns the token length.
+unsafe fn copy_token(token: &str, buf: *mut core::ffi::c_char, len: usize) -> c_int {
+    use crate::error::errno::ERANGE;
+    if buf.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    if token.len() >= len {
+        set_errno(ERANGE);
+        return -1;
+    }
+    // SAFETY: the caller guarantees `buf` is writable for `len` bytes, and
+    // `token.len() + 1 <= len`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(token.as_ptr(), buf.cast::<u8>(), token.len());
+        *buf.add(token.len()) = 0;
+    }
+    token.len() as c_int
+}
+
+#[cfg(unix)]
+const EFAULT: c_int = libc::EFAULT;
+#[cfg(windows)]
+const EFAULT: c_int = 14;
+
+/// Makes `fd` shareable with a child process spawned afterwards (the
+/// cross-platform form of inheriting an eventfd across `exec` on Linux),
+/// writing a NUL-terminated token into `buf` (`len` bytes; [`TOKEN_MAX`] is
+/// enough). Give the token to the child, e.g. in an environment variable,
+/// and call [`eventfd_import`] there. On native platforms the token is
+/// `gkefd1:n:<fd>` and `<fd>` is an inheritable copy of the kernel eventfd.
+///
+/// This process's inheritable copies stay open until
+/// [`eventfd_export_release`]; release them once the child is spawned. Any
+/// other child spawned meanwhile inherits them too.
 ///
 /// Returns the token length, or `-1` with `errno` (`EBADF`, `ERANGE` if
 /// `buf` is too small, `EFAULT`).
@@ -182,32 +245,102 @@ pub unsafe fn eventfd_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int {
 /// # Safety
 ///
 /// `buf` must be valid for writing `len` bytes.
-#[cfg(windows)]
 pub unsafe fn eventfd_export_inheritable(
     fd: c_int,
     buf: *mut core::ffi::c_char,
     len: usize,
 ) -> c_int {
-    // SAFETY: forwarded to the caller.
-    unsafe { imp::eventfd_export_inheritable(fd, buf, len) }
+    match imp::export_inheritable(fd) {
+        Ok(export) => {
+            // SAFETY: forwarded to the caller.
+            let n = unsafe { copy_token(export.token(), buf, len) };
+            if n >= 0 {
+                exports().insert(export.token().to_owned(), export);
+            }
+            n
+        }
+        Err(e) => fail_share(&e),
+    }
 }
 
-/// Windows: closes this process's inheritable copies made by
-/// [`eventfd_export_inheritable`] for `token`. Returns `0`, or `-1` with
-/// `errno = EINVAL` for an unknown token.
+/// Closes this process's copies made by [`eventfd_export_inheritable`] for
+/// `token`. Returns `0`, or `-1` with `errno = EINVAL` for an unknown token.
 ///
 /// # Safety
 ///
 /// `token` must be a valid NUL-terminated string.
-#[cfg(windows)]
 pub unsafe fn eventfd_export_release(token: *const core::ffi::c_char) -> c_int {
+    if token.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string.
+    let token = unsafe { core::ffi::CStr::from_ptr(token) }.to_string_lossy();
+    let removed = exports().remove(token.as_ref());
+    match removed {
+        Some(_) => 0, // dropped here: closes this process's copies
+        None => {
+            set_errno(crate::error::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+/// Opens an eventfd from a token made for this process by
+/// [`eventfd_export_inheritable`] (in another process) or, on Windows,
+/// `eventfd_export_to`. Returns a new descriptor sharing that eventfd's
+/// counter, or `-1` with `errno` (`EINVAL` for a bad token, which leaves
+/// every descriptor it names open).
+///
+/// # Safety
+///
+/// `token` must be a NUL-terminated string made for this process and
+/// imported only once (see [`GkEventFd::import`](crate::GkEventFd::import)).
+pub unsafe fn eventfd_import(token: *const core::ffi::c_char) -> c_int {
+    if token.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string.
+    let Ok(token) = unsafe { core::ffi::CStr::from_ptr(token) }.to_str() else {
+        set_errno(crate::error::errno::EINVAL);
+        return -1;
+    };
     // SAFETY: forwarded to the caller.
-    unsafe { imp::eventfd_export_release(token) }
+    match unsafe { imp::import(token) } {
+        Ok(fd) => fd,
+        Err(e) => fail_share(&e),
+    }
+}
+
+/// Unix: sends eventfd `fd` over the connected unix socket `sock`, like
+/// passing an eventfd with `SCM_RIGHTS` on Linux (see
+/// [`GkEventFd::send_to`](crate::GkEventFd::send_to)). The other process
+/// calls [`eventfd_recv`]. Returns `0`, or `-1` with `errno`.
+#[cfg(unix)]
+pub fn eventfd_send(fd: c_int, sock: c_int) -> c_int {
+    match imp::send(fd, sock) {
+        Ok(()) => 0,
+        Err(e) => fail_share(&e),
+    }
+}
+
+/// Unix: receives an eventfd sent with [`eventfd_send`] on `sock`. Returns
+/// a new descriptor sharing the sender's counter, or `-1` with `errno`
+/// (`EINVAL` if the message is not an eventfd).
+#[cfg(unix)]
+pub fn eventfd_recv(sock: c_int) -> c_int {
+    match imp::recv(sock) {
+        Ok(fd) => fd,
+        Err(e) => fail_share(&e),
+    }
 }
 
 /// Windows: duplicates `fd` into the running process `pid`, writing a
-/// NUL-terminated token for it into `buf`. Send it to that process and call
-/// [`eventfd_import`] there. Returns the token length, or `-1` with `errno`.
+/// NUL-terminated token for it into `buf`: the Windows counterpart of
+/// `eventfd_send` (Windows can't pass handles over a socket). Send the
+/// token to that process and call [`eventfd_import`] there. Returns the
+/// token length, or `-1` with `errno`.
 ///
 /// # Safety
 ///
@@ -219,29 +352,12 @@ pub unsafe fn eventfd_export_to(
     buf: *mut core::ffi::c_char,
     len: usize,
 ) -> c_int {
-    // SAFETY: forwarded to the caller.
-    unsafe { imp::eventfd_export_to(fd, pid, buf, len) }
+    match imp::export_to(fd, pid) {
+        // SAFETY: forwarded to the caller.
+        Ok(token) => unsafe { copy_token(&token, buf, len) },
+        Err(e) => fail_share(&e),
+    }
 }
-
-/// Windows: opens an eventfd from a token made by
-/// [`eventfd_export_inheritable`] or [`eventfd_export_to`] in another
-/// process. Returns a new descriptor sharing that eventfd's counter, or `-1`
-/// with `errno` (`EINVAL` for a bad token, which leaves every handle it
-/// names open).
-///
-/// # Safety
-///
-/// `token` must be a NUL-terminated string made for this process and
-/// imported only once (see [`GkEventFd::import`](crate::GkEventFd::import)).
-#[cfg(windows)]
-pub unsafe fn eventfd_import(token: *const core::ffi::c_char) -> c_int {
-    // SAFETY: forwarded to the caller.
-    unsafe { imp::eventfd_import(token) }
-}
-
-/// Windows: buffer size that always fits a token from the export functions.
-#[cfg(windows)]
-pub const TOKEN_MAX: usize = 4096;
 
 /// Returns the `SOCKET` of an eventfd, for `WSAPoll`/`select`/IOCP readiness.
 /// It is readable exactly while the counter is non-zero.
@@ -431,6 +547,48 @@ mod imp {
     pub(super) unsafe fn eventfd_write_buf(fd: c_int, buf: *const c_void, count: usize) -> isize {
         // SAFETY: the caller guarantees `buf` is readable for `count` bytes.
         unsafe { libc::write(fd, buf, count) }
+    }
+    /// A `GkEventFd` view of the raw eventfd `fd`, never closed.
+    fn view(fd: c_int) -> std::io::Result<std::mem::ManuallyDrop<crate::GkEventFd>> {
+        if !crate::sys::is_open(fd) {
+            return Err(crate::error::bad_descriptor());
+        }
+        // SAFETY: `fd` is open; ManuallyDrop means we never close it.
+        Ok(std::mem::ManuallyDrop::new(unsafe {
+            <crate::GkEventFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        }))
+    }
+
+    pub(super) fn export_inheritable(fd: c_int) -> std::io::Result<crate::InheritableExport> {
+        view(fd)?.export_inheritable()
+    }
+
+    pub(super) unsafe fn import(token: &str) -> std::io::Result<c_int> {
+        // SAFETY: forwarded to the caller.
+        let efd = unsafe { crate::GkEventFd::import(token) }?;
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(efd))
+    }
+
+    pub(super) fn send(fd: c_int, sock: c_int) -> std::io::Result<()> {
+        let efd = view(fd)?;
+        if !crate::sys::is_open(sock) {
+            return Err(crate::error::bad_descriptor());
+        }
+        // SAFETY: `sock` is open; only borrowed for this call.
+        efd.inner
+            .send_to(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })
+    }
+
+    pub(super) fn recv(sock: c_int) -> std::io::Result<c_int> {
+        if !crate::sys::is_open(sock) {
+            return Err(crate::error::bad_descriptor());
+        }
+        // SAFETY: `sock` is open; only borrowed for this call.
+        let inner =
+            crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(crate::GkEventFd {
+            inner,
+        }))
     }
 }
 
@@ -685,9 +843,6 @@ mod imp {
         map: IntMap<c_int, Handle>,
         /// Next synthetic descriptor to try.
         next: c_int,
-        /// Inheritable exports kept alive until `eventfd_export_release`
-        /// (C callers have no destructor to end them).
-        exports: std::collections::HashMap<String, crate::InheritableExport>,
     }
 
     /// First synthetic descriptor on Windows. The CRT allows at most 8192
@@ -702,7 +857,6 @@ mod imp {
             Self {
                 map: IntMap::default(),
                 next: FIRST_SYNTHETIC_FD,
-                exports: std::collections::HashMap::new(),
             }
         }
 
@@ -791,101 +945,73 @@ mod imp {
         }
     }
 
-    /// Copies `token` and a NUL into `buf` (`ERANGE` if it doesn't fit).
-    /// Returns the token length.
     #[cfg(windows)]
-    unsafe fn copy_token(token: &str, buf: *mut core::ffi::c_char, len: usize) -> c_int {
-        if buf.is_null() {
-            return fail_errno(EFAULT);
-        }
-        if token.len() >= len {
-            return fail_errno(errno::ERANGE);
-        }
-        // SAFETY: the caller guarantees `buf` is writable for `len` bytes,
-        // and `token.len() + 1 <= len`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(token.as_ptr(), buf.cast::<u8>(), token.len());
-            *buf.add(token.len()) = 0;
-        }
-        token.len() as c_int
-    }
-
-    /// Maps import/export errors to errno (`EINVAL` for bad tokens).
-    #[cfg(windows)]
-    fn fail_share(e: &io::Error) -> c_int {
-        match e.kind() {
-            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => fail_errno(errno::EINVAL),
-            _ => fail(e),
-        }
+    pub(super) fn export_inheritable(fd: c_int) -> io::Result<crate::InheritableExport> {
+        lookup(fd)
+            .ok_or_else(crate::error::bad_descriptor)?
+            .export_inheritable()
     }
 
     #[cfg(windows)]
-    pub(super) unsafe fn eventfd_export_to(
-        fd: c_int,
-        pid: u32,
-        buf: *mut core::ffi::c_char,
-        len: usize,
-    ) -> c_int {
-        let Some(efd) = lookup(fd) else {
-            return fail_errno(errno::EBADF);
-        };
-        match efd.export_to(pid) {
-            // SAFETY: forwarded to the caller.
-            Ok(token) => unsafe { copy_token(&token, buf, len) },
-            Err(e) => fail_share(&e),
-        }
+    pub(super) fn export_to(fd: c_int, pid: u32) -> io::Result<String> {
+        lookup(fd)
+            .ok_or_else(crate::error::bad_descriptor)?
+            .export_to(pid)
     }
 
     #[cfg(windows)]
-    pub(super) unsafe fn eventfd_export_inheritable(
-        fd: c_int,
-        buf: *mut core::ffi::c_char,
-        len: usize,
-    ) -> c_int {
-        let Some(efd) = lookup(fd) else {
-            return fail_errno(errno::EBADF);
-        };
-        let export = match efd.export_inheritable() {
-            Ok(export) => export,
-            Err(e) => return fail_share(&e),
-        };
+    pub(super) unsafe fn import(token: &str) -> io::Result<c_int> {
         // SAFETY: forwarded to the caller.
-        let n = unsafe { copy_token(export.token(), buf, len) };
-        if n >= 0 {
-            let token = export.token().to_owned();
-            write_lock().exports.insert(token, export);
-        }
-        n
-    }
-
-    #[cfg(windows)]
-    pub(super) unsafe fn eventfd_export_release(token: *const core::ffi::c_char) -> c_int {
-        if token.is_null() {
-            return fail_errno(EFAULT);
-        }
-        // SAFETY: the caller guarantees a NUL-terminated string.
-        let token = unsafe { core::ffi::CStr::from_ptr(token) }.to_string_lossy();
-        let removed = write_lock().exports.remove(token.as_ref());
-        match removed {
-            Some(_) => 0, // dropped here: closes this process's copies
-            None => fail_errno(errno::EINVAL),
+        let efd = unsafe { GkEventFd::import(token) }?;
+        match write_lock().insert_new(std::sync::Arc::new(efd)) {
+            -1 => Err(io::Error::other("too many eventfds")),
+            fd => Ok(fd),
         }
     }
 
-    #[cfg(windows)]
-    pub(super) unsafe fn eventfd_import(token: *const core::ffi::c_char) -> c_int {
-        if token.is_null() {
-            return fail_errno(EFAULT);
+    #[cfg(unix)]
+    pub(super) fn export_inheritable(fd: c_int) -> io::Result<crate::InheritableExport> {
+        let core = lookup(fd).ok_or_else(crate::error::bad_descriptor)?;
+        Ok(crate::InheritableExport(core.export_inheritable()?))
+    }
+
+    /// Registers a `GkEventFd` received from another process.
+    #[cfg(unix)]
+    fn register(efd: GkEventFd) -> io::Result<c_int> {
+        let (core, fd) = efd.into_core();
+        let id = core
+            .pipe_id()
+            .ok_or_else(|| io::Error::from_raw_os_error(errno::EIO))?;
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+        write_lock().insert(fd, core, id);
+        Ok(fd)
+    }
+
+    #[cfg(unix)]
+    pub(super) unsafe fn import(token: &str) -> io::Result<c_int> {
+        // SAFETY: forwarded to the caller.
+        register(unsafe { GkEventFd::import(token) }?)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn send(fd: c_int, sock: c_int) -> io::Result<()> {
+        let core = lookup(fd).ok_or_else(crate::error::bad_descriptor)?;
+        if !crate::sys::is_open(sock) {
+            return Err(crate::error::bad_descriptor());
         }
-        // SAFETY: the caller guarantees a NUL-terminated string.
-        let Ok(token) = unsafe { core::ffi::CStr::from_ptr(token) }.to_str() else {
-            return fail_errno(errno::EINVAL);
-        };
-        // SAFETY: forwarded to the caller (see compat::eventfd_import).
-        match unsafe { GkEventFd::import(token) } {
-            Ok(efd) => write_lock().insert_new(std::sync::Arc::new(efd)),
-            Err(e) => fail_share(&e),
+        // SAFETY: `sock` is open; only borrowed for this call.
+        core.send_to(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })
+    }
+
+    #[cfg(unix)]
+    pub(super) fn recv(sock: c_int) -> io::Result<c_int> {
+        if !crate::sys::is_open(sock) {
+            return Err(crate::error::bad_descriptor());
         }
+        // SAFETY: `sock` is open; only borrowed for this call.
+        let inner =
+            crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
+        register(GkEventFd { inner })
     }
 
     // -- common ---------------------------------------------------------------
@@ -1436,6 +1562,43 @@ pub(crate) mod tests {
             assert_eq!(errno(), EINVAL);
             assert_eq!(eventfd_export_to(-1, 0, buf.as_mut_ptr(), buf.len()), -1);
             assert_eq!(errno(), EBADF);
+        }
+        assert_eq!(eventfd_close(fd), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_send_recv_and_exports_c_style() {
+        use std::os::fd::AsRawFd;
+        let _g = lock();
+        let fd = eventfd(0, EFD_NONBLOCK);
+        assert!(fd >= 0);
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(eventfd_send(fd, tx.as_raw_fd()), 0, "errno {}", errno());
+        let got = eventfd_recv(rx.as_raw_fd());
+        assert!(got >= 0 && got != fd, "errno {}", errno());
+        assert_eq!(write(fd, 3), Ok(()));
+        assert_eq!(read(got), Ok(3));
+        assert_eq!(eventfd_close(got), 0);
+
+        assert_eq!(eventfd_send(-1, tx.as_raw_fd()), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(eventfd_send(fd, -1), -1);
+        assert_eq!(errno(), EBADF);
+
+        let mut buf = vec![0 as core::ffi::c_char; TOKEN_MAX];
+        // SAFETY: `buf` is valid for its length; tokens are NUL-terminated.
+        unsafe {
+            let n = eventfd_export_inheritable(fd, buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "errno {}", errno());
+            let mut small = [0 as core::ffi::c_char; 4];
+            assert_eq!(eventfd_export_inheritable(fd, small.as_mut_ptr(), 4), -1);
+            assert_eq!(errno(), crate::error::errno::ERANGE);
+            assert_eq!(eventfd_export_release(buf.as_ptr()), 0);
+            assert_eq!(eventfd_export_release(buf.as_ptr()), -1);
+            assert_eq!(errno(), EINVAL);
+            assert_eq!(eventfd_import(c"gkefd1:x".as_ptr()), -1);
+            assert_eq!(errno(), EINVAL);
         }
         assert_eq!(eventfd_close(fd), 0);
     }

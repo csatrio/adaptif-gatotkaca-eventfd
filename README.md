@@ -20,7 +20,7 @@ C code written for Linux eventfd can be ported with almost no changes.
 | Platform | Backend | Pollable object | Raw-fd conversions |
 |---|---|---|---|
 | Linux, Android, FreeBSD 13+, NetBSD 10+, illumos | the kernel `eventfd(2)` (no shim) | the eventfd itself (`AsFd`, `AsRawFd`) | `From<OwnedFd>`, `Into<OwnedFd>`, `IntoRawFd`, `FromRawFd` |
-| macOS, iOS, OpenBSD, DragonFly | counter in fork-shared memory (cross-process spinlock) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
+| macOS, iOS, OpenBSD, DragonFly | counter in shared memory (cross-process spinlock) + non-blocking pipe | read end of the pipe (`AsFd`, `AsRawFd`) | — |
 | Windows | counter in a shareable memory section (cross-process spinlock) + loopback TCP socket pair | read socket (`AsSocket`, `AsRawSocket`) | — |
 
 On the shim backends the pipe or socket holds exactly one byte iff the counter
@@ -145,58 +145,95 @@ async fn main() -> std::io::Result<()> {
 On Windows, use the `mio` feature with your own mio-based reactor, or poll the
 socket returned by `AsSocket`.
 
-## Sharing with child processes on Windows
+## Sharing with other processes
 
-Windows has no `fork()`, so an eventfd is handed to another process
-explicitly, as a short text token. The other process imports it and then
-shares the counter: writes, blocking reads and readiness all work across the
-two processes, as with an inherited eventfd on Linux.
+An eventfd can be shared with other processes on every OS, following the
+three ways Linux shares one. Afterwards the processes share one counter:
+writes, blocking reads and readiness (`poll`/`kqueue`/`WSAPoll`/mio) work
+across them, which makes it a cross-process doorbell, for example next to a
+shared memory area.
 
-At spawn, through an environment variable:
+| Linux way | This crate | Linux & other native | macOS & other unix shims | Windows |
+|---|---|---|---|---|
+| `fork()` | nothing to do | kernel | shared memory page | no `fork` |
+| fd inherited by a spawned / `exec`'d child | `export_inheritable()` + `GkEventFd::import(token)` | the eventfd itself | shared memory + pipe fds | section + sockets |
+| fd passed to an unrelated process (`SCM_RIGHTS`) | `send_to(&UnixStream)` + `GkEventFd::recv_from(&UnixStream)` | the eventfd itself | shared memory + pipe fds | `export_to(pid)` + `import(token)` |
+
+Memory ordering: writes a process makes before `efd.write()` are visible to
+the process whose `efd.read()` observes that write (a syscall on Linux, the
+shim's cross-process lock elsewhere), so the eventfd can guard data in
+shared memory.
+
+### Spawned children
 
 ```rust,no_run
-# #[cfg(windows)] fn main() -> std::io::Result<()> {
 use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd};
 use std::process::Command;
 
-let efd = GkEventFd::new(0, EfdFlags::NONE)?;
-let export = efd.export_inheritable()?;
-let mut child = Command::new("child.exe")
-    .env("GK_EVENTFD", export.token())
-    .spawn()?;
-drop(export); // closes this process's inheritable copies
-let value = efd.read()?; // woken by a write in the child
-child.wait()?;
-# Ok(()) }
-# #[cfg(not(windows))] fn main() {}
+fn main() -> std::io::Result<()> {
+    let efd = GkEventFd::new(0, EfdFlags::NONE)?;
+    let export = efd.export_inheritable()?;
+    let mut child = Command::new("./worker")
+        .env("GK_EVENTFD", export.token())
+        .spawn()?;
+    drop(export); // closes this process's inheritable copies
+    let value = efd.read()?; // woken by a write in the child
+    child.wait()?;
+    Ok(())
+}
 ```
 
 ```rust,no_run
-# #[cfg(windows)] fn main() -> std::io::Result<()> {
 // In the child:
 use adaptif_gatotkaca_eventfd::GkEventFd;
-let token = std::env::var("GK_EVENTFD").expect("no token");
-// SAFETY: the token was made for this process and is imported once.
-let efd = unsafe { GkEventFd::import(&token) }?;
-efd.write(1)?;
-# Ok(()) }
-# #[cfg(not(windows))] fn main() {}
+
+fn main() -> std::io::Result<()> {
+    let token = std::env::var("GK_EVENTFD").expect("no token");
+    // SAFETY: the token was made for this process and is imported once.
+    let efd = unsafe { GkEventFd::import(&token) }?;
+    efd.write(1)?;
+    Ok(())
+}
 ```
 
-To a process that is already running: `efd.export_to(pid)` duplicates the
-handles straight into that process and returns its token; send it over
-stdin, a pipe or any other channel and `import` it there. Nothing becomes
-inheritable that way. While an `export_inheritable` value is alive, *every*
-child spawned by the parent inherits the handles (that is how Windows handle
-inheritance works), so prefer `export_to` when other children are being
-spawned at the same time.
+On Linux and the other native platforms the token is `gkefd1:n:<fd>`: the
+child inherits a plain eventfd and could also use that number directly. While
+an export is alive, every child the parent spawns inherits the copies (that
+is how inheritance works on every OS); drop it right after spawning.
 
-`import` is `unsafe` like `FromRawHandle`: it takes ownership of the handles
+### Unrelated processes
+
+On unix, pass the eventfd over a connected unix socket:
+
+```rust,no_run
+# #[cfg(unix)] fn main() -> std::io::Result<()> {
+use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+
+// Process A
+let efd = GkEventFd::new(0, EfdFlags::NONBLOCK)?;
+let (stream, _) = UnixListener::bind("/tmp/doorbell.sock")?.accept()?;
+efd.send_to(&stream)?;
+
+// Process B
+let stream = UnixStream::connect("/tmp/doorbell.sock")?;
+let efd = GkEventFd::recv_from(&stream)?;
+# Ok(()) }
+# #[cfg(not(unix))] fn main() {}
+```
+
+Windows can't pass handles over a socket, so the sender duplicates the
+eventfd into the receiving process instead: `let token = efd.export_to(pid)?`,
+send the text token over any channel (stdin, a pipe, a socket), and call
+`unsafe { GkEventFd::import(&token) }` in that process.
+
+`import` is `unsafe` like `FromRawFd`: it takes ownership of the descriptors
 the token names, so import each token once, in the process it was made for.
-A malformed token, or one whose handles are not an eventfd's, is rejected
+A malformed token, or one whose descriptors are not an eventfd's, is rejected
 without closing anything. In C: `gk_eventfd_export_inheritable`,
-`gk_eventfd_export_release`, `gk_eventfd_export_to` and `gk_eventfd_import`
-(see the header).
+`gk_eventfd_export_release`, `gk_eventfd_import`, `gk_eventfd_send`,
+`gk_eventfd_recv` (unix) and `gk_eventfd_export_to` (Windows); see the
+header.
 
 ## C usage
 
@@ -345,12 +382,12 @@ DragonFly, Windows, and any platform built with `force-shim`):
   layer. Close it with `eventfd_close` (or `gk_close`), not a raw
   `close`/`closesocket`. (On unix the registry notices a number that was
   closed behind its back and reused, and forgets it without closing anything.)
-- **`fork()` yes, `exec()` no (unix shims).** The counter lives in an
-  anonymous shared memory page, so parent and child keep sharing it after
-  `fork()`, including blocking reads woken from the other process. It is not
-  carried across `exec()` or to unrelated processes. Windows has no `fork()`:
-  share explicitly with child processes, see "Sharing with child processes on
-  Windows".
+- **Sharing is explicit after `exec()`.** `fork()` shares the counter
+  automatically. A spawned or `exec`'d child, or an unrelated process, gets
+  it through `export_inheritable`/`import`, `send_to`/`recv_from` or (Windows)
+  `export_to`/`import`, see "Sharing with other processes". Plain fd
+  inheritance without a token works only on the native platforms, where the
+  descriptor is the kernel eventfd.
 - **Not async-signal-safe.** Operations take a short cross-process lock, so
   calling into an eventfd from a signal handler that interrupted an
   operation on the same eventfd deadlocks. (A process that dies holding the

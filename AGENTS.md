@@ -32,10 +32,12 @@ visible to your crate.
 3. **Share with `Arc<GkEventFd>` or `try_clone()`.** In C-style code duplicate
    with `eventfd_dup`/`eventfd_dup2`/`eventfd_dup3` (`gk_dup*`). See section 5
    for raw `dup()` on shims.
-4. **`fork()` shares the counter on every unix platform** (on the shim too).
-   `exec()` and unrelated processes do not get it on the shim. Windows has no
-   `fork`: share with a child via `export_inheritable`/`export_to` +
-   `GkEventFd::import` (section 6).
+4. **Share with other processes the Linux way** (section 6): `fork()` shares
+   it automatically on unix; spawned children get it via
+   `export_inheritable()` + `GkEventFd::import(token)`; unrelated processes
+   via `send_to`/`recv_from` over a `UnixStream` (unix) or `export_to(pid)` +
+   `import` (Windows). On shims, plain fd inheritance without a token does
+   not carry the counter.
 5. **Close by dropping** the `GkEventFd` (or `eventfd_close`/`gk_eventfd_close`
    in the C-style APIs). Never `close(2)` a shim fd yourself.
 6. Write-readiness (`POLLOUT`) is not reported on shims. Register for
@@ -194,24 +196,55 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 
 `examples/c/smoke.c` is a working example of all of the above.
 
-## 6. Per-platform checklists
+## 6. Sharing with other processes (all OS, modelled on Linux)
+
+| Linux way | Call | Notes |
+|---|---|---|
+| `fork()` | nothing | unix only; Windows has no `fork` |
+| child inherits the fd across `exec` / spawn | parent: `let export = efd.export_inheritable()?;` pass `export.token()` (env var), spawn, `drop(export)`. Child: `unsafe { GkEventFd::import(&token) }` | every child spawned while `export` lives inherits the copies |
+| fd passed to an unrelated process (`SCM_RIGHTS`) | unix: `efd.send_to(&stream)` / `GkEventFd::recv_from(&stream)` on a connected `UnixStream` | don't interleave other writes on that stream with it |
+| (Windows equivalent of the above) | `let token = efd.export_to(pid)?;` send the text, `unsafe { GkEventFd::import(&token) }` there | needs `PROCESS_DUP_HANDLE` on the target |
+
+- After sharing, both processes use one counter: writes, blocking reads,
+  readiness and `set_nonblocking` work across them. Data written before
+  `efd.write()` is visible to the process whose `efd.read()` sees that write,
+  so the eventfd can be a doorbell for shared memory.
+- On native platforms the token is `gkefd1:n:<fd>`: an inheritable copy of
+  the kernel eventfd, usable directly by a child that doesn't use this crate.
+  On shims the token names several descriptors and only `import` can use it.
+- `import` is `unsafe`: it takes ownership of what the token names. One import
+  per token, in the process it was made for. Bad tokens fail
+  (`InvalidInput`/`InvalidData`) without closing anything. Imported and
+  received descriptors are close-on-exec again.
+- `recv_from` rejects (and closes) a message from a different backend kind,
+  e.g. a native Linux sender with a `force-shim` receiver.
+- C: `gk_eventfd_export_inheritable` (then `gk_eventfd_export_release` after
+  spawning), `gk_eventfd_import`, `gk_eventfd_send`/`gk_eventfd_recv` (unix),
+  `gk_eventfd_export_to` (Windows); token buffers of `GK_EVENTFD_TOKEN_MAX`.
+- mio on Windows: each process should read (drain) its own registered handle;
+  use one eventfd per waiting side.
+
+## 7. Per-platform checklists
 
 **Linux / Android / FreeBSD 13+ / NetBSD 10+ / illumos (native)**
 - Everything works, including raw syscalls, `epoll`/`kqueue`, `fork()`
-  sharing, and passing the fd to other processes.
+  sharing, and passing the fd to other processes (section 6's calls are thin
+  wrappers over fd inheritance and `SCM_RIGHTS`).
 - FreeBSD 12 and NetBSD 9 lack `eventfd`; the crate does not support them.
 
 **macOS / iOS / OpenBSD / DragonFly (pipe shim)**
 - Poll the fd with `kqueue` (`EVFILT_READ`), `poll`, `select` or mio.
-- Each `GkEventFd` uses 3 fds, plus 1 per clone. Size `RLIMIT_NOFILE` accordingly.
-- `fork()` shares the counter: it lives in an anonymous shared memory page,
+- Each `GkEventFd` uses 4 fds (shared memory object, pipe read and write
+  ends, its own pollable dup), plus 1 per clone. Size `RLIMIT_NOFILE`
+  accordingly.
+- `fork()` shares the counter: it lives in an unnamed shared memory object,
   guarded by a cross-process spinlock. Parent and child see each other's
   writes, blocking reads wake across processes, and `set_nonblocking` is
   shared (as `O_NONBLOCK` is on Linux).
 - If a process dies while holding that lock (only possible mid-operation, e.g.
   `SIGKILL`), the next caller takes it over and repairs readiness.
-- Not shared across `exec` or with unrelated processes: without
-  `EFD_CLOEXEC` the fds are inherited across `exec`, but the counter is not.
+- After `exec` or for unrelated processes, share explicitly (section 6):
+  plain inherited fds without a token don't carry the counter.
 - Not async-signal-safe: don't call into an eventfd from a signal handler
   that may have interrupted an operation on the same eventfd.
 - After `fork()` in a multithreaded program, the usual rule applies: the child
@@ -223,28 +256,13 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   plus 1 per clone, and closed pairs sit in `TIME_WAIT`. Don't create and
   destroy thousands per second; reuse them.
 - The eventfd's own handles are always non-inheritable, with or without
-  `EFD_CLOEXEC`. Share with another process explicitly:
-  - **At spawn:** `let export = efd.export_inheritable()?;` pass
-    `export.token()` to `std::process::Command` (e.g. `.env("GK_EVENTFD", ...)`),
-    spawn, then `drop(export)`. The child calls
-    `unsafe { GkEventFd::import(&token) }`. Every child spawned while the export
-    is alive inherits the handles.
-  - **To a running process:** `let token = efd.export_to(pid)?;` send the token
-    (stdin, pipe) and `import` it there. Nothing becomes inheritable.
-  - `import` takes ownership of the named handles: one import per token, in
-    the process the token was made for. Bad tokens fail without closing
-    anything.
-  - C: `gk_eventfd_export_inheritable` (+ `gk_eventfd_export_release` after
-    spawning), `gk_eventfd_export_to`, `gk_eventfd_import`; buffers of
-    `GK_EVENTFD_TOKEN_MAX` bytes.
-  - After sharing, the counter, blocking reads, readiness and
-    `set_nonblocking` work across the processes; the same cross-process lock
-    and dead-holder takeover as on the unix shim apply.
+  `EFD_CLOEXEC`. Share with other processes explicitly (section 6); the same
+  cross-process lock and dead-holder takeover as on the unix shim apply.
 - Use `WSAPoll`/`select`/mio for readiness. tokio needs `spawn_blocking`.
 - Third-party firewalls and antivirus that filter loopback traffic can delay
   or break readiness.
 
-## 7. Verifying changes to this crate (no CI; run manually)
+## 8. Verifying changes to this crate (no CI; run manually)
 
 ```sh
 cargo fmt --check

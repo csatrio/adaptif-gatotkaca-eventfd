@@ -136,6 +136,60 @@ impl From<Inner> for OwnedFd {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sharing with other processes: the kernel eventfd itself is passed along.
+// ---------------------------------------------------------------------------
+
+use super::unix_share::{self, InheritableExport};
+
+impl Inner {
+    pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
+        InheritableExport::new('n', &[self.fd.as_fd()])
+    }
+
+    /// # Safety
+    /// See `GkEventFd::import`.
+    pub(crate) unsafe fn import(token: &str) -> io::Result<Self> {
+        let fd = unix_share::parse(token, 'n', 1)?[0];
+        if !unix_share::is_open(fd) {
+            return Err(unix_share::invalid_token());
+        }
+        check_is_eventfd(fd)?;
+        // SAFETY: open, validated, and the caller guarantees we may own it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        unix_share::set_cloexec(fd.as_fd())?;
+        Ok(Self { fd })
+    }
+
+    pub(crate) fn send_to(&self, sock: BorrowedFd<'_>) -> io::Result<()> {
+        unix_share::send(sock, 'n', &[self.fd.as_fd()])
+    }
+
+    pub(crate) fn recv_from(sock: BorrowedFd<'_>) -> io::Result<Self> {
+        let fd = unix_share::recv(sock, 'n', 1)?
+            .pop()
+            .expect("one descriptor");
+        check_is_eventfd(fd.as_raw_fd())?;
+        Ok(Self { fd })
+    }
+}
+
+/// On Linux/Android, checks through `/proc` that `fd` is an eventfd (skipped
+/// if `/proc` is unavailable). Other native platforms only check it is open.
+fn check_is_eventfd(fd: RawFd) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        if target.as_os_str() != "anon_inode:[eventfd]" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "descriptor is not an eventfd",
+            ));
+        }
+    }
+    let _ = fd;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

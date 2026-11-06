@@ -23,6 +23,11 @@ mod native;
 #[cfg(gk_native)]
 pub(crate) use native::Inner;
 
+#[cfg(unix)]
+mod unix_share;
+#[cfg(unix)]
+pub(crate) use unix_share::{InheritableExport, is_open};
+
 #[cfg(any(windows, all(unix, not(gk_native))))]
 mod shm;
 #[cfg(all(unix, not(gk_native)))]
