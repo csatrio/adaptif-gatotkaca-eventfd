@@ -112,16 +112,19 @@ single read drains the counter. In semaphore mode, loop.
 ## tokio (Unix)
 
 On Unix, wrap the eventfd in `tokio::io::unix::AsyncFd`. This needs tokio's
-`net` feature.
+`net` feature and tokio 1.53.3+ (or 1.51.6+ LTS) for `AsyncFd::register*`;
+on older tokio use the now-deprecated `AsyncFd::new`.
 
 ```rust
 use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd};
 use std::sync::Arc;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let efd = Arc::new(AsyncFd::new(GkEventFd::new(0, EfdFlags::NONBLOCK)?)?);
+    let efd = GkEventFd::new(0, EfdFlags::NONBLOCK)?;
+    // SAFETY: GkEventFd owns its fd until dropped and always returns the same one.
+    let efd = Arc::new(unsafe { AsyncFd::register_with_interest(efd, Interest::READABLE) }?);
 
     let notifier = Arc::clone(&efd);
     std::thread::spawn(move || notifier.get_ref().write(7).unwrap());

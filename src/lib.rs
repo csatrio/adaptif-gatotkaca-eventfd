@@ -296,6 +296,12 @@ mod windows_impls {
     }
 }
 
+/// Compiles and runs the README's Rust examples as doctests. They use mio and
+/// `tokio::io::unix::AsyncFd`, so this only exists with `--features mio` on Unix.
+#[cfg(all(doctest, unix, feature = "mio"))]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
