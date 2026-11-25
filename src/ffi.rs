@@ -61,11 +61,7 @@ pub unsafe extern "C" fn gk_eventfd_read_buf(fd: c_int, buf: *mut c_void, count:
 /// # Safety
 /// `buf` must be null or valid for reading `count` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_eventfd_write_buf(
-    fd: c_int,
-    buf: *const c_void,
-    count: usize,
-) -> isize {
+pub unsafe extern "C" fn gk_eventfd_write_buf(fd: c_int, buf: *const c_void, count: usize) -> isize {
     // SAFETY: forwarded to the caller.
     guard(-1, || unsafe { compat::eventfd_write_buf(fd, buf, count) })
 }
@@ -101,25 +97,15 @@ unsafe extern "C" {
 }
 
 #[cfg(windows)]
-type InvalidParameterHandler =
-    Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, c_uint, usize)>;
+type InvalidParameterHandler = Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, c_uint, usize)>;
 
 #[cfg(windows)]
 unsafe extern "C" {
-    fn _set_thread_local_invalid_parameter_handler(
-        h: InvalidParameterHandler,
-    ) -> InvalidParameterHandler;
+    fn _set_thread_local_invalid_parameter_handler(h: InvalidParameterHandler) -> InvalidParameterHandler;
 }
 
 #[cfg(windows)]
-unsafe extern "C" fn ignore_invalid_parameter(
-    _: *const u16,
-    _: *const u16,
-    _: *const u16,
-    _: c_uint,
-    _: usize,
-) {
-}
+unsafe extern "C" fn ignore_invalid_parameter(_: *const u16, _: *const u16, _: *const u16, _: c_uint, _: usize) {}
 
 /// Runs a CRT descriptor call with the invalid-parameter handler silenced.
 /// Without it the CRT aborts the process (`STATUS_STACK_BUFFER_OVERRUN`) on a
@@ -128,8 +114,7 @@ unsafe extern "C" fn ignore_invalid_parameter(
 #[cfg(windows)]
 fn crt_call<T>(f: impl FnOnce() -> T) -> T {
     // SAFETY: installs/restores a thread-local handler; no pointers involved.
-    let prev =
-        unsafe { _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter)) };
+    let prev = unsafe { _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter)) };
     let r = f();
     // SAFETY: as above.
     unsafe { _set_thread_local_invalid_parameter_handler(prev) };
@@ -164,6 +149,7 @@ pub unsafe extern "C" fn gk_read(fd: c_int, buf: *mut c_void, count: usize) -> S
         #[cfg(unix)]
         return unsafe { libc::read(fd, buf, count) };
         #[cfg(windows)]
+        // SAFETY: forwarded to the caller (the CRT function itself).
         return crt_call(|| unsafe { _read(fd, buf, crt_count(count)) });
     })
 }
@@ -189,6 +175,7 @@ pub unsafe extern "C" fn gk_write(fd: c_int, buf: *const c_void, count: usize) -
         #[cfg(unix)]
         return unsafe { libc::write(fd, buf, count) };
         #[cfg(windows)]
+        // SAFETY: forwarded to the caller (the CRT function itself).
         return crt_call(|| unsafe { _write(fd, buf, crt_count(count)) });
     })
 }
@@ -210,6 +197,7 @@ pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
         #[cfg(unix)]
         return unsafe { libc::close(fd) };
         #[cfg(windows)]
+        // SAFETY: forwarded to the caller (the CRT function itself).
         return crt_call(|| unsafe { _close(fd) });
     })
 }
@@ -220,15 +208,9 @@ pub unsafe extern "C" fn gk_close(fd: c_int) -> c_int {
 /// # Safety
 /// `buf` must be valid for writing `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_eventfd_export_inheritable(
-    fd: c_int,
-    buf: *mut core::ffi::c_char,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn gk_eventfd_export_inheritable(fd: c_int, buf: *mut core::ffi::c_char, len: usize) -> c_int {
     // SAFETY: forwarded to the caller.
-    guard(-1, || unsafe {
-        compat::eventfd_export_inheritable(fd, buf, len)
-    })
+    guard(-1, || unsafe { compat::eventfd_export_inheritable(fd, buf, len) })
 }
 
 /// `int gk_eventfd_export_release(const char *token);`
@@ -248,16 +230,9 @@ pub unsafe extern "C" fn gk_eventfd_export_release(token: *const core::ffi::c_ch
 /// `buf` must be valid for writing `len` bytes.
 #[cfg(windows)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_eventfd_export_to(
-    fd: c_int,
-    pid: core::ffi::c_ulong,
-    buf: *mut core::ffi::c_char,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn gk_eventfd_export_to(fd: c_int, pid: core::ffi::c_ulong, buf: *mut core::ffi::c_char, len: usize) -> c_int {
     // SAFETY: forwarded to the caller.
-    guard(-1, || unsafe {
-        compat::eventfd_export_to(fd, pid, buf, len)
-    })
+    guard(-1, || unsafe { compat::eventfd_export_to(fd, pid, buf, len) })
 }
 
 /// `int gk_eventfd_import(const char *token);`
@@ -393,10 +368,7 @@ pub extern "C" fn gk_process_from_parent() -> *mut GkProcess {
 /// # Safety
 /// `env_value` must be valid for writing `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_process_for_child(
-    env_value: *mut c_char,
-    len: usize,
-) -> *mut GkProcess {
+pub unsafe extern "C" fn gk_process_for_child(env_value: *mut c_char, len: usize) -> *mut GkProcess {
     guard(core::ptr::null_mut(), || match GkProcess::for_child() {
         Ok((process, name)) => {
             if env_value.is_null() || name.len() >= len {
@@ -422,10 +394,7 @@ pub unsafe extern "C" fn gk_process_for_child(
 /// # Safety
 /// `process` must be a live handle from this API.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_process_expect_pid(
-    process: *mut GkProcess,
-    pid: core::ffi::c_ulong,
-) -> c_int {
+pub unsafe extern "C" fn gk_process_expect_pid(process: *mut GkProcess, pid: core::ffi::c_ulong) -> c_int {
     guard(-1, || {
         // SAFETY: the caller guarantees a live handle (or null).
         match unsafe { process.as_mut() } {
@@ -499,11 +468,7 @@ use crate::{ChannelOptions, GkChannel, GkReceiver, GkSender};
 /// Sets `errno` for a channel error: size problems are `EMSGSIZE`.
 fn channel_errno(e: &std::io::Error) {
     use crate::error::errno::EMSGSIZE;
-    compat::set_errno(if e.kind() == std::io::ErrorKind::InvalidInput {
-        EMSGSIZE
-    } else {
-        crate::error::to_errno(e)
-    });
+    compat::set_errno(if e.kind() == std::io::ErrorKind::InvalidInput { EMSGSIZE } else { crate::error::to_errno(e) });
 }
 
 /// Runs `f` on a live handle, or sets `errno = EINVAL` for null.
@@ -560,11 +525,7 @@ pub unsafe extern "C" fn gk_channel_options_default(opts: *mut GkChannelOptionsC
 /// `opts` must be null or valid for reading; `tx` and `rx` valid for writing
 /// a pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_channel_new(
-    opts: *const GkChannelOptionsC,
-    tx: *mut *mut GkSender,
-    rx: *mut *mut GkReceiver,
-) -> c_int {
+pub unsafe extern "C" fn gk_channel_new(opts: *const GkChannelOptionsC, tx: *mut *mut GkSender, rx: *mut *mut GkReceiver) -> c_int {
     guard(-1, || {
         if tx.is_null() || rx.is_null() {
             compat::set_errno(crate::error::errno::EINVAL);
@@ -610,11 +571,7 @@ pub unsafe extern "C" fn gk_channel_new(
 /// # Safety
 /// `tx` must be a live handle; `buf` valid for reading `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_send(
-    tx: *mut GkSender,
-    buf: *const c_void,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn gk_sender_send(tx: *mut GkSender, buf: *const c_void, len: usize) -> c_int {
     // SAFETY: forwarded to the caller.
     unsafe { gk_sender_send_kind(tx, 0, buf, len) }
 }
@@ -624,12 +581,7 @@ pub unsafe extern "C" fn gk_sender_send(
 /// # Safety
 /// `tx` must be a live handle; `buf` valid for reading `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_send_kind(
-    tx: *mut GkSender,
-    kind: u16,
-    buf: *const c_void,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn gk_sender_send_kind(tx: *mut GkSender, kind: u16, buf: *const c_void, len: usize) -> c_int {
     guard(-1, || {
         with(tx, -1, |tx| {
             let msg = if len == 0 {
@@ -657,11 +609,7 @@ pub unsafe extern "C" fn gk_sender_send_kind(
 /// # Safety
 /// `rx` must be a live handle; `buf` valid for writing `cap` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_recv(
-    rx: *mut GkReceiver,
-    buf: *mut c_void,
-    cap: usize,
-) -> isize {
+pub unsafe extern "C" fn gk_receiver_recv(rx: *mut GkReceiver, buf: *mut c_void, cap: usize) -> isize {
     // SAFETY: forwarded to the caller.
     unsafe { gk_receiver_recv_kind(rx, std::ptr::null_mut(), buf, cap) }
 }
@@ -672,12 +620,7 @@ pub unsafe extern "C" fn gk_receiver_recv(
 /// `rx` must be a live handle; `kind` null or writable; `buf` valid for
 /// writing `cap` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_recv_kind(
-    rx: *mut GkReceiver,
-    kind: *mut u16,
-    buf: *mut c_void,
-    cap: usize,
-) -> isize {
+pub unsafe extern "C" fn gk_receiver_recv_kind(rx: *mut GkReceiver, kind: *mut u16, buf: *mut c_void, cap: usize) -> isize {
     guard(-1, || {
         with(rx, -1, |rx| {
             let out = if cap == 0 {
@@ -759,10 +702,7 @@ pub unsafe extern "C" fn gk_sender_set_nonblocking(tx: *mut GkSender, nonblockin
 /// # Safety
 /// `rx` must be a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_set_nonblocking(
-    rx: *mut GkReceiver,
-    nonblocking: c_int,
-) -> c_int {
+pub unsafe extern "C" fn gk_receiver_set_nonblocking(rx: *mut GkReceiver, nonblocking: c_int) -> c_int {
     guard(-1, || {
         with(rx, -1, |rx| {
             rx.set_nonblocking(nonblocking != 0);
@@ -806,9 +746,7 @@ pub unsafe extern "C" fn gk_receiver_claim(rx: *mut GkReceiver) -> c_int {
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_sender_fd(tx: *mut GkSender) -> c_int {
-    guard(-1, || {
-        with(tx, -1, |tx| std::os::fd::AsRawFd::as_raw_fd(&*tx))
-    })
+    guard(-1, || with(tx, -1, |tx| std::os::fd::AsRawFd::as_raw_fd(&*tx)))
 }
 
 /// `int gk_receiver_fd(gk_receiver *rx);` (unix: readable when a message may wait)
@@ -818,9 +756,7 @@ pub unsafe extern "C" fn gk_sender_fd(tx: *mut GkSender) -> c_int {
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_receiver_fd(rx: *mut GkReceiver) -> c_int {
-    guard(-1, || {
-        with(rx, -1, |rx| std::os::fd::AsRawFd::as_raw_fd(&*rx))
-    })
+    guard(-1, || with(rx, -1, |rx| std::os::fd::AsRawFd::as_raw_fd(&*rx)))
 }
 
 /// `uintptr_t gk_sender_socket(gk_sender *tx);` (Windows)
@@ -830,11 +766,7 @@ pub unsafe extern "C" fn gk_receiver_fd(rx: *mut GkReceiver) -> c_int {
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_sender_socket(tx: *mut GkSender) -> usize {
-    guard(usize::MAX, || {
-        with(tx, usize::MAX, |tx| {
-            std::os::windows::io::AsRawSocket::as_raw_socket(&*tx) as usize
-        })
-    })
+    guard(usize::MAX, || with(tx, usize::MAX, |tx| std::os::windows::io::AsRawSocket::as_raw_socket(&*tx) as usize))
 }
 
 /// `uintptr_t gk_receiver_socket(gk_receiver *rx);` (Windows)
@@ -844,11 +776,7 @@ pub unsafe extern "C" fn gk_sender_socket(tx: *mut GkSender) -> usize {
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_receiver_socket(rx: *mut GkReceiver) -> usize {
-    guard(usize::MAX, || {
-        with(rx, usize::MAX, |rx| {
-            std::os::windows::io::AsRawSocket::as_raw_socket(&*rx) as usize
-        })
-    })
+    guard(usize::MAX, || with(rx, usize::MAX, |rx| std::os::windows::io::AsRawSocket::as_raw_socket(&*rx) as usize))
 }
 
 /// `void gk_sender_free(gk_sender *tx);` (closes the sending side; NULL ok)
@@ -936,12 +864,7 @@ fn bulk_errno(e: &std::io::Error) {
 /// # Safety
 /// `tx` live; `buf` readable for `len` bytes; `id` null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_send_bulk(
-    tx: *mut GkSender,
-    buf: *const c_void,
-    len: usize,
-    id: *mut u64,
-) -> c_int {
+pub unsafe extern "C" fn gk_sender_send_bulk(tx: *mut GkSender, buf: *const c_void, len: usize, id: *mut u64) -> c_int {
     // SAFETY: forwarded to the caller.
     unsafe { gk_sender_send_bulk_kind(tx, 0, buf, len, id) }
 }
@@ -951,13 +874,7 @@ pub unsafe extern "C" fn gk_sender_send_bulk(
 /// # Safety
 /// As `gk_sender_send_bulk`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_send_bulk_kind(
-    tx: *mut GkSender,
-    kind: u16,
-    buf: *const c_void,
-    len: usize,
-    id: *mut u64,
-) -> c_int {
+pub unsafe extern "C" fn gk_sender_send_bulk_kind(tx: *mut GkSender, kind: u16, buf: *const c_void, len: usize, id: *mut u64) -> c_int {
     guard(-1, || {
         with(tx, -1, |tx| {
             // SAFETY: forwarded to the caller.
@@ -995,12 +912,7 @@ pub unsafe extern "C" fn gk_sender_bulk_begin(tx: *mut GkSender, len: i64, id: *
 /// # Safety
 /// As `gk_sender_bulk_begin`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_bulk_begin_kind(
-    tx: *mut GkSender,
-    kind: u16,
-    len: i64,
-    id: *mut u64,
-) -> c_int {
+pub unsafe extern "C" fn gk_sender_bulk_begin_kind(tx: *mut GkSender, kind: u16, len: i64, id: *mut u64) -> c_int {
     guard(-1, || {
         with(tx, -1, |tx| {
             match tx.bulk_begin(kind, u64::try_from(len).ok()) {
@@ -1023,11 +935,7 @@ pub unsafe extern "C" fn gk_sender_bulk_begin_kind(
 /// # Safety
 /// `tx` live; `buf` readable for `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_sender_bulk_write(
-    tx: *mut GkSender,
-    buf: *const c_void,
-    len: usize,
-) -> isize {
+pub unsafe extern "C" fn gk_sender_bulk_write(tx: *mut GkSender, buf: *const c_void, len: usize) -> isize {
     guard(-1, || {
         with(tx, -1, |tx| {
             // SAFETY: forwarded to the caller.
@@ -1085,11 +993,7 @@ pub unsafe extern "C" fn gk_sender_bulk_abort(tx: *mut GkSender) -> c_int {
 /// # Safety
 /// `rx` live; `len`, `id` null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_bulk_begin(
-    rx: *mut GkReceiver,
-    len: *mut i64,
-    id: *mut u64,
-) -> c_int {
+pub unsafe extern "C" fn gk_receiver_bulk_begin(rx: *mut GkReceiver, len: *mut i64, id: *mut u64) -> c_int {
     // SAFETY: forwarded to the caller.
     unsafe { gk_receiver_bulk_begin_kind(rx, std::ptr::null_mut(), len, id) }
 }
@@ -1099,12 +1003,7 @@ pub unsafe extern "C" fn gk_receiver_bulk_begin(
 /// # Safety
 /// `rx` live; `kind`, `len`, `id` null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_bulk_begin_kind(
-    rx: *mut GkReceiver,
-    kind: *mut u16,
-    len: *mut i64,
-    id: *mut u64,
-) -> c_int {
+pub unsafe extern "C" fn gk_receiver_bulk_begin_kind(rx: *mut GkReceiver, kind: *mut u16, len: *mut i64, id: *mut u64) -> c_int {
     guard(-1, || {
         with(rx, -1, |rx| match rx.bulk_begin() {
             Ok((v, total)) => {
@@ -1113,10 +1012,7 @@ pub unsafe extern "C" fn gk_receiver_bulk_begin_kind(
                 unsafe {
                     put(kind, k);
                     put(id, v);
-                    put(
-                        len,
-                        total.map_or(-1, |t| i64::try_from(t).unwrap_or(i64::MAX)),
-                    );
+                    put(len, total.map_or(-1, |t| i64::try_from(t).unwrap_or(i64::MAX)));
                 }
                 0
             }
@@ -1134,11 +1030,7 @@ pub unsafe extern "C" fn gk_receiver_bulk_begin_kind(
 /// # Safety
 /// `rx` live; `buf` writable for `cap` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_receiver_bulk_read(
-    rx: *mut GkReceiver,
-    buf: *mut c_void,
-    cap: usize,
-) -> isize {
+pub unsafe extern "C" fn gk_receiver_bulk_read(rx: *mut GkReceiver, buf: *mut c_void, cap: usize) -> isize {
     guard(-1, || {
         with(rx, -1, |rx| {
             let out = if cap == 0 {
@@ -1225,9 +1117,7 @@ pub unsafe extern "C" fn gk_process_send_receiver(p: *mut GkProcess, rx: *mut Gk
 /// `p` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_process_recv_sender(p: *mut GkProcess) -> *mut GkSender {
-    guard(core::ptr::null_mut(), || {
-        with(p, core::ptr::null_mut(), |p| boxed(p.recv_as::<GkSender>()))
-    })
+    guard(core::ptr::null_mut(), || with(p, core::ptr::null_mut(), |p| boxed(p.recv_as::<GkSender>())))
 }
 
 /// `gk_receiver *gk_process_recv_receiver(gk_process *p);`
@@ -1236,11 +1126,7 @@ pub unsafe extern "C" fn gk_process_recv_sender(p: *mut GkProcess) -> *mut GkSen
 /// `p` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_process_recv_receiver(p: *mut GkProcess) -> *mut GkReceiver {
-    guard(core::ptr::null_mut(), || {
-        with(p, core::ptr::null_mut(), |p| {
-            boxed(p.recv_as::<GkReceiver>())
-        })
-    })
+    guard(core::ptr::null_mut(), || with(p, core::ptr::null_mut(), |p| boxed(p.recv_as::<GkReceiver>())))
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,11 +1183,7 @@ pub struct GkShmOptionsC {
 
 impl From<SharedMemoryOptions> for GkShmOptionsC {
     fn from(o: SharedMemoryOptions) -> Self {
-        Self {
-            huge_pages: huge_to_c(o.huge_pages),
-            huge_page_size: o.huge_page_size.unwrap_or(0),
-            populate: c_int::from(o.populate),
-        }
+        Self { huge_pages: huge_to_c(o.huge_pages), huge_page_size: o.huge_page_size.unwrap_or(0), populate: c_int::from(o.populate) }
     }
 }
 
@@ -1339,10 +1221,7 @@ pub extern "C" fn gk_shm_new(len: usize) -> *mut GkSharedMemory {
 /// # Safety
 /// `opts` must be null or valid for reading a `gk_shm_options`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_shm_new_ex(
-    len: usize,
-    opts: *const GkShmOptionsC,
-) -> *mut GkSharedMemory {
+pub unsafe extern "C" fn gk_shm_new_ex(len: usize, opts: *const GkShmOptionsC) -> *mut GkSharedMemory {
     guard(core::ptr::null_mut(), || {
         // SAFETY: the caller guarantees `opts` is null or readable.
         let opts = match unsafe { opts.as_ref() } {
@@ -1365,9 +1244,7 @@ pub unsafe extern "C" fn gk_shm_new_ex(
 /// `shm` must be a live handle (or null).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_shm_ptr(shm: *const GkSharedMemory) -> *mut c_void {
-    guard(core::ptr::null_mut(), || {
-        with_ref(shm, core::ptr::null_mut(), |s| s.as_ptr().cast::<c_void>())
-    })
+    guard(core::ptr::null_mut(), || with_ref(shm, core::ptr::null_mut(), |s| s.as_ptr().cast::<c_void>()))
 }
 
 /// `size_t gk_shm_len(const gk_shm *shm);` (0 + `EINVAL` for NULL)
@@ -1405,11 +1282,7 @@ pub unsafe extern "C" fn gk_shm_is_huge(shm: *const GkSharedMemory) -> c_int {
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gk_shm_fd(shm: *const GkSharedMemory) -> c_int {
-    guard(-1, || {
-        with_ref(shm, -1, |s| {
-            std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(s))
-        })
-    })
+    guard(-1, || with_ref(shm, -1, |s| std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(s))))
 }
 
 /// `void *gk_shm_handle(const gk_shm *shm);` (Windows: the section handle,
@@ -1422,10 +1295,7 @@ pub unsafe extern "C" fn gk_shm_fd(shm: *const GkSharedMemory) -> c_int {
 pub unsafe extern "C" fn gk_shm_handle(shm: *const GkSharedMemory) -> *mut c_void {
     guard(core::ptr::null_mut(), || {
         with_ref(shm, core::ptr::null_mut(), |s| {
-            std::os::windows::io::AsRawHandle::as_raw_handle(
-                &std::os::windows::io::AsHandle::as_handle(s),
-            )
-            .cast()
+            std::os::windows::io::AsRawHandle::as_raw_handle(&std::os::windows::io::AsHandle::as_handle(s)).cast()
         })
     })
 }
@@ -1448,10 +1318,7 @@ pub unsafe extern "C" fn gk_shm_free(shm: *mut GkSharedMemory) {
 /// # Safety
 /// Both must be live handles (or null).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gk_process_send_shm(
-    p: *mut GkProcess,
-    shm: *const GkSharedMemory,
-) -> c_int {
+pub unsafe extern "C" fn gk_process_send_shm(p: *mut GkProcess, shm: *const GkSharedMemory) -> c_int {
     guard(-1, || {
         // SAFETY: the caller guarantees a live handle (or null).
         let Some(shm) = (unsafe { shm.as_ref() }) else {
@@ -1478,9 +1345,7 @@ pub unsafe extern "C" fn gk_process_recv_shm(p: *mut GkProcess) -> *mut GkShared
         with(p, core::ptr::null_mut(), |p| {
             // Something else sent (or a bad offer): EINVAL, as gk_process_recv.
             boxed(p.recv_as::<GkSharedMemory>().map_err(|e| match e.kind() {
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
-                    crate::error::invalid_input()
-                }
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => crate::error::invalid_input(),
                 _ => e,
             }))
         })
@@ -1795,8 +1660,7 @@ mod tests {
             // while this thread connects.
             let l_addr = l as usize;
             // SAFETY (closure): `l` stays alive until this thread is joined.
-            let accepting =
-                std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+            let accepting = std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
             let q = gk_process_connect(name.as_ptr());
             assert!(!q.is_null());
             let p = accepting.join().unwrap() as *mut GkProcess;
@@ -1883,8 +1747,7 @@ mod tests {
             let l = gk_listener_bind(name.as_ptr());
             assert!(!l.is_null());
             let l_addr = l as usize;
-            let accepting =
-                std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+            let accepting = std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
             let q = gk_process_connect(name.as_ptr());
             let a = accepting.join().unwrap() as *mut GkProcess;
             assert!(!q.is_null() && !a.is_null());
@@ -1909,11 +1772,7 @@ mod tests {
             gk_shm_free(shm);
 
             // Options.
-            let mut opts = GkShmOptionsC {
-                huge_pages: 9,
-                huge_page_size: 1,
-                populate: 9,
-            };
+            let mut opts = GkShmOptionsC { huge_pages: 9, huge_page_size: 1, populate: 9 };
             gk_shm_options_default(&mut opts);
             assert_eq!(opts.huge_pages, GK_HUGE_PAGES_OFF);
             assert_eq!(opts.huge_page_size, 0);
@@ -1930,10 +1789,7 @@ mod tests {
             let shm = gk_shm_new_ex(1 << 21, &opts);
             if shm.is_null() {
                 let e = compat::errno();
-                assert!(
-                    [ENOTSUP, ENOMEM, EPERM, crate::error::errno::EACCES].contains(&e),
-                    "errno {e}"
-                );
+                assert!([ENOTSUP, ENOMEM, EPERM, crate::error::errno::EACCES].contains(&e), "errno {e}");
             } else {
                 assert_eq!(gk_shm_is_huge(shm), 1);
                 gk_shm_free(shm);
@@ -1948,10 +1804,7 @@ mod tests {
             assert!(gk_shm_ptr(core::ptr::null()).is_null());
             assert_eq!(gk_shm_len(core::ptr::null()), 0);
             assert_eq!(gk_shm_is_huge(core::ptr::null()), -1);
-            assert_eq!(
-                gk_process_send_shm(core::ptr::null_mut(), core::ptr::null()),
-                -1
-            );
+            assert_eq!(gk_process_send_shm(core::ptr::null_mut(), core::ptr::null()), -1);
             assert!(gk_process_recv_shm(core::ptr::null_mut()).is_null());
             gk_shm_free(core::ptr::null_mut());
         }

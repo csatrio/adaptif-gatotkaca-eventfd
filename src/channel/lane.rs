@@ -44,10 +44,7 @@ pub(super) fn record_len(len: u64) -> u64 {
 
 /// A ring of `capacity` bytes can carry payloads of up to `max` bytes.
 pub(super) fn valid_sizes(capacity: u64, max: u64) -> bool {
-    capacity.is_power_of_two()
-        && (64..=1 << 40).contains(&capacity)
-        && max <= u64::from(u32::MAX)
-        && record_len(max) <= capacity / 2
+    capacity.is_power_of_two() && (64..=1 << 40).contains(&capacity) && max <= u64::from(u32::MAX) && record_len(max) <= capacity / 2
 }
 
 #[repr(C, align(64))]
@@ -140,11 +137,7 @@ impl Lane {
         let free = self.cap.checked_sub(tail.wrapping_sub(head))?;
         let idx = tail & (self.cap - 1);
         let to_end = self.cap - idx;
-        if need <= to_end {
-            (need <= free).then_some((0, idx))
-        } else {
-            (to_end + need <= free).then_some((to_end, 0))
-        }
+        if need <= to_end { (need <= free).then_some((0, idx)) } else { (to_end + need <= free).then_some((to_end, 0)) }
     }
 
     /// The payload area of a record starting at ring index `idx`.
@@ -172,15 +165,7 @@ impl Lane {
     /// # Safety
     /// (`pad`, `idx`) must come from `reserve(tail, reserved)` with
     /// `len <= reserved`, and the payload must already be written.
-    pub(super) unsafe fn publish(
-        &self,
-        tail: u64,
-        pad: u64,
-        idx: u64,
-        len: u64,
-        flags: u32,
-        kind: u16,
-    ) -> u64 {
+    pub(super) unsafe fn publish(&self, tail: u64, pad: u64, idx: u64, len: u64, flags: u32, kind: u16) -> u64 {
         // SAFETY: forwarded; headers lie inside the reserved space.
         unsafe {
             if pad > 0 {
@@ -210,11 +195,7 @@ impl Lane {
             // published (Acquire above) and is not reused until released.
             let (len, flags, kind) = unsafe {
                 let p = self.data.as_ptr().add(idx as usize);
-                (
-                    u64::from(p.cast::<u32>().read()),
-                    u32::from(p.add(4).cast::<u16>().read()),
-                    p.add(6).cast::<u16>().read(),
-                )
+                (u64::from(p.cast::<u32>().read()), u32::from(p.add(4).cast::<u16>().read()), p.add(6).cast::<u16>().read())
             };
             if flags & flag::PAD != 0 {
                 head += self.cap - idx;
@@ -224,13 +205,7 @@ impl Lane {
             if len > self.max || rec > self.cap - idx || rec > tail - head {
                 return Err(corrupt());
             }
-            return Ok(Some(Rec {
-                ptr: self.payload(idx),
-                len: len as usize,
-                flags,
-                kind,
-                next: head + rec,
-            }));
+            return Ok(Some(Rec { ptr: self.payload(idx), len: len as usize, flags, kind, next: head + rec }));
         }
     }
 
@@ -251,8 +226,7 @@ pub(super) struct Sizes {
 
 impl Sizes {
     pub(super) fn valid(&self) -> bool {
-        valid_sizes(self.msg_capacity, self.max_message)
-            && valid_sizes(self.bulk_capacity, self.chunk + BULK_HDR)
+        valid_sizes(self.msg_capacity, self.max_message) && valid_sizes(self.bulk_capacity, self.chunk + BULK_HDR)
     }
 
     pub(super) fn region_len(&self) -> u64 {
@@ -281,11 +255,9 @@ impl Layout {
     pub(super) unsafe fn init(base: NonNull<u8>, sizes: Sizes, pid: u32) {
         // SAFETY: forwarded.
         let meta = unsafe { &base.cast::<Header>().as_ref().meta };
-        meta.msg_capacity
-            .store(sizes.msg_capacity, Ordering::Relaxed);
+        meta.msg_capacity.store(sizes.msg_capacity, Ordering::Relaxed);
         meta.max_message.store(sizes.max_message, Ordering::Relaxed);
-        meta.bulk_capacity
-            .store(sizes.bulk_capacity, Ordering::Relaxed);
+        meta.bulk_capacity.store(sizes.bulk_capacity, Ordering::Relaxed);
         meta.chunk.store(sizes.chunk, Ordering::Relaxed);
         meta.sender_pid.store(pid, Ordering::Relaxed);
         meta.receiver_pid.store(pid, Ordering::Relaxed);
@@ -313,16 +285,7 @@ impl Layout {
             return false;
         }
         // SAFETY: at least a header's worth of mapped, page-aligned memory.
-        let (magic, sizes) = unsafe {
-            (
-                ptr.cast::<Header>()
-                    .as_ref()
-                    .meta
-                    .magic
-                    .load(Ordering::Acquire),
-                Self::sizes(ptr),
-            )
-        };
+        let (magic, sizes) = unsafe { (ptr.cast::<Header>().as_ref().meta.magic.load(Ordering::Acquire), Self::sizes(ptr)) };
         magic == MAGIC && sizes.valid() && sizes.region_len() <= len as u64
     }
 
@@ -347,20 +310,8 @@ impl Layout {
             };
             Self {
                 hdr,
-                msg: lane(
-                    &raw mut (*h).msg_tail,
-                    &raw mut (*h).msg_head,
-                    msg_data,
-                    sizes.msg_capacity,
-                    sizes.max_message,
-                ),
-                bulk: lane(
-                    &raw mut (*h).bulk_tail,
-                    &raw mut (*h).bulk_head,
-                    bulk_data,
-                    sizes.bulk_capacity,
-                    sizes.chunk + BULK_HDR,
-                ),
+                msg: lane(&raw mut (*h).msg_tail, &raw mut (*h).msg_head, msg_data, sizes.msg_capacity, sizes.max_message),
+                bulk: lane(&raw mut (*h).bulk_tail, &raw mut (*h).bulk_head, bulk_data, sizes.bulk_capacity, sizes.chunk + BULK_HDR),
             }
         }
     }
@@ -397,12 +348,7 @@ pub(super) mod tests {
     }
 
     fn sizes(msg: u64, max: u64) -> Sizes {
-        Sizes {
-            msg_capacity: msg,
-            max_message: max,
-            bulk_capacity: 256,
-            chunk: 64,
-        }
+        Sizes { msg_capacity: msg, max_message: max, bulk_capacity: 256, chunk: 64 }
     }
 
     pub(crate) fn put(l: &Lane, tail: &mut u64, msg: &[u8]) -> bool {
@@ -440,10 +386,7 @@ pub(super) mod tests {
         assert_eq!(DATA % 64, 0);
         // Bulk lane: chunk + 24-byte sub-header must fit half the ring.
         assert!(sizes(256, 64).valid());
-        let s = Sizes {
-            bulk_capacity: 128,
-            ..sizes(256, 64)
-        };
+        let s = Sizes { bulk_capacity: 128, ..sizes(256, 64) };
         assert!(!s.valid());
     }
 
@@ -532,12 +475,7 @@ pub(super) mod tests {
     /// Writer and reader threads over one lane, random message sizes.
     #[test]
     fn two_threads() {
-        let h = heap_layout(Sizes {
-            msg_capacity: 1024,
-            max_message: 200,
-            bulk_capacity: 256,
-            chunk: 64,
-        });
+        let h = heap_layout(Sizes { msg_capacity: 1024, max_message: 200, bulk_capacity: 256, chunk: 64 });
         let l = h.layout.msg;
         let n: u32 = if cfg!(miri) { 300 } else { 100_000 };
         let size = |i: u32| (i.wrapping_mul(2654435761) % 201) as usize;

@@ -58,17 +58,12 @@ pub(crate) struct PageInfo {
 /// `len` rounded up to a multiple of `page` (a power of two).
 pub(crate) fn round_up(len: usize, page: usize) -> io::Result<usize> {
     debug_assert!(page.is_power_of_two());
-    len.checked_add(page - 1)
-        .map(|n| n & !(page - 1))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "region too large"))
+    len.checked_add(page - 1).map(|n| n & !(page - 1)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "region too large"))
 }
 
 /// `HugePages::Require` on a system (or build) without huge page support.
 pub(crate) fn huge_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "huge pages are not available for shared memory on this system",
-    )
+    io::Error::new(io::ErrorKind::Unsupported, "huge pages are not available for shared memory on this system")
 }
 
 /// A writable shared mapping of `len` bytes.
@@ -92,10 +87,7 @@ unsafe impl Send for SharedRegion {}
 unsafe impl Sync for SharedRegion {}
 
 fn invalid_data() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "not an adaptif-gatotkaca-eventfd shared memory object",
-    )
+    io::Error::new(io::ErrorKind::InvalidData, "not an adaptif-gatotkaca-eventfd shared memory object")
 }
 
 impl SharedRegion {
@@ -110,19 +102,10 @@ impl SharedRegion {
     /// the page size used), with the given page options.
     pub(crate) fn create_with(len: usize, opts: &RegionOptions) -> io::Result<Self> {
         if len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "shared memory length must not be zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "shared memory length must not be zero"));
         }
         let c = os::create(len, opts)?;
-        let region = Self {
-            ptr: c.ptr,
-            len: c.len,
-            page_size: c.page_size,
-            huge: c.huge,
-            handle: c.handle,
-        };
+        let region = Self { ptr: c.ptr, len: c.len, page_size: c.page_size, huge: c.huge, handle: c.handle };
         if opts.populate {
             region.populate();
         }
@@ -194,23 +177,13 @@ impl SharedRegion {
         }
         // SAFETY: validated; the caller guarantees we may own it.
         let handle = unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
-        Ok(Self {
-            ptr,
-            len,
-            page_size: info.page_size,
-            huge: info.huge,
-            handle,
-        })
+        Ok(Self { ptr, len, page_size: info.page_size, huge: info.huge, handle })
     }
 
     /// Like [`adopt`](Self::adopt) for a descriptor we already own (closed
     /// if it does not validate).
     #[cfg(unix)]
-    pub(crate) fn from_owned(
-        fd: std::os::fd::OwnedFd,
-        min_len: usize,
-        check: impl FnOnce(NonNull<u8>, usize) -> bool,
-    ) -> io::Result<Self> {
+    pub(crate) fn from_owned(fd: std::os::fd::OwnedFd, min_len: usize, check: impl FnOnce(NonNull<u8>, usize) -> bool) -> io::Result<Self> {
         let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
         // SAFETY: we own `fd`; on success ownership moves into the region.
         let region = unsafe { Self::adopt(raw, min_len, check) }?;
@@ -242,13 +215,7 @@ impl SharedRegion {
         }
         // SAFETY: validated; the caller guarantees we may own it.
         let handle = unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(raw) };
-        Ok(Self {
-            ptr,
-            len,
-            page_size: info.page_size,
-            huge: info.huge,
-            handle,
-        })
+        Ok(Self { ptr, len, page_size: info.page_size, huge: info.huge, handle })
     }
 
     /// Like [`adopt`](Self::adopt) for a handle we already own (closed if it
@@ -347,23 +314,13 @@ mod tests {
         assert!(!r.is_huge());
         let r = SharedRegion::create(r.page_size() + 1).unwrap();
         assert_eq!(r.len(), 2 * r.page_size());
-        assert_eq!(
-            SharedRegion::create(0).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            round_up(usize::MAX, 4096).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        assert_eq!(SharedRegion::create(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(round_up(usize::MAX, 4096).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn populate_and_prefer_give_a_usable_region() {
-        let opts = RegionOptions {
-            huge: HugePages::Prefer,
-            populate: true,
-            ..Default::default()
-        };
+        let opts = RegionOptions { huge: HugePages::Prefer, populate: true, ..Default::default() };
         let r = SharedRegion::create_with(3 << 20, &opts).unwrap();
         assert!(r.len() >= 3 << 20);
         // SAFETY: inside the region.

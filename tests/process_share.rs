@@ -20,8 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adaptif_gatotkaca_eventfd::{
-    ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkProcess, GkReceiver, GkSender,
-    GkSharedMemory,
+    ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkProcess, GkReceiver, GkSender, GkSharedMemory,
 };
 
 /// How the child gets the eventfd.
@@ -38,8 +37,7 @@ enum Via<'a> {
 
 fn spawn(role: &str, via: Via<'_>) -> Child {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
-        .env("GK_CHILD_ROLE", role);
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"]).env("GK_CHILD_ROLE", role);
     match via {
         Via::Env(token) => {
             cmd.env("GK_TOKEN", token);
@@ -71,8 +69,7 @@ fn spawn_inherited(efd: &GkEventFd, role: &str) -> Spawned {
 /// Spawns a child through the uniform process API (all OS).
 fn spawn_process(efd: &GkEventFd, role: &str) -> Spawned {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
-        .env("GK_CHILD_ROLE", role);
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"]).env("GK_CHILD_ROLE", role);
     let (child, mut peer) = GkProcess::spawn(&mut cmd).unwrap();
     peer.send(efd).unwrap();
     Spawned(child, Some(peer))
@@ -86,11 +83,7 @@ fn spawn_passed(efd: &GkEventFd, role: &str) -> Spawned {
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "gkefd-{}-{}.sock",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = std::env::temp_dir().join(format!("gkefd-{}-{}.sock", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let child = spawn(role, Via::Socket(&path));
@@ -130,11 +123,7 @@ fn join(Spawned(mut child, _keep): Spawned) {
 fn readable_within(efd: &GkEventFd, ms: i32) -> bool {
     #[cfg(unix)]
     {
-        let mut pfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(efd),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfd = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(efd), events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd.
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
         assert!(n >= 0);
@@ -143,11 +132,7 @@ fn readable_within(efd: &GkEventFd, ms: i32) -> bool {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET, WSAPOLLFD, WSAPoll};
-        let mut fd = WSAPOLLFD {
-            fd: std::os::windows::io::AsRawSocket::as_raw_socket(efd) as SOCKET,
-            events: POLLRDNORM,
-            revents: 0,
-        };
+        let mut fd = WSAPOLLFD { fd: std::os::windows::io::AsRawSocket::as_raw_socket(efd) as SOCKET, events: POLLRDNORM, revents: 0 };
         // SAFETY: one valid WSAPOLLFD; the socket is open.
         let n = unsafe { WSAPoll(&mut fd, 1, ms) };
         assert!(n >= 0);
@@ -177,10 +162,7 @@ fn child_entry() {
         // SAFETY: the parent made this token for this process, once.
         unsafe { GkEventFd::import(&token) }.expect("import")
     } else if std::env::var_os(adaptif_gatotkaca_eventfd::process::PARENT_ENV).is_some() {
-        GkProcess::from_parent()
-            .unwrap()
-            .recv()
-            .expect("GkProcess::recv")
+        GkProcess::from_parent().unwrap().recv().expect("GkProcess::recv")
     } else {
         receive()
     };
@@ -268,11 +250,7 @@ fn blocking_read_in_parent_woken_by_child() {
 #[test]
 fn children_contend_without_losing_counts() {
     let efd = GkEventFd::new(0, EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE).unwrap();
-    let children = vec![
-        spawn_inherited(&efd, "write_ones"),
-        spawn_passed(&efd, "write_ones"),
-        spawn_process(&efd, "write_ones"),
-    ];
+    let children = vec![spawn_inherited(&efd, "write_ones"), spawn_passed(&efd, "write_ones"), spawn_process(&efd, "write_ones")];
     let mut consumed = 0u64;
     let deadline = Instant::now() + Duration::from_secs(30);
     while consumed < 3_000 {
@@ -395,18 +373,11 @@ fn from_parent_without_parent_fails() {
 const MESSAGES: u32 = 500;
 
 fn message(i: u32) -> Vec<u8> {
-    (0..(i * 37 % 3000) as usize)
-        .map(|k| (k as u32 ^ i) as u8)
-        .collect()
+    (0..(i * 37 % 3000) as usize).map(|k| (k as u32 ^ i) as u8).collect()
 }
 
 fn channel() -> (GkSender, GkReceiver) {
-    GkChannel::with_options(ChannelOptions {
-        capacity: 1 << 16,
-        max_message: 4000,
-        ..Default::default()
-    })
-    .unwrap()
+    GkChannel::with_options(ChannelOptions { capacity: 1 << 16, max_message: 4000, ..Default::default() }).unwrap()
 }
 
 fn channel_child(role: &str) {
@@ -421,10 +392,7 @@ fn channel_child(role: &str) {
                 assert_eq!(buf, message(i), "message {i}");
             }
             // The parent drops its sender after the last message.
-            assert_eq!(
-                rx.recv_vec(&mut buf).unwrap_err().kind(),
-                ErrorKind::BrokenPipe
-            );
+            assert_eq!(rx.recv_vec(&mut buf).unwrap_err().kind(), ErrorKind::BrokenPipe);
         }
         // Receive the sender and write to the parent.
         "channel_send" => {
@@ -452,15 +420,12 @@ fn channel_child(role: &str) {
 const BULK_LEN: usize = 12 << 20;
 
 fn bulk_data() -> Vec<u8> {
-    (0..BULK_LEN as u32)
-        .map(|i| i.wrapping_mul(2654435761).rotate_left(7) as u8)
-        .collect()
+    (0..BULK_LEN as u32).map(|i| i.wrapping_mul(2654435761).rotate_left(7) as u8).collect()
 }
 
 fn spawn_channel_child(role: &str) -> (Child, GkProcess) {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
-        .env("GK_CHILD_ROLE", role);
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"]).env("GK_CHILD_ROLE", role);
     GkProcess::spawn(&mut cmd).unwrap()
 }
 
@@ -472,10 +437,7 @@ fn channel_parent_sends_child_receives() {
     // Our copy now belongs to the child: unusable here, and dropping it
     // doesn't close the channel.
     let mut rx = rx;
-    assert_eq!(
-        rx.next_len().unwrap_err().kind(),
-        ErrorKind::PermissionDenied
-    );
+    assert_eq!(rx.next_len().unwrap_err().kind(), ErrorKind::PermissionDenied);
     drop(rx);
     for i in 0..MESSAGES {
         tx.send(&message(i)).unwrap();
@@ -496,10 +458,7 @@ fn channel_child_sends_parent_receives() {
         assert_eq!(buf, message(i), "message {i}");
     }
     // The child exits after its last message: its sender is dropped.
-    assert_eq!(
-        rx.recv_vec(&mut buf).unwrap_err().kind(),
-        ErrorKind::BrokenPipe
-    );
+    assert_eq!(rx.recv_vec(&mut buf).unwrap_err().kind(), ErrorKind::BrokenPipe);
     join(Spawned(child, Some(peer)));
 }
 
@@ -512,11 +471,7 @@ fn channel_bulk_to_child_on_huge_pages() {
     } else {
         adaptif_gatotkaca_eventfd::HugePages::Prefer
     };
-    let (mut tx, rx) = GkChannel::with_options(ChannelOptions {
-        huge_pages,
-        ..Default::default()
-    })
-    .unwrap();
+    let (mut tx, rx) = GkChannel::with_options(ChannelOptions { huge_pages, ..Default::default() }).unwrap();
     let (child, mut peer) = spawn_channel_child("channel_bulk");
     peer.send(&rx).unwrap();
     drop(rx);
@@ -592,9 +547,6 @@ fn shared_memory_with_child() {
     // The child has exited; this process still has the memory.
     // SAFETY: no other process uses it any more.
     let mem = unsafe { shm.as_slice() };
-    assert!(
-        (half..SHM_LEN).all(|i| mem[i] == !shm_byte(i)),
-        "reply differs"
-    );
+    assert!((half..SHM_LEN).all(|i| mem[i] == !shm_byte(i)), "reply differs");
     assert!((0..half).all(|i| mem[i] == shm_byte(i)));
 }

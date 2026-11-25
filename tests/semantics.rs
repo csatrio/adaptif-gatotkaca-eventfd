@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use adaptif_gatotkaca_eventfd::{
-    EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, GkEventFd,
-};
+use adaptif_gatotkaca_eventfd::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, GkEventFd};
 
 fn nb() -> EfdFlags {
     EfdFlags::NONBLOCK
@@ -36,20 +34,11 @@ const SETTLE: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 fn is_readable(efd: &GkEventFd) -> bool {
     use std::os::fd::AsRawFd;
-    let mut pfd = libc::pollfd {
-        fd: efd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut pfd = libc::pollfd { fd: efd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd, zero timeout.
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(n >= 0, "poll: {}", io::Error::last_os_error());
-    assert_eq!(
-        pfd.revents & (libc::POLLERR | libc::POLLNVAL),
-        0,
-        "unexpected revents {:#x}",
-        pfd.revents
-    );
+    assert_eq!(pfd.revents & (libc::POLLERR | libc::POLLNVAL), 0, "unexpected revents {:#x}", pfd.revents);
     pfd.revents & libc::POLLIN != 0
 }
 
@@ -57,11 +46,7 @@ fn is_readable(efd: &GkEventFd) -> bool {
 fn is_readable(efd: &GkEventFd) -> bool {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
-    let mut pfd = WSAPOLLFD {
-        fd: efd.as_raw_socket() as _,
-        events: POLLRDNORM,
-        revents: 0,
-    };
+    let mut pfd = WSAPOLLFD { fd: efd.as_raw_socket() as _, events: POLLRDNORM, revents: 0 };
     // SAFETY: one valid WSAPOLLFD, zero timeout.
     let n = unsafe { WSAPoll(&mut pfd, 1, 0) };
     assert!(n >= 0, "WSAPoll: {}", io::Error::last_os_error());
@@ -159,10 +144,7 @@ fn blocking_write_is_unblocked_by_read() {
         })
     };
     thread::sleep(SETTLE);
-    assert!(
-        !done.load(Ordering::SeqCst),
-        "write should block while full"
-    );
+    assert!(!done.load(Ordering::SeqCst), "write should block while full");
 
     assert_eq!(efd.read().unwrap(), EFD_MAX);
     writer.join().unwrap();
@@ -247,10 +229,7 @@ fn io_read_write_use_8_byte_native_endian_buffers() {
     assert_eq!(kind(Read::read(&mut &efd, &mut buf)), ErrorKind::WouldBlock);
 
     // u64::MAX through io::Write is EINVAL too.
-    assert_eq!(
-        kind(Write::write(&mut &efd, &u64::MAX.to_ne_bytes())),
-        ErrorKind::InvalidInput
-    );
+    assert_eq!(kind(Write::write(&mut &efd, &u64::MAX.to_ne_bytes())), ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -258,16 +237,8 @@ fn io_short_buffers_are_invalid_input() {
     let efd = GkEventFd::new(3, nb()).unwrap();
     for len in 0..8 {
         let mut buf = vec![0u8; len];
-        assert_eq!(
-            kind(Read::read(&mut &efd, &mut buf)),
-            ErrorKind::InvalidInput,
-            "read len {len}"
-        );
-        assert_eq!(
-            kind(Write::write(&mut &efd, &buf)),
-            ErrorKind::InvalidInput,
-            "write len {len}"
-        );
+        assert_eq!(kind(Read::read(&mut &efd, &mut buf)), ErrorKind::InvalidInput, "read len {len}");
+        assert_eq!(kind(Write::write(&mut &efd, &buf)), ErrorKind::InvalidInput, "write len {len}");
     }
     // The short read did not consume the counter.
     assert_eq!(efd.read().unwrap(), 3);
@@ -437,17 +408,9 @@ fn readiness_random_sequence() {
 fn mpmc(semaphore: bool) {
     const PRODUCERS: u64 = 4;
     const CONSUMERS: usize = 4;
-    const WRITES: u64 = if cfg!(debug_assertions) {
-        2_000
-    } else {
-        20_000
-    };
+    const WRITES: u64 = if cfg!(debug_assertions) { 2_000 } else { 20_000 };
 
-    let flags = if semaphore {
-        EfdFlags::SEMAPHORE
-    } else {
-        EfdFlags::NONE
-    };
+    let flags = if semaphore { EfdFlags::SEMAPHORE } else { EfdFlags::NONE };
     let efd = Arc::new(GkEventFd::new(0, flags).unwrap());
     let consumed = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -558,17 +521,12 @@ fn concurrent_writers_conserve_total_nonblocking() {
 /// parallel, so callers compare with some slack.
 #[cfg(unix)]
 fn open_fd_count() -> usize {
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: getrlimit writes into a live local.
     assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
     let cap = lim.rlim_cur.min(1 << 16) as libc::c_int;
     // SAFETY: F_GETFD only queries the descriptor table.
-    (0..cap)
-        .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1)
-        .count()
+    (0..cap).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1).count()
 }
 
 #[cfg(unix)]
@@ -577,9 +535,7 @@ fn drop_releases_descriptors() {
     let before = open_fd_count();
     for i in 0..10_000u32 {
         let efd = GkEventFd::new(i, nb()).unwrap_or_else(|e| panic!("iteration {i}: {e}"));
-        let clone = efd
-            .try_clone()
-            .unwrap_or_else(|e| panic!("iteration {i}: {e}"));
+        let clone = efd.try_clone().unwrap_or_else(|e| panic!("iteration {i}: {e}"));
         clone.write(1).unwrap();
         drop(efd);
         drop(clone);
@@ -596,9 +552,7 @@ fn drop_releases_sockets() {
     // TCP connections linger in TIME_WAIT.
     for i in 0..1_000u32 {
         let efd = GkEventFd::new(i, nb()).unwrap_or_else(|e| panic!("iteration {i}: {e}"));
-        let clone = efd
-            .try_clone()
-            .unwrap_or_else(|e| panic!("iteration {i}: {e}"));
+        let clone = efd.try_clone().unwrap_or_else(|e| panic!("iteration {i}: {e}"));
         clone.write(1).unwrap();
         drop(efd);
         drop(clone);

@@ -48,13 +48,11 @@ enum Step {
 type Outcome = Result<u64, i32>;
 
 fn errno_of(e: &io::Error) -> i32 {
-    e.raw_os_error()
-        .unwrap_or_else(|| panic!("shim error without errno: {e:?}"))
+    e.raw_os_error().unwrap_or_else(|| panic!("shim error without errno: {e:?}"))
 }
 
 fn kernel_eventfd(initval: u32, semaphore: bool) -> OwnedFd {
-    let flags =
-        libc::EFD_NONBLOCK | libc::EFD_CLOEXEC | if semaphore { libc::EFD_SEMAPHORE } else { 0 };
+    let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC | if semaphore { libc::EFD_SEMAPHORE } else { 0 };
     // SAFETY: plain syscall.
     let fd = unsafe { libc::eventfd(initval, flags) };
     assert!(fd >= 0, "eventfd: {}", io::Error::last_os_error());
@@ -127,11 +125,7 @@ fn kernel_op(fd: RawFd, op: &Op) -> Outcome {
 
 /// `POLLIN` readiness, with a zero timeout.
 fn pollin(fd: RawFd) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd.
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(n >= 0, "poll: {}", io::Error::last_os_error());
@@ -168,11 +162,7 @@ fn initval() -> impl Strategy<Value = u32> {
 }
 
 fn flags(semaphore: bool) -> EfdFlags {
-    if semaphore {
-        EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE
-    } else {
-        EfdFlags::NONBLOCK
-    }
+    if semaphore { EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE } else { EfdFlags::NONBLOCK }
 }
 
 fn run(initval: u32, semaphore: bool, ops: &[Op]) -> Result<(), TestCaseError> {
@@ -187,13 +177,7 @@ fn run_steps(initval: u32, semaphore: bool, steps: &[Step]) -> Result<(), TestCa
 
     let check_ready = |shim: &[GkEventFd], kernel: &[OwnedFd], what: &str| {
         for (i, (s, k)) in shim.iter().zip(kernel).enumerate() {
-            prop_assert_eq!(
-                pollin(s.as_raw_fd()),
-                pollin(k.as_raw_fd()),
-                "readiness of handle {} after {}",
-                i,
-                what
-            );
+            prop_assert_eq!(pollin(s.as_raw_fd()), pollin(k.as_raw_fd()), "readiness of handle {} after {}", i, what);
         }
         Ok(())
     };
@@ -276,10 +260,7 @@ fn run_compat(initval: u32, semaphore: bool, steps: &[CStep]) -> Result<(), Test
             let n = shim.len();
             match *step {
                 CStep::Write(h, v) => {
-                    let (s, k) = (
-                        compat_write(shim[h % n], v),
-                        kernel_write(kernel[h % n], v, 8),
-                    );
+                    let (s, k) = (compat_write(shim[h % n], v), kernel_write(kernel[h % n], v, 8));
                     prop_assert_eq!(s, k, "step #{} {:?}", i, step);
                 }
                 CStep::Read(h) => {
@@ -306,12 +287,7 @@ fn run_compat(initval: u32, semaphore: bool, steps: &[CStep]) -> Result<(), Test
                 CStep::Dup2(a, b) => {
                     let (a, b) = (a % n, b % n);
                     // SAFETY: both targets are descriptors we own.
-                    let (s, k) = unsafe {
-                        (
-                            compat::eventfd_dup2(shim[a], shim[b]),
-                            libc::dup2(kernel[a], kernel[b]),
-                        )
-                    };
+                    let (s, k) = unsafe { (compat::eventfd_dup2(shim[a], shim[b]), libc::dup2(kernel[a], kernel[b])) };
                     prop_assert_eq!(s, shim[b], "step #{} {:?}", i, step);
                     prop_assert_eq!(k, kernel[b], "step #{} {:?}", i, step);
                 }
@@ -325,14 +301,7 @@ fn run_compat(initval: u32, semaphore: bool, steps: &[CStep]) -> Result<(), Test
                 }
             }
             for (j, (&s, &k)) in shim.iter().zip(&kernel).enumerate() {
-                prop_assert_eq!(
-                    pollin(s),
-                    pollin(k),
-                    "readiness of {} after step #{} {:?}",
-                    j,
-                    i,
-                    step
-                );
+                prop_assert_eq!(pollin(s), pollin(k), "readiness of {} after step #{} {:?}", j, i, step);
             }
         }
         // Every handle must still see the same final counter.
@@ -418,31 +387,14 @@ fn edge_cases_match_kernel() {
     use Op::*;
     let cases: &[(u32, bool, &[Op])] = &[
         (0, false, &[Write(EFD_MAX), Write(1), Write(0), Read, Read]),
-        (
-            0,
-            true,
-            &[Write(EFD_MAX), Write(1), Read, Write(1), Write(1)],
-        ),
-        (
-            u32::MAX,
-            false,
-            &[Write(EFD_MAX - u64::from(u32::MAX)), Write(1), Read],
-        ),
+        (0, true, &[Write(EFD_MAX), Write(1), Read, Write(1), Write(1)]),
+        (u32::MAX, false, &[Write(EFD_MAX - u64::from(u32::MAX)), Write(1), Read]),
         (0, false, &[Write(u64::MAX), Read, Write(0), Read]),
         (3, true, &[Read, Read, Read, Read, Write(0), Read]),
-        (
-            1,
-            false,
-            &[ReadBuf(7), ReadBuf(8), WriteBuf(5, 4), WriteBuf(5, 9), Read],
-        ),
-        (
-            0,
-            false,
-            &[WriteBuf(u64::MAX, 8), WriteBuf(u64::MAX, 16), Read],
-        ),
+        (1, false, &[ReadBuf(7), ReadBuf(8), WriteBuf(5, 4), WriteBuf(5, 9), Read]),
+        (0, false, &[WriteBuf(u64::MAX, 8), WriteBuf(u64::MAX, 16), Read]),
     ];
     for (initval, semaphore, ops) in cases {
-        run(*initval, *semaphore, ops)
-            .unwrap_or_else(|e| panic!("init {initval} sem {semaphore} {ops:?}: {e}"));
+        run(*initval, *semaphore, ops).unwrap_or_else(|e| panic!("init {initval} sem {semaphore} {ops:?}: {e}"));
     }
 }

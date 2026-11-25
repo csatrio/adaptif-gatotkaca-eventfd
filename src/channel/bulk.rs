@@ -106,28 +106,15 @@ impl GkSender {
     /// reading any data).
     pub fn bulk_writer_kind(&mut self, kind: u16, len: Option<u64>) -> io::Result<BulkWriter<'_>> {
         let id = self.bulk_begin(kind, len)?;
-        Ok(BulkWriter {
-            sender: self,
-            id,
-            paused: false,
-        })
+        Ok(BulkWriter { sender: self, id, paused: false })
     }
 
     /// Resumes the transfer left open by [`BulkWriter::pause`] (for event
     /// loops that also use the message lane in between). Fails with
     /// [`io::ErrorKind::InvalidInput`] if no transfer is open.
     pub fn resume_bulk(&mut self) -> io::Result<BulkWriter<'_>> {
-        let id = self
-            .bulk
-            .cur
-            .as_ref()
-            .map(|tx| tx.id)
-            .ok_or_else(|| invalid("no bulk transfer in progress"))?;
-        Ok(BulkWriter {
-            sender: self,
-            id,
-            paused: false,
-        })
+        let id = self.bulk.cur.as_ref().map(|tx| tx.id).ok_or_else(|| invalid("no bulk transfer in progress"))?;
+        Ok(BulkWriter { sender: self, id, paused: false })
     }
 
     /// Sends `data` (any size) as one bulk transfer and returns its id.
@@ -142,16 +129,14 @@ impl GkSender {
     /// `kind`.
     pub fn send_bulk_kind(&mut self, kind: u16, data: &[u8]) -> io::Result<u64> {
         let nonblocking = std::mem::replace(&mut self.end.nonblocking, false);
-        let r = self
-            .bulk_begin(kind, Some(data.len() as u64))
-            .and_then(|id| {
-                let mut off = 0;
-                while off < data.len() {
-                    off += self.bulk_write(&data[off..])?;
-                }
-                self.bulk_finish()?;
-                Ok(id)
-            });
+        let r = self.bulk_begin(kind, Some(data.len() as u64)).and_then(|id| {
+            let mut off = 0;
+            while off < data.len() {
+                off += self.bulk_write(&data[off..])?;
+            }
+            self.bulk_finish()?;
+            Ok(id)
+        });
         if r.is_err() {
             let _ = self.bulk_abort();
         }
@@ -167,15 +152,7 @@ impl GkSender {
         }
         self.bulk.next_id += 1;
         let id = self.bulk.next_id;
-        self.bulk.cur = Some(Tx {
-            id,
-            kind,
-            seq: 0,
-            written: 0,
-            total: len,
-            started: false,
-            complete: false,
-        });
+        self.bulk.cur = Some(Tx { id, kind, seq: 0, written: 0, total: len, started: false, complete: false });
         Ok(id)
     }
 
@@ -199,11 +176,7 @@ impl GkSender {
                     h.write(id);
                     h.add(1).write(seq);
                     h.add(2).write(total.unwrap_or(0));
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        p.add(BULK_HDR as usize),
-                        data.len(),
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(BULK_HDR as usize), data.len());
                     self.bulk_tail = lane.publish(self.bulk_tail, pad, idx, len, flags, kind);
                 }
                 if let Some(tx) = self.bulk.cur.as_mut() {
@@ -213,10 +186,7 @@ impl GkSender {
                 return Ok(true);
             }
             let tail = self.bulk_tail;
-            match self
-                .end
-                .wait(BULK, nonblocking, || lane.reserve(tail, len).is_some())
-            {
+            match self.end.wait(BULK, nonblocking, || lane.reserve(tail, len).is_some()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) => return Err(e),
@@ -227,11 +197,7 @@ impl GkSender {
     /// Writes data of the current transfer (see [`BulkWriter`]).
     pub(crate) fn bulk_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.end.check_owner()?;
-        let tx = self
-            .bulk
-            .cur
-            .as_ref()
-            .ok_or_else(|| invalid("no bulk transfer in progress"))?;
+        let tx = self.bulk.cur.as_ref().ok_or_else(|| invalid("no bulk transfer in progress"))?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -277,11 +243,7 @@ impl GkSender {
     /// Ends the current transfer (see [`BulkWriter::finish`]).
     pub(crate) fn bulk_finish(&mut self) -> io::Result<()> {
         self.end.check_owner()?;
-        let tx = self
-            .bulk
-            .cur
-            .as_ref()
-            .ok_or_else(|| invalid("no bulk transfer in progress"))?;
+        let tx = self.bulk.cur.as_ref().ok_or_else(|| invalid("no bulk transfer in progress"))?;
         if !tx.complete {
             if let Some(total) = tx.total {
                 if tx.written != total {
@@ -304,11 +266,7 @@ impl GkSender {
         let Some(tx) = self.bulk.cur.as_ref() else {
             return Ok(());
         };
-        let r = if tx.started && !tx.complete {
-            self.bulk_record(&[], flag::ABORT, false).map(drop)
-        } else {
-            Ok(())
-        };
+        let r = if tx.started && !tx.complete { self.bulk_record(&[], flag::ABORT, false).map(drop) } else { Ok(()) };
         self.bulk.cur = None;
         r
     }
@@ -374,18 +332,11 @@ impl GkReceiver {
     /// transfer was read. A transfer left open with [`BulkReader::pause`] is
     /// resumed; one whose reader was dropped early is discarded first.
     pub fn bulk_reader(&mut self) -> io::Result<BulkReader<'_>> {
-        let resume = self
-            .bulk
-            .cur
-            .as_ref()
-            .is_some_and(|rx| !rx.done && !rx.skipping);
+        let resume = self.bulk.cur.as_ref().is_some_and(|rx| !rx.done && !rx.skipping);
         if !resume {
             self.bulk_begin()?;
         }
-        Ok(BulkReader {
-            rx: self,
-            paused: false,
-        })
+        Ok(BulkReader { rx: self, paused: false })
     }
 
     /// Receives the next transfer into `out` (replacing its contents) and
@@ -397,11 +348,7 @@ impl GkReceiver {
 
     /// Like [`recv_bulk_vec`](Self::recv_bulk_vec), also returning the
     /// transfer's kind: `(kind, id)`.
-    pub fn recv_bulk_vec_kind(
-        &mut self,
-        out: &mut Vec<u8>,
-        limit: usize,
-    ) -> io::Result<(u16, u64)> {
+    pub fn recv_bulk_vec_kind(&mut self, out: &mut Vec<u8>, limit: usize) -> io::Result<(u16, u64)> {
         let (id, total) = self.bulk_begin()?;
         let kind = self.bulk_info().map_or(KIND_UNSPECIFIED, |i| i.3);
         out.clear();
@@ -435,8 +382,7 @@ impl GkReceiver {
                 return Ok(rec);
             }
             let (lane, head, nb) = (*self.end.lane(BULK), self.bulk_head, self.end.nonblocking);
-            self.end
-                .wait(BULK, nb, || !matches!(lane.peek(head), Ok(None)))?;
+            self.end.wait(BULK, nb, || !matches!(lane.peek(head), Ok(None)))?;
         }
     }
 
@@ -463,21 +409,10 @@ impl GkReceiver {
         let rec = self.bulk_rec()?;
         let c = parse(&rec)?;
         if rec.flags & flag::FIRST == 0 || c.seq != 0 {
-            return Err(corrupt(
-                "bulk lane out of sync (expected the start of a transfer)",
-            ));
+            return Err(corrupt("bulk lane out of sync (expected the start of a transfer)"));
         }
         let total = (rec.flags & flag::LEN_KNOWN != 0).then_some(c.total);
-        self.bulk.cur = Some(Rx {
-            id: c.id,
-            kind: rec.kind,
-            next_seq: 0,
-            received: 0,
-            total,
-            off: 0,
-            done: false,
-            skipping: false,
-        });
+        self.bulk.cur = Some(Rx { id: c.id, kind: rec.kind, next_seq: 0, received: 0, total, off: 0, done: false, skipping: false });
         Ok((c.id, total))
     }
 
@@ -506,10 +441,7 @@ impl GkReceiver {
         if rec.flags & flag::ABORT != 0 {
             self.bulk_release(rec.next);
             self.bulk.cur = None;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "the sender abandoned the bulk transfer",
-            ));
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "the sender abandoned the bulk transfer"));
         }
         Ok(Some((rec, c)))
     }
@@ -532,9 +464,7 @@ impl GkReceiver {
         self.bulk_release(rec.next);
         if mismatch {
             self.bulk.cur = None;
-            return Err(corrupt(
-                "bulk transfer length differs from its declared length",
-            ));
+            return Err(corrupt("bulk transfer length differs from its declared length"));
         }
         Ok(())
     }
@@ -556,9 +486,7 @@ impl GkReceiver {
             }
             // SAFETY: `n` unread bytes of a published record we own until
             // it is released in `bulk_advance`.
-            let r = (f.take().expect("called once"))(unsafe {
-                std::slice::from_raw_parts(c.data.add(off), n)
-            });
+            let r = (f.take().expect("called once"))(unsafe { std::slice::from_raw_parts(c.data.add(off), n) });
             self.bulk_advance(&rec, &c, n)?;
             return Ok(Some(r));
         }
@@ -595,10 +523,7 @@ impl GkReceiver {
 
     /// The current transfer: `(id, declared length, bytes read, kind)`.
     pub(crate) fn bulk_info(&self) -> Option<(u64, Option<u64>, u64, u16)> {
-        self.bulk
-            .cur
-            .as_ref()
-            .map(|rx| (rx.id, rx.total, rx.received, rx.kind))
+        self.bulk.cur.as_ref().map(|rx| (rx.id, rx.total, rx.received, rx.kind))
     }
 }
 

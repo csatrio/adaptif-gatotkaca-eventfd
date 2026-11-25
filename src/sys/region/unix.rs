@@ -42,11 +42,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use super::{Created, HugePages, PageInfo, RegionOptions};
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
-    if r == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(r)
-    }
+    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(r) }
 }
 
 fn too_large() -> io::Error {
@@ -62,12 +58,7 @@ const SIZE_SEALS: libc::c_int = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn sealable_memfd(extra: libc::c_uint) -> io::Result<OwnedFd> {
     // SAFETY: a static C string name (debugging only) and flags.
-    let fd = cvt(unsafe {
-        libc::memfd_create(
-            c"gk-eventfd".as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | extra,
-        )
-    })?;
+    let fd = cvt(unsafe { libc::memfd_create(c"gk-eventfd".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | extra) })?;
     // SAFETY: a fresh descriptor we own.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -76,14 +67,7 @@ fn sealable_memfd(extra: libc::c_uint) -> io::Result<OwnedFd> {
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn seal_size(fd: &OwnedFd) -> io::Result<()> {
     // SAFETY: plain fcntl on our descriptor.
-    cvt(unsafe {
-        libc::fcntl(
-            fd.as_raw_fd(),
-            libc::F_ADD_SEALS,
-            SIZE_SEALS | libc::F_SEAL_SEAL,
-        )
-    })
-    .map(drop)
+    cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SIZE_SEALS | libc::F_SEAL_SEAL) }).map(drop)
 }
 
 /// `InvalidData` unless the size of `raw` is sealed.
@@ -110,25 +94,11 @@ fn anon_shm() -> io::Result<OwnedFd> {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         // macOS limits names to 31 bytes: "/gkefd.<pid>.<seq>.<nanos>".
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let name = format!(
-            "/gkefd.{:x}.{:x}.{:x}",
-            current_pid(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            nanos & 0xff_ffff
-        );
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let name = format!("/gkefd.{:x}.{:x}.{:x}", current_pid(), SEQ.fetch_add(1, Ordering::Relaxed), nanos & 0xff_ffff);
         let cname = std::ffi::CString::new(name).expect("no NUL in name");
         // SAFETY: valid C string; O_EXCL never opens someone else's object.
-        let fd = unsafe {
-            libc::shm_open(
-                cname.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                0o600 as libc::c_uint,
-            )
-        };
+        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
         if fd == -1 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::AlreadyExists {
@@ -150,16 +120,7 @@ fn anon_shm() -> io::Result<OwnedFd> {
 /// Maps `len` bytes of `fd` shared and writable.
 pub(crate) fn map(fd: RawFd, len: usize) -> io::Result<NonNull<u8>> {
     // SAFETY: a fresh shared mapping of `fd`, no address hint.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
-    };
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
@@ -182,13 +143,7 @@ fn finish(fd: OwnedFd, len: usize, page_size: usize, huge: bool) -> io::Result<C
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     seal_size(&fd)?;
     let ptr = map(fd.as_raw_fd(), len)?;
-    Ok(Created {
-        ptr,
-        len,
-        page_size,
-        huge,
-        handle: fd,
-    })
+    Ok(Created { ptr, len, page_size, huge, handle: fd })
 }
 
 /// A normal-page object. `thp`: ask for transparent huge pages (Linux).
@@ -211,10 +166,7 @@ fn create_normal(len: usize, thp: bool) -> io::Result<Created<OwnedFd>> {
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn check_huge_size(size: usize) -> io::Result<u32> {
     if !size.is_power_of_two() || size <= base_page_size() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "huge page size must be a power of two larger than the normal page size",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "huge page size must be a power of two larger than the normal page size"));
     }
     Ok(size.trailing_zeros())
 }
@@ -246,10 +198,7 @@ fn hugetlb_page_size(raw: RawFd) -> io::Result<Option<usize>> {
 fn hugetlb_setup_error(e: io::Error) -> io::Error {
     match e.raw_os_error() {
         Some(libc::EINVAL | libc::ENOSYS | libc::ENODEV | libc::ENOENT | libc::EOPNOTSUPP) => {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("huge pages are not available for shared memory: {e}"),
-            )
+            io::Error::new(io::ErrorKind::Unsupported, format!("huge pages are not available for shared memory: {e}"))
         }
         _ => e,
     }
@@ -270,10 +219,7 @@ fn create_huge(len: usize, huge_size: Option<usize>) -> io::Result<Created<Owned
     // MAP_NORESERVE), so a short pool fails here with ENOMEM.
     let c = finish(fd, len, page, true).map_err(|e| {
         if e.raw_os_error() == Some(libc::ENOMEM) {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "not enough free huge pages for the shared memory region",
-            )
+            io::Error::new(io::ErrorKind::OutOfMemory, "not enough free huge pages for the shared memory region")
         } else {
             hugetlb_setup_error(e)
         }
@@ -288,10 +234,7 @@ fn create_huge(len: usize, huge_size: Option<usize>) -> io::Result<Created<Owned
         if e.raw_os_error() != Some(libc::EINVAL) {
             // SAFETY: our fresh view, not used afterwards.
             unsafe { unmap(c.ptr, c.len) };
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("could not populate huge pages: {e}"),
-            ));
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("could not populate huge pages: {e}")));
         }
     }
     Ok(c)
@@ -345,14 +288,7 @@ pub(crate) fn create(len: usize, opts: &RegionOptions) -> io::Result<Created<Own
         HugePages::Off => create_normal(len, false),
         HugePages::Require => create_huge(len, opts.huge_size),
         HugePages::Prefer => match create_huge(len, opts.huge_size) {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::Unsupported
-                        | io::ErrorKind::OutOfMemory
-                        | io::ErrorKind::PermissionDenied
-                ) =>
-            {
+            Err(e) if matches!(e.kind(), io::ErrorKind::Unsupported | io::ErrorKind::OutOfMemory | io::ErrorKind::PermissionDenied) => {
                 create_normal(len, true)
             }
             r => r,
@@ -376,14 +312,8 @@ pub(crate) fn inspect(raw: RawFd) -> io::Result<PageInfo> {
         check_sealed(raw)?;
         let huge = hugetlb_page_size(raw).map_err(|_| super::invalid_data())?;
         Ok(match huge {
-            Some(page_size) => PageInfo {
-                page_size,
-                huge: true,
-            },
-            None => PageInfo {
-                page_size: base_page_size(),
-                huge: false,
-            },
+            Some(page_size) => PageInfo { page_size, huge: true },
+            None => PageInfo { page_size: base_page_size(), huge: false },
         })
     }
     #[cfg(target_os = "freebsd")]
@@ -394,32 +324,19 @@ pub(crate) fn inspect(raw: RawFd) -> io::Result<PageInfo> {
         // SAFETY: the ioctl only writes a shm_largepage_conf through a valid
         // pointer; it fails on anything that is not a largepage object.
         let r = unsafe { libc::ioctl(raw, FIOGSHMLPGCNF, &mut conf) };
-        let psind = if r == 0 {
-            usize::try_from(conf.psind).unwrap_or(0)
-        } else {
-            0
-        };
+        let psind = if r == 0 { usize::try_from(conf.psind).unwrap_or(0) } else { 0 };
         if psind > 0 {
             let page_size = *page_sizes().get(psind).ok_or_else(super::invalid_data)?;
-            return Ok(PageInfo {
-                page_size,
-                huge: true,
-            });
+            return Ok(PageInfo { page_size, huge: true });
         }
-        Ok(PageInfo {
-            page_size: base_page_size(),
-            huge: false,
-        })
+        Ok(PageInfo { page_size: base_page_size(), huge: false })
     }
     // macOS/iOS: sizes can't change after the first ftruncate. Elsewhere
     // nothing can be checked (see the module docs).
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     {
         let _ = raw;
-        Ok(PageInfo {
-            page_size: base_page_size(),
-            huge: false,
-        })
+        Ok(PageInfo { page_size: base_page_size(), huge: false })
     }
 }
 
@@ -428,10 +345,7 @@ pub(crate) fn object_len(raw: RawFd) -> io::Result<usize> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat writes a stat through a valid pointer; bad values fail.
     if unsafe { libc::fstat(raw, st.as_mut_ptr()) } != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "shared memory descriptor is not open",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "shared memory descriptor is not open"));
     }
     // SAFETY: fstat succeeded. No file-type check: macOS reports POSIX
     // shared memory objects without S_IFREG; callers check contents.
@@ -480,14 +394,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a live siginfo_t. WNOWAIT leaves the child
     // waitable, so this never steals an exit status from the application.
-    let r = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
+    let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
     if r == 0 {
         // Our child: si_pid is set only if it has exited.
         // SAFETY: waitid filled `info` (or left it zeroed for "no change").
@@ -507,11 +414,7 @@ mod tests {
     use super::*;
 
     fn opts(huge: HugePages, huge_size: Option<usize>) -> RegionOptions {
-        RegionOptions {
-            huge,
-            huge_size,
-            populate: false,
-        }
+        RegionOptions { huge, huge_size, populate: false }
     }
 
     fn truncate(fd: RawFd, len: usize) -> io::Result<()> {
@@ -541,11 +444,7 @@ mod tests {
     /// sealable at all).
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     fn hand_made(seals: Option<libc::c_int>) -> OwnedFd {
-        let flags = if seals.is_some() {
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING
-        } else {
-            libc::MFD_CLOEXEC
-        };
+        let flags = if seals.is_some() { libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING } else { libc::MFD_CLOEXEC };
         // SAFETY: static name and flags.
         let fd = cvt(unsafe { libc::memfd_create(c"gk-test".as_ptr(), flags) }).unwrap();
         // SAFETY: a fresh descriptor we own.
@@ -561,12 +460,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     #[test]
     fn unsealed_objects_are_refused() {
-        let cases = [
-            None,
-            Some(0),
-            Some(libc::F_SEAL_SHRINK),
-            Some(libc::F_SEAL_GROW | libc::F_SEAL_SEAL),
-        ];
+        let cases = [None, Some(0), Some(libc::F_SEAL_SHRINK), Some(libc::F_SEAL_GROW | libc::F_SEAL_SEAL)];
         for seals in cases {
             let fd = hand_made(seals);
             let err = inspect(fd.as_raw_fd()).unwrap_err();
@@ -589,13 +483,7 @@ mod tests {
     fn other_files_are_refused() {
         let name = std::ffi::CString::new(format!("/gk-test-{}", current_pid())).unwrap();
         // SAFETY: valid C string; the name is unlinked right away.
-        let fd = unsafe {
-            libc::shm_open(
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                0o600 as libc::mode_t,
-            )
-        };
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::mode_t) };
         if fd != -1 {
             // SAFETY: fresh descriptor we own; removes our own name.
             let fd = unsafe {
@@ -654,20 +542,12 @@ mod tests {
     fn require_gives_huge_pages_or_a_clear_error() {
         let must = std::env::var("GK_TEST_HUGEPAGES").as_deref() == Ok("1");
         for size in [None, Some(2 << 20)] {
-            let o = RegionOptions {
-                populate: true,
-                ..opts(HugePages::Require, size)
-            };
+            let o = RegionOptions { populate: true, ..opts(HugePages::Require, size) };
             let r = match SharedRegion::create_with(3 << 20, &o) {
                 Ok(r) => r,
                 Err(e) if !must => {
                     assert!(
-                        matches!(
-                            e.kind(),
-                            io::ErrorKind::OutOfMemory
-                                | io::ErrorKind::Unsupported
-                                | io::ErrorKind::PermissionDenied
-                        ),
+                        matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied),
                         "{e:?}"
                     );
                     continue;
@@ -685,18 +565,8 @@ mod tests {
             unsafe { *r.ptr().as_ptr().add(r.len() - 1) = 7 };
             // Sealed like any other.
             let fd = r.fd().as_raw_fd();
-            assert_eq!(
-                truncate(fd, r.len() - r.page_size())
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(libc::EPERM)
-            );
-            assert_eq!(
-                truncate(fd, r.len() + r.page_size())
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(libc::EPERM)
-            );
+            assert_eq!(truncate(fd, r.len() - r.page_size()).unwrap_err().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(truncate(fd, r.len() + r.page_size()).unwrap_err().raw_os_error(), Some(libc::EPERM));
             // A received copy is recognised as huge.
             let info = inspect(fd).unwrap();
             assert!(info.huge);
@@ -715,22 +585,13 @@ mod tests {
         // A size no x86/arm system has: unsupported (or no pool).
         let err = SharedRegion::create_with(10, &opts(HugePages::Require, Some(1 << 40)));
         if let Err(e) = err {
-            assert!(
-                matches!(
-                    e.kind(),
-                    io::ErrorKind::OutOfMemory | io::ErrorKind::Unsupported
-                ),
-                "{e:?}"
-            );
+            assert!(matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::Unsupported), "{e:?}");
         }
     }
 
     /// More huge pages than the pool has: an error at creation (never
     /// SIGBUS later), and `Prefer` falls back to normal pages.
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        target_pointer_width = "64"
-    ))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
     #[test]
     fn exhausted_pool_is_out_of_memory() {
         const LEN: usize = 16 << 30;
@@ -738,13 +599,7 @@ mod tests {
             match SharedRegion::create_with(LEN, &opts(HugePages::Require, size)) {
                 // A machine with 16 GiB of huge pages reserved.
                 Ok(r) => assert!(r.is_huge()),
-                Err(e) => assert!(
-                    matches!(
-                        e.kind(),
-                        io::ErrorKind::OutOfMemory | io::ErrorKind::Unsupported
-                    ),
-                    "{e:?}"
-                ),
+                Err(e) => assert!(matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::Unsupported), "{e:?}"),
             }
             let r = SharedRegion::create_with(LEN, &opts(HugePages::Prefer, size)).unwrap();
             assert_eq!(r.len(), LEN);

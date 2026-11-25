@@ -35,9 +35,7 @@ mod unix {
     }
 
     async fn consume(flags: EfdFlags, writes: u64) -> u64 {
-        let efd = Arc::new(register(
-            GkEventFd::new(0, flags | EfdFlags::NONBLOCK).unwrap(),
-        ));
+        let efd = Arc::new(register(GkEventFd::new(0, flags | EfdFlags::NONBLOCK).unwrap()));
         // Expected sum: 1 + 2 + ... + writes.
         let expected = writes * (writes + 1) / 2;
 
@@ -55,18 +53,13 @@ mod unix {
 
         let mut sum = 0;
         while sum < expected {
-            sum += tokio::time::timeout(Duration::from_secs(10), read_async(&efd))
-                .await
-                .expect("timed out waiting for the producer")
-                .unwrap();
+            sum +=
+                tokio::time::timeout(Duration::from_secs(10), read_async(&efd)).await.expect("timed out waiting for the producer").unwrap();
         }
         producer.join().unwrap();
         assert_eq!(sum, expected);
         // Nothing left over.
-        assert_eq!(
-            efd.get_ref().read().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        assert_eq!(efd.get_ref().read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
         sum
     }
 
@@ -115,10 +108,7 @@ mod unix {
         base.write(TASKS).unwrap();
         let mut total = 0;
         for h in handles {
-            total += tokio::time::timeout(Duration::from_secs(10), h)
-                .await
-                .expect("waiter timed out")
-                .unwrap();
+            total += tokio::time::timeout(Duration::from_secs(10), h).await.expect("waiter timed out").unwrap();
         }
         assert_eq!(total, TASKS);
     }
@@ -130,9 +120,7 @@ mod windows {
 
     /// Blocking read on tokio's blocking pool.
     async fn read_blocking(efd: Arc<GkEventFd>) -> std::io::Result<u64> {
-        tokio::task::spawn_blocking(move || efd.read())
-            .await
-            .expect("blocking task panicked")
+        tokio::task::spawn_blocking(move || efd.read()).await.expect("blocking task panicked")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,12 +155,7 @@ async fn channel_receiver_with_asyncfd() {
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
 
-    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
-        capacity: 4096,
-        max_message: 64,
-        ..Default::default()
-    })
-    .unwrap();
+    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions { capacity: 4096, max_message: 64, ..Default::default() }).unwrap();
     rx.set_nonblocking(true);
     // SAFETY: the receiver owns its pollable descriptor until dropped, and
     // `as_raw_fd` always returns that same descriptor.

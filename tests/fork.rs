@@ -43,13 +43,7 @@ fn try_wait(pid: libc::pid_t) -> Option<i32> {
     // SAFETY: waits for our own child without blocking.
     let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
     assert!(r >= 0, "waitpid failed");
-    (r == pid).then(|| {
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        }
-    })
+    (r == pid).then(|| if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 })
 }
 
 /// Waits up to 10 s for `pid` and asserts it succeeded (kills it on timeout).
@@ -73,11 +67,7 @@ fn join(pid: libc::pid_t) {
 }
 
 fn readable(efd: &GkEventFd) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: efd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut pfd = libc::pollfd { fd: efd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd, zero timeout.
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(n >= 0);
@@ -93,9 +83,7 @@ fn child_sees_parent_writes_and_back() {
     let _s = serial();
     let efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
     efd.write(7).unwrap();
-    join(spawn(|| {
-        efd.read().ok() == Some(7) && would_block(efd.read()) && efd.write(5).is_ok()
-    }));
+    join(spawn(|| efd.read().ok() == Some(7) && would_block(efd.read()) && efd.write(5).is_ok()));
     assert!(readable(&efd));
     assert_eq!(efd.read().unwrap(), 5);
     assert!(!readable(&efd));
@@ -165,9 +153,7 @@ fn processes_contend_without_losing_counts() {
     const CHILDREN: u64 = 4;
     const WRITES: u64 = 2_000;
     let efd = GkEventFd::new(0, EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE).unwrap();
-    let children: Vec<_> = (0..CHILDREN)
-        .map(|_| spawn(|| (0..WRITES).all(|_| efd.write(1).is_ok())))
-        .collect();
+    let children: Vec<_> = (0..CHILDREN).map(|_| spawn(|| (0..WRITES).all(|_| efd.write(1).is_ok()))).collect();
     let mut consumed = 0u64;
     let deadline = Instant::now() + Duration::from_secs(20);
     while consumed < CHILDREN * WRITES {

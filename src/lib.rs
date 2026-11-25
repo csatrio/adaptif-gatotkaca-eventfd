@@ -34,12 +34,15 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-#![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use core::ffi::c_int;
 use std::fmt;
 use std::io;
+
+// Only the shim backends key their descriptor registry with it (`compat`).
+#[cfg(gk_native)]
+use nohash_hasher as _;
 
 mod counter;
 mod error;
@@ -53,10 +56,7 @@ mod ffi;
 pub mod process;
 pub mod shared_memory;
 
-pub use channel::{
-    BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED,
-    SendSlot,
-};
+pub use channel::{BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED, SendSlot};
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
 pub use process::{GkListener, GkProcess, Shareable};
 pub use shared_memory::{GkSharedMemory, HugePages, SharedMemoryOptions};
@@ -72,9 +72,7 @@ pub struct GkEventFd {
 impl GkEventFd {
     /// Creates an eventfd, like `eventfd(initval, flags)`.
     pub fn new(initval: u32, flags: EfdFlags) -> io::Result<Self> {
-        Ok(Self {
-            inner: sys::Inner::new(initval, flags)?,
-        })
+        Ok(Self { inner: sys::Inner::new(initval, flags)? })
     }
 
     /// Like [`new`](Self::new) but takes raw `EFD_*` bits.
@@ -105,9 +103,7 @@ impl GkEventFd {
     /// Creates a new handle to the same counter (like `dup(2)`).
     /// The clone has its own pollable descriptor.
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            inner: self.inner.try_clone()?,
-        })
+        Ok(Self { inner: self.inner.try_clone()? })
     }
 
     /// Switches non-blocking mode. Like `O_NONBLOCK`, this is shared by all
@@ -181,9 +177,7 @@ impl GkEventFd {
     /// descriptors must not be owned by anything else in this process.
     pub unsafe fn import(token: &str) -> io::Result<Self> {
         // SAFETY: forwarded to the caller.
-        Ok(Self {
-            inner: unsafe { sys::Inner::import(token) }?,
-        })
+        Ok(Self { inner: unsafe { sys::Inner::import(token) }? })
     }
 
     /// Unix: sends this eventfd to the process at the other end of `stream`,
@@ -205,9 +199,7 @@ impl GkEventFd {
     /// [`io::ErrorKind::UnexpectedEof`] if the peer closed the stream.
     #[cfg(unix)]
     pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
-        Ok(Self {
-            inner: sys::Inner::recv_from(std::os::fd::AsFd::as_fd(stream))?,
-        })
+        Ok(Self { inner: sys::Inner::recv_from(std::os::fd::AsFd::as_fd(stream))? })
     }
 
     /// Windows: duplicates this eventfd into the running process `pid` and
@@ -256,10 +248,7 @@ impl fmt::Debug for GkEventFd {
         #[cfg(unix)]
         d.field("fd", &std::os::fd::AsRawFd::as_raw_fd(self));
         #[cfg(windows)]
-        d.field(
-            "socket",
-            &std::os::windows::io::AsRawSocket::as_raw_socket(self),
-        );
+        d.field("socket", &std::os::windows::io::AsRawSocket::as_raw_socket(self));
         d.finish_non_exhaustive()
     }
 }
@@ -325,20 +314,10 @@ mod unix_impls {
 
     #[cfg(feature = "mio")]
     impl mio::event::Source for GkEventFd {
-        fn register(
-            &mut self,
-            registry: &mio::Registry,
-            token: mio::Token,
-            interests: mio::Interest,
-        ) -> std::io::Result<()> {
+        fn register(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> std::io::Result<()> {
             mio::unix::SourceFd(&self.as_raw_fd()).register(registry, token, interests)
         }
-        fn reregister(
-            &mut self,
-            registry: &mio::Registry,
-            token: mio::Token,
-            interests: mio::Interest,
-        ) -> std::io::Result<()> {
+        fn reregister(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> std::io::Result<()> {
             mio::unix::SourceFd(&self.as_raw_fd()).reregister(registry, token, interests)
         }
         fn deregister(&mut self, registry: &mio::Registry) -> std::io::Result<()> {
@@ -363,9 +342,7 @@ mod native_impls {
     /// The fd must be an eventfd.
     impl From<OwnedFd> for GkEventFd {
         fn from(fd: OwnedFd) -> Self {
-            Self {
-                inner: Inner::from(fd),
-            }
+            Self { inner: Inner::from(fd) }
         }
     }
 
@@ -406,20 +383,10 @@ mod windows_impls {
 
     #[cfg(feature = "mio")]
     impl mio::event::Source for GkEventFd {
-        fn register(
-            &mut self,
-            registry: &mio::Registry,
-            token: mio::Token,
-            interests: mio::Interest,
-        ) -> std::io::Result<()> {
+        fn register(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> std::io::Result<()> {
             self.inner.register(registry, token, interests)
         }
-        fn reregister(
-            &mut self,
-            registry: &mio::Registry,
-            token: mio::Token,
-            interests: mio::Interest,
-        ) -> std::io::Result<()> {
+        fn reregister(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> std::io::Result<()> {
             self.inner.reregister(registry, token, interests)
         }
         fn deregister(&mut self, registry: &mio::Registry) -> std::io::Result<()> {

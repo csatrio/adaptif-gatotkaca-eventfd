@@ -6,17 +6,10 @@ use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
 
-use adaptif_gatotkaca_eventfd::{
-    ChannelOptions, GkChannel, GkReceiver, GkSender, HugePages, KIND_UNSPECIFIED,
-};
+use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel, GkReceiver, GkSender, HugePages, KIND_UNSPECIFIED};
 
 fn small() -> (GkSender, GkReceiver) {
-    GkChannel::with_options(ChannelOptions {
-        capacity: 4096,
-        max_message: 1000,
-        ..Default::default()
-    })
-    .unwrap()
+    GkChannel::with_options(ChannelOptions { capacity: 4096, max_message: 1000, ..Default::default() }).unwrap()
 }
 
 fn kind<T: std::fmt::Debug>(r: std::io::Result<T>) -> ErrorKind {
@@ -26,11 +19,7 @@ fn kind<T: std::fmt::Debug>(r: std::io::Result<T>) -> ErrorKind {
 /// Readable within `ms` milliseconds (poll / WSAPoll on the end).
 #[cfg(unix)]
 fn readable(fd: &impl std::os::fd::AsRawFd, ms: i32) -> bool {
-    let mut p = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd.
     let n = unsafe { libc::poll(&mut p, 1, ms) };
     assert!(n >= 0);
@@ -40,11 +29,7 @@ fn readable(fd: &impl std::os::fd::AsRawFd, ms: i32) -> bool {
 #[cfg(windows)]
 fn readable(s: &impl std::os::windows::io::AsRawSocket, ms: i32) -> bool {
     use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET, WSAPOLLFD, WSAPoll};
-    let mut fd = WSAPOLLFD {
-        fd: s.as_raw_socket() as SOCKET,
-        events: POLLRDNORM,
-        revents: 0,
-    };
+    let mut fd = WSAPOLLFD { fd: s.as_raw_socket() as SOCKET, events: POLLRDNORM, revents: 0 };
     // SAFETY: one valid WSAPOLLFD.
     let n = unsafe { WSAPoll(&mut fd, 1, ms) };
     assert!(n >= 0);
@@ -54,11 +39,7 @@ fn readable(s: &impl std::os::windows::io::AsRawSocket, ms: i32) -> bool {
 #[test]
 fn defaults_and_options() {
     let (tx, rx) = GkChannel::new().unwrap();
-    let (msg, bulk) = if cfg!(windows) {
-        (256 << 10, 1 << 20)
-    } else {
-        (1 << 20, 4 << 20)
-    };
+    let (msg, bulk) = if cfg!(windows) { (256 << 10, 1 << 20) } else { (1 << 20, 4 << 20) };
     assert_eq!(tx.capacity(), msg);
     assert_eq!(tx.bulk_capacity(), bulk);
     assert_eq!(rx.max_message(), 64 << 10);
@@ -70,11 +51,7 @@ fn defaults_and_options() {
     });
     assert_eq!(kind(bad_chunk), ErrorKind::InvalidInput);
     for (capacity, max_message) in [(100, 8), (32, 8), (4096, 2041), (4096, 4096)] {
-        let r = GkChannel::with_options(ChannelOptions {
-            capacity,
-            max_message,
-            ..Default::default()
-        });
+        let r = GkChannel::with_options(ChannelOptions { capacity, max_message, ..Default::default() });
         assert_eq!(kind(r), ErrorKind::InvalidInput, "{capacity}/{max_message}");
     }
 }
@@ -224,12 +201,7 @@ fn readiness_follows_the_waiting_protocol() {
 /// Many messages of random sizes through blocking ends on two threads.
 #[test]
 fn stress_two_threads() {
-    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
-        capacity: 1 << 16,
-        max_message: 4000,
-        ..Default::default()
-    })
-    .unwrap();
+    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions { capacity: 1 << 16, max_message: 4000, ..Default::default() }).unwrap();
     const N: u32 = 200_000;
     let size = |i: u32| (i.wrapping_mul(2654435761) % 4001) as usize;
     let writer = thread::spawn(move || {
@@ -244,12 +216,7 @@ fn stress_two_threads() {
     for i in 0..N {
         let n = rx.recv(&mut buf).unwrap();
         assert_eq!(n, size(i), "message {i}");
-        assert!(
-            buf[..n]
-                .iter()
-                .enumerate()
-                .all(|(k, &b)| b == (k as u32 ^ i) as u8)
-        );
+        assert!(buf[..n].iter().enumerate().all(|(k, &b)| b == (k as u32 ^ i) as u8));
     }
     writer.join().unwrap();
     assert_eq!(kind(rx.recv(&mut buf)), ErrorKind::BrokenPipe);
@@ -263,9 +230,7 @@ fn mio_receiver_events() {
     let mut events = Events::with_capacity(4);
     let (mut tx, mut rx) = small();
     rx.set_nonblocking(true);
-    poll.registry()
-        .register(&mut rx, Token(1), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut rx, Token(1), Interest::READABLE).unwrap();
     let writer = thread::spawn(move || {
         for i in 0..50u8 {
             tx.send(&[i; 10]).unwrap();
@@ -289,8 +254,7 @@ fn mio_receiver_events() {
             }
         }
         assert!(Instant::now() < deadline, "stuck at {got}");
-        poll.poll(&mut events, Some(Duration::from_millis(500)))
-            .unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(500))).unwrap();
     }
     writer.join().unwrap();
     assert_eq!(got, 50);
@@ -394,27 +358,15 @@ fn exercise(mut tx: GkSender, mut rx: GkReceiver) {
 
 #[test]
 fn huge_page_channels() {
-    let opts = |huge_pages| ChannelOptions {
-        huge_pages,
-        ..Default::default()
-    };
+    let opts = |huge_pages| ChannelOptions { huge_pages, ..Default::default() };
     // Prefer always works (normal pages where huge ones aren't available).
     let (tx, rx) = GkChannel::with_options(opts(HugePages::Prefer)).unwrap();
     exercise(tx, rx);
     match GkChannel::with_options(opts(HugePages::Require)) {
         Ok((tx, rx)) => exercise(tx, rx),
         Err(e) => {
-            assert!(
-                std::env::var_os("GK_TEST_HUGEPAGES").is_none(),
-                "GK_TEST_HUGEPAGES is set but Require failed: {e}"
-            );
-            assert!(
-                matches!(
-                    e.kind(),
-                    ErrorKind::Unsupported | ErrorKind::OutOfMemory | ErrorKind::PermissionDenied
-                ),
-                "{e}"
-            );
+            assert!(std::env::var_os("GK_TEST_HUGEPAGES").is_none(), "GK_TEST_HUGEPAGES is set but Require failed: {e}");
+            assert!(matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::OutOfMemory | ErrorKind::PermissionDenied), "{e}");
         }
     }
 }
@@ -433,9 +385,7 @@ fn small_bulk() -> (GkSender, GkReceiver) {
 
 /// Deterministic test data.
 fn pattern(len: usize, seed: u32) -> Vec<u8> {
-    (0..len)
-        .map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(seed) as u8)
-        .collect()
+    (0..len).map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(seed) as u8).collect()
 }
 
 #[test]
@@ -514,10 +464,7 @@ fn messages_overtake_a_bulk_transfer() {
     let data = pattern(1 << 20, 3);
     let mut w = tx.bulk_writer(Some(data.len() as u64)).unwrap();
     let mut off = w.write(&data).unwrap();
-    assert_eq!(
-        w.write(&data[off..]).unwrap_err().kind(),
-        ErrorKind::WouldBlock
-    );
+    assert_eq!(w.write(&data[off..]).unwrap_err().kind(), ErrorKind::WouldBlock);
     drop(w); // abandons the transfer (blocks briefly only for the marker)
     // The message lane is independent: this goes straight through...
     let mut tx = tx;
@@ -531,10 +478,7 @@ fn messages_overtake_a_bulk_transfer() {
     let mut got = vec![0u8; off];
     r.read_exact(&mut got).unwrap();
     assert!(got == data[..off]);
-    assert_eq!(
-        r.read(&mut buf).unwrap_err().kind(),
-        ErrorKind::ConnectionAborted
-    );
+    assert_eq!(r.read(&mut buf).unwrap_err().kind(), ErrorKind::ConnectionAborted);
     off = 0;
     let _ = off;
 }
@@ -568,10 +512,7 @@ fn bulk_abort_and_early_reader_drop() {
     let mut r = rx.bulk_reader().unwrap();
     let mut buf = [0u8; 1000];
     assert_eq!(r.read(&mut buf).unwrap(), 400);
-    assert_eq!(
-        r.read(&mut buf).unwrap_err().kind(),
-        ErrorKind::ConnectionAborted
-    );
+    assert_eq!(r.read(&mut buf).unwrap_err().kind(), ErrorKind::ConnectionAborted);
     drop(r);
     // A reader dropped early: the rest is skipped before the next transfer.
     tx.send_bulk(&pattern(50_000, 5)).unwrap();
@@ -592,10 +533,7 @@ fn bulk_length_rules_and_limit() {
     let (mut tx, mut rx) = small_bulk();
     // Writing more than declared is refused.
     let mut w = tx.bulk_writer(Some(4)).unwrap();
-    assert_eq!(
-        w.write(b"12345").unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
+    assert_eq!(w.write(b"12345").unwrap_err().kind(), ErrorKind::InvalidInput);
     w.write_all(b"1234").unwrap();
     w.finish().unwrap();
     drop(w);
@@ -613,16 +551,10 @@ fn bulk_length_rules_and_limit() {
     let mut out = Vec::new();
     rx.recv_bulk_vec(&mut out, 100).unwrap();
     assert_eq!(out, b"1234");
-    assert_eq!(
-        rx.recv_bulk_vec(&mut out, 100).unwrap_err().kind(),
-        ErrorKind::ConnectionAborted
-    );
+    assert_eq!(rx.recv_bulk_vec(&mut out, 100).unwrap_err().kind(), ErrorKind::ConnectionAborted);
     rx.recv_bulk_vec(&mut out, 100).unwrap();
     assert!(out.is_empty());
-    assert_eq!(
-        rx.recv_bulk_vec(&mut out, 100).unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
+    assert_eq!(rx.recv_bulk_vec(&mut out, 100).unwrap_err().kind(), ErrorKind::InvalidInput);
     rx.recv_bulk_vec(&mut out, 100).unwrap();
     assert_eq!(out, b"ok");
 }
@@ -636,10 +568,7 @@ fn bulk_nonblocking_partial_writes() {
     // The ring holds less than the data: the first write is partial.
     let n = w.write(&data).unwrap();
     assert!(n > 0 && n < data.len(), "wrote {n}");
-    assert_eq!(
-        w.write(&data[n..]).unwrap_err().kind(),
-        ErrorKind::WouldBlock
-    );
+    assert_eq!(w.write(&data[n..]).unwrap_err().kind(), ErrorKind::WouldBlock);
     // Drain on another thread while we keep writing what fits.
     let reader = thread::spawn(move || {
         let mut out = Vec::new();
@@ -706,15 +635,12 @@ fn mio_event_loop_with_both_lanes() {
     let mut events = Events::with_capacity(4);
     let (mut tx, mut rx) = small_bulk();
     rx.set_nonblocking(true);
-    poll.registry()
-        .register(&mut rx, Token(0), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut rx, Token(0), Interest::READABLE).unwrap();
     const N: u32 = 600;
     let writer = thread::spawn(move || {
         for i in 0..N {
             if i % 3 == 0 {
-                tx.send_bulk(&pattern((i as usize * 1013) % 70_000, i))
-                    .unwrap();
+                tx.send_bulk(&pattern((i as usize * 1013) % 70_000, i)).unwrap();
             } else {
                 tx.send(&i.to_le_bytes()).unwrap();
             }
@@ -766,20 +692,13 @@ fn mio_event_loop_with_both_lanes() {
                 break;
             }
             let i = transfers * 3;
-            assert!(
-                bulk == pattern((i as usize * 1013) % 70_000, i),
-                "transfer {i}"
-            );
+            assert!(bulk == pattern((i as usize * 1013) % 70_000, i), "transfer {i}");
             bulk.clear();
             transfers += 1;
         }
-        assert!(
-            Instant::now() < deadline,
-            "stuck: {msgs} messages, {transfers} transfers"
-        );
+        assert!(Instant::now() < deadline, "stuck: {msgs} messages, {transfers} transfers");
         if !(sender_gone.0 && sender_gone.1) {
-            poll.poll(&mut events, Some(Duration::from_secs(2)))
-                .unwrap();
+            poll.poll(&mut events, Some(Duration::from_secs(2))).unwrap();
         }
     }
     writer.join().unwrap();
@@ -807,11 +726,7 @@ mod fork {
         let mut status = 0;
         // SAFETY: waits for our own child.
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        }
+        if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 }
     }
 
     /// Serialise the fork tests (no other test thread mid-operation).

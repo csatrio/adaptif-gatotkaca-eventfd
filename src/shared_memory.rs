@@ -117,14 +117,8 @@ impl GkSharedMemory {
     /// Like [`new`](Self::new), with page options. With huge pages the
     /// length is rounded up to the huge page size.
     pub fn with_options(len: usize, options: SharedMemoryOptions) -> io::Result<Self> {
-        let opts = RegionOptions {
-            huge: options.huge_pages,
-            huge_size: options.huge_page_size,
-            populate: options.populate,
-        };
-        Ok(Self {
-            region: SharedRegion::create_with(len, &opts)?,
-        })
+        let opts = RegionOptions { huge: options.huge_pages, huge_size: options.huge_page_size, populate: options.populate };
+        Ok(Self { region: SharedRegion::create_with(len, &opts)? })
     }
 
     /// Start of the memory (page-aligned, never null). Valid for
@@ -278,20 +272,14 @@ impl crate::process::private::Sealed for GkSharedMemory {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid shared memory offer");
         let mut parts = token.trim().split('|');
         if parts.next() != Some(TAG) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not the expected kind of object",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object"));
         }
-        let section =
-            usize::from_str_radix(parts.next().ok_or_else(bad)?, 16).map_err(|_| bad())?;
+        let section = usize::from_str_radix(parts.next().ok_or_else(bad)?, 16).map_err(|_| bad())?;
         if parts.next().is_some() {
             return Err(bad());
         }
         let section = crate::sys::duplicate_from(pid, section)?;
-        Ok(Self {
-            region: SharedRegion::from_owned(section, 1, |_, _| true)?,
-        })
+        Ok(Self { region: SharedRegion::from_owned(section, 1, |_, _| true)? })
     }
 }
 
@@ -303,15 +291,9 @@ mod tests {
 
     #[test]
     fn options_map_onto_the_region() {
-        let shm = GkSharedMemory::with_options(
-            10,
-            SharedMemoryOptions {
-                huge_pages: HugePages::Prefer,
-                huge_page_size: None,
-                populate: true,
-            },
-        )
-        .unwrap();
+        let shm =
+            GkSharedMemory::with_options(10, SharedMemoryOptions { huge_pages: HugePages::Prefer, huge_page_size: None, populate: true })
+                .unwrap();
         assert!(shm.len() >= 10);
         assert!(!shm.is_empty());
         assert_eq!(shm.len() % shm.page_size(), 0);

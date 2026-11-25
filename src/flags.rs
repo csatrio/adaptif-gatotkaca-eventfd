@@ -59,11 +59,7 @@ impl EfdFlags {
     /// Builds flags from raw bits. Returns `None` if unknown bits are set
     /// (the C `eventfd()` call fails with `EINVAL` in that case).
     pub const fn from_bits(bits: c_int) -> Option<Self> {
-        if bits & !Self::ALL != 0 {
-            None
-        } else {
-            Some(Self(bits))
-        }
+        if bits & !Self::ALL != 0 { None } else { Some(Self(bits)) }
     }
 
     /// Raw bits, suitable for passing to C `eventfd()`.
@@ -106,11 +102,7 @@ impl fmt::Debug for EfdFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         f.write_str("EfdFlags(")?;
-        for (flag, name) in [
-            (Self::SEMAPHORE, "SEMAPHORE"),
-            (Self::CLOEXEC, "CLOEXEC"),
-            (Self::NONBLOCK, "NONBLOCK"),
-        ] {
+        for (flag, name) in [(Self::SEMAPHORE, "SEMAPHORE"), (Self::CLOEXEC, "CLOEXEC"), (Self::NONBLOCK, "NONBLOCK")] {
             if self.contains(flag) {
                 if !first {
                     f.write_str(" | ")?;
@@ -133,18 +125,12 @@ mod tests {
     #[test]
     fn rejects_unknown_bits() {
         assert!(EfdFlags::from_bits(0x4000_0000).is_none());
-        assert_eq!(
-            EfdFlags::from_bits(EFD_NONBLOCK | EFD_SEMAPHORE),
-            Some(EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE)
-        );
+        assert_eq!(EfdFlags::from_bits(EFD_NONBLOCK | EFD_SEMAPHORE), Some(EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE));
     }
 
     #[test]
     fn debug_format() {
         assert_eq!(format!("{:?}", EfdFlags::NONE), "EfdFlags(NONE)");
-        assert_eq!(
-            format!("{:?}", EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK),
-            "EfdFlags(SEMAPHORE | NONBLOCK)"
-        );
+        assert_eq!(format!("{:?}", EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK), "EfdFlags(SEMAPHORE | NONBLOCK)");
     }
 }

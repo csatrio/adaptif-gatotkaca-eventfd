@@ -62,9 +62,7 @@ async fn main() -> std::io::Result<()> {
     let mut done = 0;
     while done < JOBS {
         let efd = Arc::clone(&efd);
-        let n = tokio::task::spawn_blocking(move || efd.read())
-            .await
-            .expect("blocking task panicked")?;
+        let n = tokio::task::spawn_blocking(move || efd.read()).await.expect("blocking task panicked")?;
         done += n;
         println!("{done}/{JOBS} jobs done");
     }

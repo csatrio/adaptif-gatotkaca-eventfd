@@ -16,11 +16,7 @@ const LONG: Duration = Duration::from_secs(5);
 fn poll_tokens(poll: &mut Poll, timeout: Duration) -> Vec<Token> {
     let mut events = Events::with_capacity(16);
     poll.poll(&mut events, Some(timeout)).unwrap();
-    let mut tokens: Vec<Token> = events
-        .iter()
-        .filter(|e| e.is_readable())
-        .map(|e| e.token())
-        .collect();
+    let mut tokens: Vec<Token> = events.iter().filter(|e| e.is_readable()).map(|e| e.token()).collect();
     tokens.sort();
     tokens.dedup();
     tokens
@@ -42,14 +38,9 @@ fn wait_for(poll: &mut Poll, want: &[Token]) -> Vec<Token> {
 fn readable_event_after_write() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(1), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(1), Interest::READABLE).unwrap();
 
-    assert!(
-        poll_tokens(&mut poll, SHORT).is_empty(),
-        "no event before a write"
-    );
+    assert!(poll_tokens(&mut poll, SHORT).is_empty(), "no event before a write");
     efd.write(3).unwrap();
     assert_eq!(wait_for(&mut poll, &[Token(1)]), vec![Token(1)]);
     assert_eq!(efd.read().unwrap(), 3);
@@ -59,9 +50,7 @@ fn readable_event_after_write() {
 fn initval_is_readable_on_register() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(1, EfdFlags::NONBLOCK).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(0), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(0), Interest::READABLE).unwrap();
     assert_eq!(wait_for(&mut poll, &[Token(0)]), vec![Token(0)]);
 }
 
@@ -69,17 +58,11 @@ fn initval_is_readable_on_register() {
 fn edge_triggered_rearm_after_drain() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(7), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(7), Interest::READABLE).unwrap();
 
     for round in 1..=5u64 {
         efd.write(round).unwrap();
-        assert_eq!(
-            wait_for(&mut poll, &[Token(7)]),
-            vec![Token(7)],
-            "round {round}"
-        );
+        assert_eq!(wait_for(&mut poll, &[Token(7)]), vec![Token(7)], "round {round}");
         // Drain until WouldBlock, as edge-triggered readiness requires.
         assert_eq!(efd.read().unwrap(), round);
         assert_eq!(efd.read().unwrap_err().kind(), ErrorKind::WouldBlock);
@@ -92,9 +75,7 @@ fn edge_triggered_rearm_after_drain() {
 fn semaphore_drain_loop() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK | EfdFlags::SEMAPHORE).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(0), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(0), Interest::READABLE).unwrap();
     efd.write(4).unwrap();
     assert_eq!(wait_for(&mut poll, &[Token(0)]), vec![Token(0)]);
     let mut n = 0;
@@ -114,18 +95,11 @@ fn clones_with_distinct_tokens_both_fire() {
     let mut poll = Poll::new().unwrap();
     let mut a = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
     let mut b = a.try_clone().unwrap();
-    poll.registry()
-        .register(&mut a, Token(10), Interest::READABLE)
-        .unwrap();
-    poll.registry()
-        .register(&mut b, Token(20), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut a, Token(10), Interest::READABLE).unwrap();
+    poll.registry().register(&mut b, Token(20), Interest::READABLE).unwrap();
 
     a.write(1).unwrap();
-    assert_eq!(
-        wait_for(&mut poll, &[Token(10), Token(20)]),
-        vec![Token(10), Token(20)]
-    );
+    assert_eq!(wait_for(&mut poll, &[Token(10), Token(20)]), vec![Token(10), Token(20)]);
     assert_eq!(b.read().unwrap(), 1);
     // Drain `a` to WouldBlock too: on Windows mio is re-armed only for the
     // handle that performed the read (see `sys::windows` docs).
@@ -133,10 +107,7 @@ fn clones_with_distinct_tokens_both_fire() {
 
     // Again, written through the other handle.
     b.write(2).unwrap();
-    assert_eq!(
-        wait_for(&mut poll, &[Token(10), Token(20)]),
-        vec![Token(10), Token(20)]
-    );
+    assert_eq!(wait_for(&mut poll, &[Token(10), Token(20)]), vec![Token(10), Token(20)]);
     assert_eq!(a.read().unwrap(), 2);
 }
 
@@ -144,24 +115,15 @@ fn clones_with_distinct_tokens_both_fire() {
 fn deregister_and_reregister() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(1), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(1), Interest::READABLE).unwrap();
     poll.registry().deregister(&mut efd).unwrap();
 
     efd.write(1).unwrap();
-    assert!(
-        poll_tokens(&mut poll, SHORT).is_empty(),
-        "no event after deregister"
-    );
+    assert!(poll_tokens(&mut poll, SHORT).is_empty(), "no event after deregister");
     assert_eq!(efd.read().unwrap(), 1);
 
-    poll.registry()
-        .register(&mut efd, Token(2), Interest::READABLE)
-        .unwrap();
-    poll.registry()
-        .reregister(&mut efd, Token(3), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(2), Interest::READABLE).unwrap();
+    poll.registry().reregister(&mut efd, Token(3), Interest::READABLE).unwrap();
     efd.write(1).unwrap();
     assert_eq!(wait_for(&mut poll, &[Token(3)]), vec![Token(3)]);
     poll.registry().deregister(&mut efd).unwrap();
@@ -171,9 +133,7 @@ fn deregister_and_reregister() {
 fn cross_thread_wakeup() {
     let mut poll = Poll::new().unwrap();
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
-    poll.registry()
-        .register(&mut efd, Token(0), Interest::READABLE)
-        .unwrap();
+    poll.registry().register(&mut efd, Token(0), Interest::READABLE).unwrap();
 
     const N: u64 = 100;
     let notifier = efd.try_clone().unwrap();
@@ -189,8 +149,7 @@ fn cross_thread_wakeup() {
     let mut total = 0;
     while total < N {
         assert!(Instant::now() < deadline, "timed out with total = {total}");
-        poll.poll(&mut events, Some(Duration::from_millis(100)))
-            .unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
         for event in &events {
             assert_eq!(event.token(), Token(0));
             loop {

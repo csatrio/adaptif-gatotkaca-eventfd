@@ -80,11 +80,7 @@ fn cvt_retry(mut f: impl FnMut() -> isize) -> io::Result<isize> {
 }
 
 fn cvt(ret: libc::c_int) -> io::Result<libc::c_int> {
-    if ret == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
+    if ret == -1 { Err(io::Error::last_os_error()) } else { Ok(ret) }
 }
 
 /// Number of bytes buffered in the pipe (crate tests only).
@@ -147,9 +143,7 @@ impl Signal for Shared {
         let mut buf = [0u8; 64];
         loop {
             // SAFETY: reads into a live local buffer from a valid open fd.
-            let r = cvt_retry(|| unsafe {
-                libc::read(self.pipe_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-            });
+            let r = cvt_retry(|| unsafe { libc::read(self.pipe_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) });
             match r {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => return Ok(()),
@@ -160,11 +154,7 @@ impl Signal for Shared {
     }
 
     fn wait_readable(&self) -> io::Result<()> {
-        let mut pfd = libc::pollfd {
-            fd: self.pipe_r.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfd = libc::pollfd { fd: self.pipe_r.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         loop {
             // SAFETY: one valid pollfd, no timeout.
             if unsafe { libc::poll(&mut pfd, 1, -1) } >= 0 {
@@ -220,11 +210,14 @@ fn make_pipe(cloexec: bool) -> io::Result<(OwnedFd, OwnedFd)> {
     cvt(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
     let (r, w) = own_pair(fds);
     for fd in [r.as_raw_fd(), w.as_raw_fd()] {
-        // SAFETY (all four calls): plain fcntl on a valid fd owned by `r`/`w`.
+        // SAFETY: plain fcntl on a valid fd owned by `r`/`w`.
         let fl = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+        // SAFETY: as above.
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) })?;
         if cloexec {
+            // SAFETY: as above.
             let fd_fl = cvt(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
+            // SAFETY: as above.
             cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, fd_fl | libc::FD_CLOEXEC) })?;
         }
     }
@@ -233,11 +226,7 @@ fn make_pipe(cloexec: bool) -> io::Result<(OwnedFd, OwnedFd)> {
 
 /// `dup`s `fd` to a new descriptor (>= 3, like std), close-on-exec iff `cloexec`.
 fn dup(fd: BorrowedFd<'_>, cloexec: bool) -> io::Result<OwnedFd> {
-    let cmd = if cloexec {
-        libc::F_DUPFD_CLOEXEC
-    } else {
-        libc::F_DUPFD
-    };
+    let cmd = if cloexec { libc::F_DUPFD_CLOEXEC } else { libc::F_DUPFD };
     // SAFETY: plain fcntl on a valid open fd.
     let new = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), cmd, 3) })?;
     // SAFETY: F_DUPFD(_CLOEXEC) returned a fresh descriptor nobody else owns.
@@ -248,19 +237,12 @@ impl Inner {
     pub(crate) fn new(initval: u32, flags: EfdFlags) -> io::Result<Self> {
         let cloexec = flags.contains(EfdFlags::CLOEXEC);
         let (pipe_r, pipe_w) = make_pipe(cloexec)?;
-        let shared = Shared {
-            page: SharedPage::new(initval, flags)?,
-            pipe_r,
-            pipe_w,
-        };
+        let shared = Shared { page: SharedPage::new(initval, flags)?, pipe_r, pipe_w };
         if initval > 0 {
             shared.set_readable()?;
         }
         let fd = dup(shared.pipe_r.as_fd(), cloexec)?;
-        Ok(Self {
-            shared: Arc::new(shared),
-            fd,
-        })
+        Ok(Self { shared: Arc::new(shared), fd })
     }
 
     pub(crate) fn read(&self) -> io::Result<u64> {
@@ -274,10 +256,7 @@ impl Inner {
     /// New handle on the same counter with its own descriptor. Like
     /// `OwnedFd::try_clone`, the new descriptor is always close-on-exec.
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            shared: Arc::clone(&self.shared),
-            fd: dup(self.fd.as_fd(), true)?,
-        })
+        Ok(Self { shared: Arc::clone(&self.shared), fd: dup(self.fd.as_fd(), true)? })
     }
 
     pub(crate) fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
@@ -325,10 +304,7 @@ pub(crate) fn pipe_id(fd: RawFd) -> Option<PipeId> {
     // SAFETY: fstat succeeded, so `st` is initialised.
     let st = unsafe { st.assume_init() };
     #[allow(clippy::unnecessary_cast)] // field types differ between OSes
-    ((st.st_mode & libc::S_IFMT) == libc::S_IFIFO).then_some(PipeId {
-        dev: st.st_dev as u64,
-        ino: st.st_ino as u64,
-    })
+    ((st.st_mode & libc::S_IFMT) == libc::S_IFIFO).then_some(PipeId { dev: st.st_dev as u64, ino: st.st_ino as u64 })
 }
 
 /// A counter handle without a descriptor of its own, for the compat registry,
@@ -395,11 +371,7 @@ impl Shared {
             // SAFETY: as above.
             cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) })?;
         }
-        Ok(Self {
-            page,
-            pipe_r,
-            pipe_w,
-        })
+        Ok(Self { page, pipe_r, pipe_w })
     }
 
     /// # Safety
@@ -422,8 +394,7 @@ impl Shared {
     /// Rebuilds from `[shared memory, pipe read end, pipe write end]` (ours;
     /// closed on failure).
     fn from_fds(fds: Vec<OwnedFd>) -> io::Result<Self> {
-        let [shm, r, w]: [OwnedFd; SHARE_FDS] =
-            fds.try_into().map_err(|_| unix_share::invalid_token())?;
+        let [shm, r, w]: [OwnedFd; SHARE_FDS] = fds.try_into().map_err(|_| unix_share::invalid_token())?;
         check_pipe_ends(r.as_raw_fd(), w.as_raw_fd())?;
         Self::assemble(SharedPage::from_owned(shm)?, r, w)
     }
@@ -447,20 +418,14 @@ fn check_pipe_ends(r: RawFd, w: RawFd) -> io::Result<()> {
     if mode(r, libc::O_RDONLY) && mode(w, libc::O_WRONLY) {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "eventfd token: descriptors are not an eventfd's pipe",
-        ))
+        Err(io::Error::new(io::ErrorKind::InvalidInput, "eventfd token: descriptors are not an eventfd's pipe"))
     }
 }
 
 impl Inner {
     fn from_shared(shared: Shared) -> io::Result<Self> {
         let fd = dup(shared.pipe_r.as_fd(), true)?;
-        Ok(Self {
-            shared: Arc::new(shared),
-            fd,
-        })
+        Ok(Self { shared: Arc::new(shared), fd })
     }
 
     pub(crate) fn export_inheritable(&self) -> io::Result<InheritableExport> {
@@ -517,11 +482,7 @@ mod tests {
 
     /// True if `fd` polls readable within `timeout_ms`.
     fn readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> bool {
-        let mut p = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd.
         let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
         assert!(n >= 0, "poll: {}", io::Error::last_os_error());
@@ -538,11 +499,7 @@ mod tests {
     }
 
     fn all_fds(e: &Inner) -> [RawFd; 3] {
-        [
-            e.fd.as_raw_fd(),
-            e.shared.pipe_r.as_raw_fd(),
-            e.shared.pipe_w.as_raw_fd(),
-        ]
+        [e.fd.as_raw_fd(), e.shared.pipe_r.as_raw_fd(), e.shared.pipe_w.as_raw_fd()]
     }
 
     #[test]
@@ -592,12 +549,7 @@ mod tests {
         assert_eq!(e.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "dragonfly"))]
     #[test]
     fn kqueue_read_filter() {
         let e = Inner::new(0, nb()).unwrap();
@@ -610,14 +562,8 @@ mod tests {
         ev.ident = e.as_fd().as_raw_fd() as _;
         ev.filter = libc::EVFILT_READ;
         ev.flags = libc::EV_ADD | libc::EV_CLEAR;
-        let zero = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let wait = libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        };
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let wait = libc::timespec { tv_sec: 1, tv_nsec: 0 };
         // SAFETY: one input event, no output buffer.
         let r = unsafe { libc::kevent(kq.as_raw_fd(), &ev, 1, std::ptr::null_mut(), 0, &zero) };
         assert_eq!(r, 0, "{}", io::Error::last_os_error());
@@ -661,11 +607,7 @@ mod tests {
         let a = Inner::new(0, nb()).unwrap();
         let b = a.try_clone().unwrap();
         let c = b.try_clone().unwrap();
-        let fds = [
-            a.as_fd().as_raw_fd(),
-            b.as_fd().as_raw_fd(),
-            c.as_fd().as_raw_fd(),
-        ];
+        let fds = [a.as_fd().as_raw_fd(), b.as_fd().as_raw_fd(), c.as_fd().as_raw_fd()];
         assert!(fds[0] != fds[1] && fds[1] != fds[2] && fds[0] != fds[2]);
         assert!(fds.iter().all(|&f| f != a.shared.pipe_r.as_raw_fd()));
         assert!(!now(&a) && !now(&b) && !now(&c));
@@ -706,10 +648,7 @@ mod tests {
         }
         // Like OwnedFd::try_clone, clones are always close-on-exec.
         let c = e.try_clone().unwrap();
-        assert_ne!(
-            fd_flags(c.as_fd().as_raw_fd()).unwrap() & libc::FD_CLOEXEC,
-            0
-        );
+        assert_ne!(fd_flags(c.as_fd().as_raw_fd()).unwrap() & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
@@ -773,21 +712,11 @@ mod tests {
             // SAFETY: an all-zero siginfo_t is a valid value.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             // SAFETY: waits on our own child; WNOWAIT keeps it a zombie.
-            let r = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    child as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
+            let r = unsafe { libc::waitid(libc::P_PID, child as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
             if r == 0 {
                 break;
             }
-            assert_eq!(
-                io::Error::last_os_error().kind(),
-                io::ErrorKind::Interrupted
-            );
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::Interrupted);
         }
         child
     }
@@ -833,10 +762,7 @@ mod tests {
         let (shm, r, w) = (fds[0], fds[1], fds[2]);
         for (token, kind) in [
             // Pipe ends swapped.
-            (
-                format!("gkefd1:u:{shm}:{w}:{r}"),
-                io::ErrorKind::InvalidInput,
-            ),
+            (format!("gkefd1:u:{shm}:{w}:{r}"), io::ErrorKind::InvalidInput),
             // A pipe where the shared memory object should be.
             (format!("gkefd1:u:{r}:{r}:{w}"), io::ErrorKind::InvalidData),
             // Native token on the shim.
@@ -875,10 +801,7 @@ mod tests {
         let left = e.shared.page.peek();
         assert_eq!(consumed + left, 4 * 2000);
         assert_eq!(now(&e), left > 0);
-        assert_eq!(
-            pending_bytes(e.shared.pipe_r.as_fd()),
-            Some(i32::from(left > 0))
-        );
+        assert_eq!(pending_bytes(e.shared.pipe_r.as_fd()), Some(i32::from(left > 0)));
         // Drain and re-check.
         e.set_nonblocking(true).unwrap();
         while e.read().is_ok() {}

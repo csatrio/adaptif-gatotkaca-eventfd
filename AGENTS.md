@@ -369,9 +369,19 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
 
 ## 8. Verifying changes to this crate (no CI; run manually)
 
+Code style and lints are part of the crate:
+
+- `rustfmt.toml`: `max_width = 140`, `use_small_heuristics = "Max"`. Run
+  `cargo fmt` after every edit.
+- `Cargo.toml` `[lints]`: `unsafe_op_in_unsafe_fn` and `missing_docs`
+  (rust), `undocumented_unsafe_blocks` and `missing_safety_doc` (clippy).
+  Every `unsafe` block needs its own `// SAFETY:` comment (one comment does
+  not cover several blocks), every `unsafe fn` a `# Safety` section, every
+  public item a doc comment. Clippy runs with `-D warnings`.
+
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --features mio -- -D warnings
+cargo clippy --all-targets --features mio,ffi -- -D warnings
 cargo test --features mio                      # macOS: exercises the pipe shim
 cargo test --features ffi --lib
 

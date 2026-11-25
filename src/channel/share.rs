@@ -65,18 +65,9 @@ impl End {
         let data = fds.split_off(1);
         let region_fd = fds.pop().expect("one region descriptor");
         let region = SharedRegion::from_owned(region_fd, DATA, Layout::accepts)?;
-        let data_ready = GkEventFd {
-            inner: Inner::from_share_fds(data)?,
-        };
-        let space_ready = GkEventFd {
-            inner: Inner::from_share_fds(space)?,
-        };
-        Ok(Self::received(
-            Ring::with_region(region),
-            data_ready,
-            space_ready,
-            side,
-        ))
+        let data_ready = GkEventFd { inner: Inner::from_share_fds(data)? };
+        let space_ready = GkEventFd { inner: Inner::from_share_fds(space)? };
+        Ok(Self::received(Ring::with_region(region), data_ready, space_ready, side))
     }
 }
 
@@ -91,11 +82,7 @@ impl End {
             let keep = self.ring.region.section().try_clone_to_owned()?;
             let (d, kd) = self.data_ready.inner.offer_to(pid)?;
             let (s, ks) = self.space_ready.inner.offer_to(pid)?;
-            let token = format!(
-                "{}|{:x}|{d}|{s}",
-                Self::tag(self.side),
-                keep.as_raw_handle() as usize
-            );
+            let token = format!("{}|{:x}|{d}|{s}", Self::tag(self.side), keep.as_raw_handle() as usize);
             Ok((token, vec![keep, kd, ks]))
         })();
         if r.is_err() {
@@ -108,13 +95,9 @@ impl End {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid channel offer");
         let mut parts = token.trim().split('|');
         if parts.next() != Some(Self::tag(side)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not the expected kind of object",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object"));
         }
-        let section =
-            usize::from_str_radix(parts.next().ok_or_else(bad)?, 16).map_err(|_| bad())?;
+        let section = usize::from_str_radix(parts.next().ok_or_else(bad)?, 16).map_err(|_| bad())?;
         let d = parts.next().ok_or_else(bad)?;
         let s = parts.next().ok_or_else(bad)?;
         if parts.next().is_some() {
@@ -122,18 +105,9 @@ impl End {
         }
         let region = crate::sys::duplicate_from(pid, section)?;
         let region = SharedRegion::from_owned(region, DATA, Layout::accepts)?;
-        let data_ready = GkEventFd {
-            inner: crate::sys::Inner::take_offer(d, pid)?,
-        };
-        let space_ready = GkEventFd {
-            inner: crate::sys::Inner::take_offer(s, pid)?,
-        };
-        Ok(Self::received(
-            Ring::with_region(region),
-            data_ready,
-            space_ready,
-            side,
-        ))
+        let data_ready = GkEventFd { inner: crate::sys::Inner::take_offer(d, pid)? };
+        let space_ready = GkEventFd { inner: crate::sys::Inner::take_offer(s, pid)? };
+        Ok(Self::received(Ring::with_region(region), data_ready, space_ready, side))
     }
 }
 
@@ -150,10 +124,7 @@ impl GkSender {
     /// becomes its owner.
     #[cfg(unix)]
     pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(
-            std::os::fd::AsFd::as_fd(stream),
-            Side::Sender,
-        )?))
+        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Sender)?))
     }
 }
 
@@ -170,10 +141,7 @@ impl GkReceiver {
     /// process becomes its owner.
     #[cfg(unix)]
     pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(
-            std::os::fd::AsFd::as_fd(stream),
-            Side::Receiver,
-        )?))
+        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Receiver)?))
     }
 }
 

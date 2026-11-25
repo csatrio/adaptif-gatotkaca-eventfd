@@ -123,12 +123,8 @@ impl GkProcess {
     /// In a child started by [`GkProcess::spawn`]: connects to the parent.
     /// Fails with [`io::ErrorKind::NotFound`] if [`PARENT_ENV`] is not set.
     pub fn from_parent() -> io::Result<Self> {
-        let name = std::env::var(PARENT_ENV).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "not started by GkProcess::spawn (GK_EVENTFD_PARENT unset)",
-            )
-        })?;
+        let name = std::env::var(PARENT_ENV)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "not started by GkProcess::spawn (GK_EVENTFD_PARENT unset)"))?;
         Self::connect(&name)
     }
 
@@ -204,9 +200,7 @@ impl private::Sealed for GkEventFd {
     }
     #[cfg(unix)]
     fn recv_over(sock: std::os::fd::BorrowedFd<'_>) -> io::Result<Self> {
-        Ok(Self {
-            inner: crate::sys::Inner::recv_from(sock)?,
-        })
+        Ok(Self { inner: crate::sys::Inner::recv_from(sock)? })
     }
     #[cfg(windows)]
     fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
@@ -218,14 +212,9 @@ impl private::Sealed for GkEventFd {
         // Another kind of object (channel end, shared memory): InvalidData,
         // as on unix.
         if !token.trim_start().starts_with("gkefd1:") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not the expected kind of object",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object"));
         }
-        Ok(Self {
-            inner: crate::sys::Inner::take_offer(token, pid)?,
-        })
+        Ok(Self { inner: crate::sys::Inner::take_offer(token, pid)? })
     }
 }
 
@@ -241,16 +230,8 @@ impl From<std::os::unix::net::UnixStream> for GkProcess {
 fn unique_name() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!(
-        "p{:x}-{:x}-{:x}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-        nanos
-    )
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    format!("p{:x}-{:x}-{:x}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed), nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +247,7 @@ mod imp {
     use std::path::PathBuf;
 
     fn path_for(name: &str) -> PathBuf {
-        if name.contains('/') {
-            PathBuf::from(name)
-        } else {
-            std::env::temp_dir().join(format!("gkefd-{name}.sock"))
-        }
+        if name.contains('/') { PathBuf::from(name) } else { std::env::temp_dir().join(format!("gkefd-{name}.sock")) }
     }
 
     #[derive(Debug)]
@@ -288,29 +265,14 @@ mod imp {
     /// connection would land in a live listener's accept queue).
     fn lock(lock_path: &PathBuf) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(lock_path)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(lock_path)?;
         // flock locks belong to the open file, so a second bind in the same
         // process is refused too (fcntl record locks would allow it).
         // SAFETY: plain flock on our open file.
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } == -1
-        {
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
             let err = io::Error::last_os_error();
             return Err(if err.kind() == io::ErrorKind::WouldBlock {
-                io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "another listener is bound to this name",
-                )
+                io::Error::new(io::ErrorKind::AddrInUse, "another listener is bound to this name")
             } else {
                 err
             });
@@ -332,12 +294,7 @@ mod imp {
                 Err(e) => return Err(e),
             }
             let sock = UnixListener::bind(&path)?;
-            Ok(Self {
-                sock,
-                path,
-                lock_path,
-                _lock: lock,
-            })
+            Ok(Self { sock, path, lock_path, _lock: lock })
         }
 
         pub(super) fn accept(&self) -> io::Result<Process> {
@@ -414,25 +371,18 @@ mod imp {
     use std::sync::Mutex;
 
     use windows_sys::Win32::Foundation::{
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError,
-        INVALID_HANDLE_VALUE,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, OPEN_EXISTING,
-        PIPE_ACCESS_DUPLEX,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-        GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
     };
 
     fn pipe_name(name: &str) -> String {
-        if name.starts_with(r"\\") {
-            name.to_owned()
-        } else {
-            format!(r"\\.\pipe\gkefd-{name}")
-        }
+        if name.starts_with(r"\\") { name.to_owned() } else { format!(r"\\.\pipe\gkefd-{name}") }
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -442,11 +392,7 @@ mod imp {
     /// A new, unconnected instance of the pipe `name`.
     fn instance(name: &[u16], first: bool) -> io::Result<OwnedHandle> {
         let first_instance = first;
-        let first = if first {
-            FILE_FLAG_FIRST_PIPE_INSTANCE
-        } else {
-            0
-        };
+        let first = if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
         // SAFETY: `name` is NUL-terminated; default security (this user),
         // local clients only.
         let h = unsafe {
@@ -530,13 +476,7 @@ mod imp {
 
     impl Process {
         fn ready(pipe: OwnedHandle, pid: u32) -> Self {
-            Self {
-                state: State::Ready {
-                    pipe: File::from(pipe),
-                    pid,
-                },
-                offered: Vec::new(),
-            }
+            Self { state: State::Ready { pipe: File::from(pipe), pid }, offered: Vec::new() }
         }
 
         pub(super) fn pid(&self) -> Option<u32> {
@@ -586,17 +526,8 @@ mod imp {
         pub(super) fn for_child() -> io::Result<(Self, String)> {
             let name = pipe_name(&unique_name());
             let listener = Listener::bind(&name)?;
-            let state = State::Pending {
-                listener,
-                child: None,
-            };
-            Ok((
-                Self {
-                    state,
-                    offered: Vec::new(),
-                },
-                name,
-            ))
+            let state = State::Pending { listener, child: None };
+            Ok((Self { state, offered: Vec::new() }, name))
         }
 
         pub(super) fn expect_pid(&mut self, pid: u32) {
@@ -638,15 +569,11 @@ mod imp {
             pipe.read_exact(&mut len)?;
             let len = u32::from_le_bytes(len) as usize;
             if len > OFFER_MAX {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "eventfd message too long",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "eventfd message too long"));
             }
             let mut token = vec![0u8; len];
             pipe.read_exact(&mut token)?;
-            let token = String::from_utf8(token)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "eventfd message"))?;
+            let token = String::from_utf8(token).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "eventfd message"))?;
             T::take(&token, pid)
         }
     }

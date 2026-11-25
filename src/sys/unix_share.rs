@@ -23,11 +23,7 @@ pub(crate) const TAG_LEN: usize = 8;
 const MAX_FDS: usize = 8;
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
-    if r == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(r)
-    }
+    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(r) }
 }
 
 pub(crate) fn invalid_token() -> io::Error {
@@ -60,10 +56,7 @@ impl InheritableExport {
         for fd in &copies {
             token.push_str(&format!(":{}", fd.as_raw_fd()));
         }
-        Ok(Self {
-            token,
-            _fds: copies,
-        })
+        Ok(Self { token, _fds: copies })
     }
 
     pub(crate) fn token(&self) -> &str {
@@ -73,16 +66,9 @@ impl InheritableExport {
 
 /// Parses a token with `tag` naming exactly `n` descriptors.
 pub(crate) fn parse(token: &str, tag: &str, n: usize) -> io::Result<Vec<RawFd>> {
-    let rest = token
-        .trim()
-        .strip_prefix(tag)
-        .and_then(|r| r.strip_prefix(':'))
-        .ok_or_else(invalid_token)?;
-    let fds = rest
-        .split(':')
-        .map(|p| p.parse::<RawFd>().ok().filter(|&fd| fd >= 0))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(invalid_token)?;
+    let rest = token.trim().strip_prefix(tag).and_then(|r| r.strip_prefix(':')).ok_or_else(invalid_token)?;
+    let fds =
+        rest.split(':').map(|p| p.parse::<RawFd>().ok().filter(|&fd| fd >= 0)).collect::<Option<Vec<_>>>().ok_or_else(invalid_token)?;
     if fds.len() != n {
         return Err(invalid_token());
     }
@@ -124,10 +110,7 @@ struct CmsgBuf([u8; 64]);
 pub(crate) fn send(sock: BorrowedFd<'_>, tag: &str, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
     assert!(fds.len() <= MAX_FDS);
     let head = header(tag);
-    let mut iov = libc::iovec {
-        iov_base: head.as_ptr().cast_mut().cast(),
-        iov_len: TAG_LEN,
-    };
+    let mut iov = libc::iovec { iov_base: head.as_ptr().cast_mut().cast(), iov_len: TAG_LEN };
     let payload = (fds.len() * size_of::<libc::c_int>()) as libc::c_uint;
     let mut cbuf = CmsgBuf([0; 64]);
     // SAFETY: CMSG_* are pure arithmetic / pointer helpers on our buffers.
@@ -186,10 +169,7 @@ fn write_all(sock: BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
 /// on any mismatch they are closed and an error is returned.
 pub(crate) fn recv(sock: BorrowedFd<'_>, tag: &str, n: usize) -> io::Result<Vec<OwnedFd>> {
     let mut head = [0u8; TAG_LEN];
-    let mut iov = libc::iovec {
-        iov_base: head.as_mut_ptr().cast(),
-        iov_len: TAG_LEN,
-    };
+    let mut iov = libc::iovec { iov_base: head.as_mut_ptr().cast(), iov_len: TAG_LEN };
     let mut cbuf = CmsgBuf([0; 64]);
     let mut fds = Vec::new();
     // SAFETY: recvmsg into our buffers; CMSG_* walk the received control
@@ -224,10 +204,7 @@ pub(crate) fn recv(sock: BorrowedFd<'_>, tag: &str, n: usize) -> io::Result<Vec<
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "eventfd message: too many descriptors",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "eventfd message: too many descriptors"));
         }
         got
     };
@@ -236,10 +213,7 @@ pub(crate) fn recv(sock: BorrowedFd<'_>, tag: &str, n: usize) -> io::Result<Vec<
     }
     read_exact(sock, &mut head[got..])?;
     if head != header(tag) || fds.len() != n {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not the expected kind of object (sent by a different backend?)",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object (sent by a different backend?)"));
     }
     for fd in &fds {
         set_cloexec(fd.as_fd())?;
@@ -274,24 +248,9 @@ mod tests {
     #[test]
     fn parse_tokens() {
         assert_eq!(parse("gkefd1:n:7", "gkefd1:n", 1).unwrap(), vec![7]);
-        assert_eq!(
-            parse(" gkefd1:u:3:4:5\n", "gkefd1:u", 3).unwrap(),
-            vec![3, 4, 5]
-        );
-        for bad in [
-            "",
-            "gkefd1",
-            "gkefd1:n",
-            "gkefd1:u:1:2:3",
-            "gkefd2:n:1",
-            "gkefd1:n:-1",
-            "gkefd1:n:x",
-        ] {
-            assert_eq!(
-                parse(bad, "gkefd1:n", 1).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput,
-                "{bad:?}"
-            );
+        assert_eq!(parse(" gkefd1:u:3:4:5\n", "gkefd1:u", 3).unwrap(), vec![3, 4, 5]);
+        for bad in ["", "gkefd1", "gkefd1:n", "gkefd1:u:1:2:3", "gkefd2:n:1", "gkefd1:n:-1", "gkefd1:n:x"] {
+            assert_eq!(parse(bad, "gkefd1:n", 1).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }
     }
 
@@ -321,15 +280,9 @@ mod tests {
         }
         // Wrong kind or count: rejected (and the descriptors closed).
         send(tx.as_fd(), "gkefd1:n", &[p.as_fd()]).unwrap();
-        assert_eq!(
-            recv(rx.as_fd(), "gkefd1:u", 3).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        assert_eq!(recv(rx.as_fd(), "gkefd1:u", 3).unwrap_err().kind(), io::ErrorKind::InvalidData);
         // Peer gone.
         drop(tx);
-        assert_eq!(
-            recv(rx.as_fd(), "gkefd1:u", 3).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
+        assert_eq!(recv(rx.as_fd(), "gkefd1:u", 3).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }

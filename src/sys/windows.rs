@@ -120,23 +120,20 @@ use std::io::{self, Read, Write};
 use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::io::{
-    AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, FromRawHandle, FromRawSocket, OwnedHandle,
-    OwnedSocket, RawHandle, RawSocket,
+    AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket, RawHandle, RawSocket,
 };
 use std::ptr;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
-    SetHandleInformation,
+    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FROM_PROTOCOL_INFO, IN_ADDR, IN_ADDR_0, INADDR_LOOPBACK, INVALID_SOCKET, IPPROTO_TCP,
-    POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
-    WSADATA, WSADuplicateSocketW, WSAGetLastError, WSAPOLLFD, WSAPROTOCOL_INFOW, WSAPoll,
-    WSASocketW, WSAStartup, bind, listen, setsockopt,
+    AF_INET, FROM_PROTOCOL_INFO, IN_ADDR, IN_ADDR_0, INADDR_LOOPBACK, INVALID_SOCKET, IPPROTO_TCP, POLLERR, POLLHUP, POLLNVAL, POLLRDNORM,
+    POLLWRNORM, SO_EXCLUSIVEADDRUSE, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSA_FLAG_OVERLAPPED, WSADATA, WSADuplicateSocketW, WSAGetLastError, WSAPOLLFD, WSAPROTOCOL_INFOW, WSAPoll, WSASocketW, WSAStartup,
+    bind, listen, setsockopt,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
@@ -235,10 +232,7 @@ impl Signal for SocketPair {
 }
 
 fn closed() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "eventfd socket pair was closed",
-    )
+    io::Error::new(io::ErrorKind::UnexpectedEof, "eventfd socket pair was closed")
 }
 
 /// State shared by all clones of one eventfd in this process. The counter is
@@ -259,9 +253,7 @@ pub(crate) struct Inner {
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Inner")
-            .field("socket", &self.sock.as_raw_socket())
-            .finish_non_exhaustive()
+        f.debug_struct("Inner").field("socket", &self.sock.as_raw_socket()).finish_non_exhaustive()
     }
 }
 
@@ -269,10 +261,7 @@ impl Inner {
     pub(crate) fn new(initval: u32, flags: EfdFlags) -> io::Result<Self> {
         // EFD_CLOEXEC is implied: every handle is non-inheritable.
         let (reader, writer) = socket_pair()?;
-        let shared = Arc::new(Shared {
-            page: SharedPage::new(initval, flags)?,
-            pair: SocketPair { reader, writer },
-        });
+        let shared = Arc::new(Shared { page: SharedPage::new(initval, flags)?, pair: SocketPair { reader, writer } });
         if shared.page.is_readable() {
             shared.pair.set_readable()?;
         }
@@ -327,26 +316,14 @@ impl Inner {
     fn rearm(&self) {
         // Best effort: the only possible error is from mio's internal
         // reregister, and the read result is what the caller asked for.
-        let _ = self
-            .sock
-            .try_io(|| Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock)));
+        let _ = self.sock.try_io(|| Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock)));
     }
 
-    pub(crate) fn register(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
+    pub(crate) fn register(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> io::Result<()> {
         mio::event::Source::register(&mut self.sock, registry, token, interests)
     }
 
-    pub(crate) fn reregister(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
+    pub(crate) fn reregister(&mut self, registry: &mio::Registry, token: mio::Token, interests: mio::Interest) -> io::Result<()> {
         mio::event::Source::reregister(&mut self.sock, registry, token, interests)
     }
 
@@ -389,18 +366,9 @@ impl Inner {
         set_inherit(reader.as_raw_socket() as RawHandle, true)?;
         let writer = OwnedSocket::from(self.shared.pair.writer.try_clone()?);
         set_inherit(writer.as_raw_socket() as RawHandle, true)?;
-        let token = format!(
-            "{TOKEN_PREFIX}:i:{:x}:{:x}:{:x}",
-            section.as_raw_handle() as usize,
-            reader.as_raw_socket(),
-            writer.as_raw_socket()
-        );
-        Ok(InheritableExport {
-            token,
-            _section: section,
-            _reader: reader,
-            _writer: writer,
-        })
+        let token =
+            format!("{TOKEN_PREFIX}:i:{:x}:{:x}:{:x}", section.as_raw_handle() as usize, reader.as_raw_socket(), writer.as_raw_socket());
+        Ok(InheritableExport { token, _section: section, _reader: reader, _writer: writer })
     }
 
     /// Duplicates the section into process `pid` and prepares the sockets
@@ -442,26 +410,11 @@ impl Inner {
             Err(e) => {
                 // Don't leak the section handle in the target process.
                 // SAFETY: closes the handle we just created in `target`.
-                unsafe {
-                    DuplicateHandle(
-                        target.as_raw_handle(),
-                        remote,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        0,
-                        0,
-                        DUPLICATE_CLOSE_SOURCE,
-                    )
-                };
+                unsafe { DuplicateHandle(target.as_raw_handle(), remote, ptr::null_mut(), ptr::null_mut(), 0, 0, DUPLICATE_CLOSE_SOURCE) };
                 return Err(e);
             }
         };
-        Ok(format!(
-            "{TOKEN_PREFIX}:d:{:x}:{}:{}",
-            remote as usize,
-            hex(&r),
-            hex(&w)
-        ))
+        Ok(format!("{TOKEN_PREFIX}:d:{:x}:{}:{}", remote as usize, hex(&r), hex(&w)))
     }
 
     /// Rebuilds an eventfd from a token made by `export_inheritable` (in a
@@ -497,12 +450,7 @@ impl Inner {
                 check_pair(r, w)?;
                 // SAFETY: validated as our connected pair; the caller
                 // guarantees we may own the inherited handles.
-                unsafe {
-                    (
-                        OwnedSocket::from_raw_socket(r),
-                        OwnedSocket::from_raw_socket(w),
-                    )
-                }
+                unsafe { (OwnedSocket::from_raw_socket(r), OwnedSocket::from_raw_socket(w)) }
             }
             "d" => {
                 let r = socket_from_info(&unhex_info(a).ok_or_else(bad)?)?;
@@ -517,21 +465,14 @@ impl Inner {
         // `adopt` only takes it over if it holds an eventfd page.
         let page = unsafe { SharedPage::adopt(section as RawHandle) }?;
 
-        for h in [
-            page.section().as_raw_handle(),
-            reader.as_raw_socket() as RawHandle,
-            writer.as_raw_socket() as RawHandle,
-        ] {
+        for h in [page.section().as_raw_handle(), reader.as_raw_socket() as RawHandle, writer.as_raw_socket() as RawHandle] {
             set_inherit(h, false)?;
         }
         let reader = TcpStream::from(reader);
         let writer = TcpStream::from(writer);
         reader.set_nonblocking(true)?;
         writer.set_nonblocking(true)?;
-        Self::with_shared(Arc::new(Shared {
-            page,
-            pair: SocketPair { reader, writer },
-        }))
+        Self::with_shared(Arc::new(Shared { page, pair: SocketPair { reader, writer } }))
     }
 }
 
@@ -544,12 +485,7 @@ impl Inner {
         let keep = self.shared.page.section().try_clone_to_owned()?;
         let r = protocol_info(self.shared.pair.reader.as_socket(), peer_pid)?;
         let w = protocol_info(self.shared.pair.writer.as_socket(), peer_pid)?;
-        let token = format!(
-            "{TOKEN_PREFIX}:p:{:x}:{}:{}",
-            keep.as_raw_handle() as usize,
-            hex(&r),
-            hex(&w)
-        );
+        let token = format!("{TOKEN_PREFIX}:p:{:x}:{}:{}", keep.as_raw_handle() as usize, hex(&r), hex(&w));
         Ok((token, keep))
     }
 
@@ -578,10 +514,7 @@ impl Inner {
         let writer = TcpStream::from(writer);
         reader.set_nonblocking(true)?;
         writer.set_nonblocking(true)?;
-        Self::with_shared(Arc::new(Shared {
-            page,
-            pair: SocketPair { reader, writer },
-        }))
+        Self::with_shared(Arc::new(Shared { page, pair: SocketPair { reader, writer } }))
     }
 }
 
@@ -598,17 +531,7 @@ pub(crate) fn duplicate_from(pid: u32, value: usize) -> io::Result<OwnedHandle> 
     let mut ours: HANDLE = ptr::null_mut();
     // SAFETY: duplicates a handle out of the peer into a fresh handle of
     // ours; a bogus value just makes the call fail.
-    let ok = unsafe {
-        DuplicateHandle(
-            peer.as_raw_handle(),
-            value as HANDLE,
-            GetCurrentProcess(),
-            &mut ours,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    };
+    let ok = unsafe { DuplicateHandle(peer.as_raw_handle(), value as HANDLE, GetCurrentProcess(), &mut ours, 0, 0, DUPLICATE_SAME_ACCESS) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -624,9 +547,7 @@ fn protocol_info(sock: BorrowedSocket<'_>, pid: u32) -> io::Result<Vec<u8>> {
         return Err(last_wsa_error());
     }
     // SAFETY: plain-old-data struct, fully written by WSADuplicateSocketW.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), size_of::<WSAPROTOCOL_INFOW>())
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), size_of::<WSAPROTOCOL_INFOW>()) };
     Ok(bytes.to_vec())
 }
 
@@ -634,14 +555,7 @@ fn protocol_info(sock: BorrowedSocket<'_>, pid: u32) -> io::Result<Vec<u8>> {
 fn socket_from_info(info: &WSAPROTOCOL_INFOW) -> io::Result<OwnedSocket> {
     // SAFETY: `info` is a valid protocol info (WinSock validates it).
     let raw = unsafe {
-        WSASocketW(
-            FROM_PROTOCOL_INFO,
-            FROM_PROTOCOL_INFO,
-            FROM_PROTOCOL_INFO,
-            info,
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
-        )
+        WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, info, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT)
     };
     if raw == INVALID_SOCKET {
         return Err(last_wsa_error());
@@ -655,44 +569,27 @@ fn socket_from_info(info: &WSAPROTOCOL_INFOW) -> io::Result<OwnedSocket> {
 fn check_pair(reader: RawSocket, writer: RawSocket) -> io::Result<()> {
     // SAFETY: only used for getsockname/getpeername and never dropped
     // (ManuallyDrop), so nothing is closed even if the values are bogus.
-    let (r, w) = unsafe {
-        (
-            ManuallyDrop::new(TcpStream::from_raw_socket(reader)),
-            ManuallyDrop::new(TcpStream::from_raw_socket(writer)),
-        )
-    };
+    let (r, w) = unsafe { (ManuallyDrop::new(TcpStream::from_raw_socket(reader)), ManuallyDrop::new(TcpStream::from_raw_socket(writer))) };
     let ok = (|| {
-        let (rl, rp, wl, wp) = (
-            r.local_addr()?,
-            r.peer_addr()?,
-            w.local_addr()?,
-            w.peer_addr()?,
-        );
+        let (rl, rp, wl, wp) = (r.local_addr()?, r.peer_addr()?, w.local_addr()?, w.peer_addr()?);
         Ok::<_, io::Error>(rp == wl && wp == rl && rl.ip().is_loopback())
     })();
     match ok {
         Ok(true) => Ok(()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "eventfd token: sockets are not an eventfd socket pair",
-        )),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "eventfd token: sockets are not an eventfd socket pair")),
     }
 }
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 fn parse_hex_usize(s: &str) -> Option<usize> {
-    (!s.is_empty() && s.len() <= 16)
-        .then(|| usize::from_str_radix(s, 16).ok())
-        .flatten()
+    (!s.is_empty() && s.len() <= 16).then(|| usize::from_str_radix(s, 16).ok()).flatten()
 }
 
 fn unhex_info(s: &str) -> Option<WSAPROTOCOL_INFOW> {
@@ -701,12 +598,7 @@ fn unhex_info(s: &str) -> Option<WSAPROTOCOL_INFOW> {
     }
     let mut info = MaybeUninit::<WSAPROTOCOL_INFOW>::zeroed();
     // SAFETY: we write exactly size_of::<WSAPROTOCOL_INFOW>() bytes into it.
-    let out = unsafe {
-        std::slice::from_raw_parts_mut(
-            info.as_mut_ptr().cast::<u8>(),
-            size_of::<WSAPROTOCOL_INFOW>(),
-        )
-    };
+    let out = unsafe { std::slice::from_raw_parts_mut(info.as_mut_ptr().cast::<u8>(), size_of::<WSAPROTOCOL_INFOW>()) };
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
@@ -720,11 +612,7 @@ fn set_inherit(handle: RawHandle, inherit: bool) -> io::Result<()> {
     let flag = if inherit { HANDLE_FLAG_INHERIT } else { 0 };
     // SAFETY: SetHandleInformation only changes flags of an open handle; the
     // callers pass handles they own or borrow.
-    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flag) } == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flag) } == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 fn last_wsa_error() -> io::Error {
@@ -749,31 +637,18 @@ fn init_winsock() {
 fn set_no_inherit(sock: BorrowedSocket<'_>) -> io::Result<()> {
     // SAFETY: the socket is open for the duration of the borrow; a SOCKET is
     // a kernel handle on which SetHandleInformation is valid.
-    let ok =
-        unsafe { SetHandleInformation(sock.as_raw_socket() as HANDLE, HANDLE_FLAG_INHERIT, 0) };
-    if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let ok = unsafe { SetHandleInformation(sock.as_raw_socket() as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// `WSAPoll`s one socket for up to `ms` milliseconds (`-1`: no timeout).
 /// Returns the reported events (0 on timeout).
 fn poll_one(sock: BorrowedSocket<'_>, events: i16, ms: i32) -> io::Result<i16> {
-    let mut fd = WSAPOLLFD {
-        fd: sock.as_raw_socket() as SOCKET,
-        events,
-        revents: 0,
-    };
+    let mut fd = WSAPOLLFD { fd: sock.as_raw_socket() as SOCKET, events, revents: 0 };
     // SAFETY: `fd` is a valid WSAPOLLFD array of length 1 for the call, and
     // the socket is open for the duration of the borrow.
     let n = unsafe { WSAPoll(&mut fd, 1, ms) };
-    if n == SOCKET_ERROR {
-        Err(last_wsa_error())
-    } else {
-        Ok(if n > 0 { fd.revents } else { 0 })
-    }
+    if n == SOCKET_ERROR { Err(last_wsa_error()) } else { Ok(if n > 0 { fd.revents } else { 0 }) }
 }
 
 /// `WSAPoll`s one socket. Returns `true` if any requested event (or an
@@ -789,14 +664,7 @@ fn loopback_listener() -> io::Result<TcpListener> {
     init_winsock();
     // SAFETY: plain FFI call with constant arguments and a null protocol info.
     let raw = unsafe {
-        WSASocketW(
-            i32::from(AF_INET),
-            SOCK_STREAM,
-            IPPROTO_TCP,
-            ptr::null(),
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
-        )
+        WSASocketW(i32::from(AF_INET), SOCK_STREAM, IPPROTO_TCP, ptr::null(), 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT)
     };
     if raw == INVALID_SOCKET {
         return Err(last_wsa_error());
@@ -806,15 +674,7 @@ fn loopback_listener() -> io::Result<TcpListener> {
 
     let one: i32 = 1;
     // SAFETY: `optval` points to a live i32 and `optlen` is its size.
-    let rc = unsafe {
-        setsockopt(
-            raw,
-            SOL_SOCKET,
-            SO_EXCLUSIVEADDRUSE,
-            ptr::from_ref(&one).cast(),
-            size_of::<i32>() as i32,
-        )
-    };
+    let rc = unsafe { setsockopt(raw, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, ptr::from_ref(&one).cast(), size_of::<i32>() as i32) };
     if rc == SOCKET_ERROR {
         return Err(last_wsa_error());
     }
@@ -822,21 +682,11 @@ fn loopback_listener() -> io::Result<TcpListener> {
     let addr = SOCKADDR_IN {
         sin_family: AF_INET,
         sin_port: 0,
-        sin_addr: IN_ADDR {
-            S_un: IN_ADDR_0 {
-                S_addr: INADDR_LOOPBACK.to_be(),
-            },
-        },
+        sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: INADDR_LOOPBACK.to_be() } },
         sin_zero: [0; 8],
     };
     // SAFETY: `addr` is a valid SOCKADDR_IN and `namelen` is its size.
-    let rc = unsafe {
-        bind(
-            raw,
-            ptr::from_ref(&addr).cast::<SOCKADDR>(),
-            size_of::<SOCKADDR_IN>() as i32,
-        )
-    };
+    let rc = unsafe { bind(raw, ptr::from_ref(&addr).cast::<SOCKADDR>(), size_of::<SOCKADDR_IN>() as i32) };
     if rc == SOCKET_ERROR {
         return Err(last_wsa_error());
     }
@@ -868,10 +718,7 @@ fn socket_pair() -> io::Result<(TcpStream, TcpStream)> {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "eventfd socket pair: connection never accepted",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "eventfd socket pair: connection never accepted"));
                 }
                 wait(listener.as_socket(), POLLRDNORM, left)?;
             }
@@ -1028,11 +875,7 @@ mod tests {
 
         fn tokens(poll: &mut Poll, events: &mut Events, ms: u64) -> Vec<Token> {
             poll.poll(events, Some(Duration::from_millis(ms))).unwrap();
-            events
-                .iter()
-                .filter(|e| e.is_readable())
-                .map(|e| e.token())
-                .collect()
+            events.iter().filter(|e| e.is_readable()).map(|e| e.token()).collect()
         }
 
         #[test]
@@ -1040,9 +883,7 @@ mod tests {
             let mut poll = Poll::new().unwrap();
             let mut events = Events::with_capacity(8);
             let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
-            poll.registry()
-                .register(&mut efd, Token(1), Interest::READABLE)
-                .unwrap();
+            poll.registry().register(&mut efd, Token(1), Interest::READABLE).unwrap();
             assert!(tokens(&mut poll, &mut events, 50).is_empty());
 
             for round in 1..=5u64 {
@@ -1063,12 +904,8 @@ mod tests {
             let mut events = Events::with_capacity(8);
             let mut a = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
             let mut b = a.try_clone().unwrap();
-            poll.registry()
-                .register(&mut a, Token(1), Interest::READABLE)
-                .unwrap();
-            poll.registry()
-                .register(&mut b, Token(2), Interest::READABLE)
-                .unwrap();
+            poll.registry().register(&mut a, Token(1), Interest::READABLE).unwrap();
+            poll.registry().register(&mut b, Token(2), Interest::READABLE).unwrap();
             a.write(1).unwrap();
             let mut got = tokens(&mut poll, &mut events, 2000);
             // Both registrations may not complete in the same poll call.
@@ -1087,11 +924,7 @@ mod tests {
         let a = GkEventFd::new(0, EfdFlags::NONBLOCK).unwrap();
         let token = a.export_to(std::process::id()).unwrap();
         assert!(token.starts_with("gkefd1:d:"));
-        assert!(
-            token.len() < crate::compat::TOKEN_MAX,
-            "token is {} bytes",
-            token.len()
-        );
+        assert!(token.len() < crate::compat::TOKEN_MAX, "token is {} bytes", token.len());
         // SAFETY: made for this process, imported once.
         let b = unsafe { GkEventFd::import(&token) }.unwrap();
         assert_ne!(a.as_raw_socket(), b.as_raw_socket());
@@ -1110,15 +943,7 @@ mod tests {
 
     #[test]
     fn import_rejects_malformed_tokens() {
-        for token in [
-            "",
-            "gkefd1",
-            "gkefd2:i:1:2:3",
-            "gkefd1:x:1:2:3",
-            "gkefd1:i:zz:1:2",
-            "gkefd1:i:1:2:3:4",
-            "gkefd1:d:4:00:00",
-        ] {
+        for token in ["", "gkefd1", "gkefd2:i:1:2:3", "gkefd1:x:1:2:3", "gkefd1:i:zz:1:2", "gkefd1:i:1:2:3:4", "gkefd1:d:4:00:00"] {
             // SAFETY: rejected before any handle is touched.
             let err = unsafe { GkEventFd::import(token) }.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{token:?}");
@@ -1135,11 +960,7 @@ mod tests {
         let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
         let section = efd.inner.shared.page.section().as_raw_handle() as usize;
         // c1 and c2 are not connected to each other.
-        let token = format!(
-            "gkefd1:i:{section:x}:{:x}:{:x}",
-            c1.as_raw_socket(),
-            c2.as_raw_socket()
-        );
+        let token = format!("gkefd1:i:{section:x}:{:x}:{:x}", c1.as_raw_socket(), c2.as_raw_socket());
         // SAFETY: rejected during validation; nothing is taken over.
         let err = unsafe { GkEventFd::import(&token) }.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1175,12 +996,7 @@ mod tests {
 
     fn spawn_child(role: &str, token: &str) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "sys::windows::tests::child_entry",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", "sys::windows::tests::child_entry", "--nocapture", "--test-threads=1"])
             .env("GK_WIN_TEST_ROLE", role)
             .env("GK_WIN_TEST_TOKEN", token)
             .stdout(std::process::Stdio::piped())

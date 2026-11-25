@@ -19,8 +19,7 @@ fn main() -> std::io::Result<()> {
     let mut poll = Poll::new()?;
     // Non-blocking: mio readiness is edge-triggered, so we read until WouldBlock.
     let mut efd = GkEventFd::new(0, EfdFlags::NONBLOCK)?;
-    poll.registry()
-        .register(&mut efd, WAKER, Interest::READABLE)?;
+    poll.registry().register(&mut efd, WAKER, Interest::READABLE)?;
 
     for id in 1..=WORKERS {
         let notifier = efd.try_clone()?;

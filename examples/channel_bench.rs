@@ -16,12 +16,8 @@ use std::time::Instant;
 use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel};
 
 fn channel_rate(size: usize, count: usize) -> f64 {
-    let (mut tx, mut rx) = GkChannel::with_options(ChannelOptions {
-        capacity: 16 << 20,
-        max_message: 1 << 20,
-        ..Default::default()
-    })
-    .unwrap();
+    let (mut tx, mut rx) =
+        GkChannel::with_options(ChannelOptions { capacity: 16 << 20, max_message: 1 << 20, ..Default::default() }).unwrap();
     let start = Instant::now();
     let writer = thread::spawn(move || {
         let msg = vec![7u8; size];
@@ -38,18 +34,10 @@ fn channel_rate(size: usize, count: usize) -> f64 {
 }
 
 fn channel_ping_pong(rounds: usize) -> f64 {
-    let (mut to_b, mut from_a) = GkChannel::with_options(ChannelOptions {
-        capacity: 1 << 16,
-        max_message: 64,
-        ..Default::default()
-    })
-    .unwrap();
-    let (mut to_a, mut from_b) = GkChannel::with_options(ChannelOptions {
-        capacity: 1 << 16,
-        max_message: 64,
-        ..Default::default()
-    })
-    .unwrap();
+    let (mut to_b, mut from_a) =
+        GkChannel::with_options(ChannelOptions { capacity: 1 << 16, max_message: 64, ..Default::default() }).unwrap();
+    let (mut to_a, mut from_b) =
+        GkChannel::with_options(ChannelOptions { capacity: 1 << 16, max_message: 64, ..Default::default() }).unwrap();
     let b = thread::spawn(move || {
         let mut buf = [0u8; 8];
         for _ in 0..rounds {
@@ -69,11 +57,7 @@ fn channel_ping_pong(rounds: usize) -> f64 {
 }
 
 /// Length-prefixed messages over any byte stream pair.
-fn stream_rate<S: Read + Write + Send + 'static>(
-    (mut a, mut b): (S, S),
-    size: usize,
-    count: usize,
-) -> f64 {
+fn stream_rate<S: Read + Write + Send + 'static>((mut a, mut b): (S, S), size: usize, count: usize) -> f64 {
     let start = Instant::now();
     let writer = thread::spawn(move || {
         let msg = vec![7u8; size];
@@ -86,8 +70,7 @@ fn stream_rate<S: Read + Write + Send + 'static>(
     let mut len = [0u8; 4];
     for _ in 0..count {
         b.read_exact(&mut len).unwrap();
-        b.read_exact(&mut buf[..u32::from_le_bytes(len) as usize])
-            .unwrap();
+        b.read_exact(&mut buf[..u32::from_le_bytes(len) as usize]).unwrap();
     }
     writer.join().unwrap();
     count as f64 / start.elapsed().as_secs_f64()
@@ -100,12 +83,7 @@ fn pipe() -> (std::fs::File, std::fs::File) {
     // SAFETY: `fds` has room for two descriptors.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     // SAFETY: fresh descriptors we own.
-    unsafe {
-        (
-            std::fs::File::from_raw_fd(fds[1]),
-            std::fs::File::from_raw_fd(fds[0]),
-        )
-    }
+    unsafe { (std::fs::File::from_raw_fd(fds[1]), std::fs::File::from_raw_fd(fds[0])) }
 }
 
 #[cfg(unix)]
@@ -188,11 +166,7 @@ fn message_latency_during_bulk() -> (f64, f64) {
         let mut sent = 0u64;
         let mut i = 0u64;
         while sent < total {
-            let mut w = if sent == 0 {
-                tx.bulk_writer(Some(total)).unwrap()
-            } else {
-                tx.resume_bulk().unwrap()
-            };
+            let mut w = if sent == 0 { tx.bulk_writer(Some(total)).unwrap() } else { tx.resume_bulk().unwrap() };
             w.write_all(&piece).unwrap();
             sent += piece.len() as u64;
             if sent < total {
@@ -253,10 +227,7 @@ fn message_latency_during_bulk() -> (f64, f64) {
 
 fn main() {
     println!("messages per second (two threads, higher is better)");
-    println!(
-        "{:>8}  {:>14}  {:>14}  {:>14}",
-        "size", "GkChannel", "pipe", "unix socket"
-    );
+    println!("{:>8}  {:>14}  {:>14}  {:>14}", "size", "GkChannel", "pipe", "unix socket");
     for (size, count) in [(64, 2_000_000), (1024, 1_000_000), (65536, 50_000)] {
         let ch = channel_rate(size, count);
         #[cfg(unix)]

@@ -174,15 +174,8 @@ impl Ring {
                  capacity / 2 - 8 and chunk <= bulk_capacity / 2 - 32",
             ));
         }
-        let len = usize::try_from(sizes.region_len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "channel too large"))?;
-        let region = SharedRegion::create_with(
-            len,
-            &RegionOptions {
-                huge: opts.huge_pages,
-                ..Default::default()
-            },
-        )?;
+        let len = usize::try_from(sizes.region_len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "channel too large"))?;
+        let region = SharedRegion::create_with(len, &RegionOptions { huge: opts.huge_pages, ..Default::default() })?;
         // SAFETY: fresh, zeroed, page-aligned and `region_len` long.
         unsafe { Layout::init(region.ptr(), sizes, current_pid()) };
         Ok(Self::with_region(region))
@@ -197,11 +190,7 @@ impl Ring {
     }
 
     fn lane(&self, lane: usize) -> &Lane {
-        if lane == MSG {
-            &self.layout.msg
-        } else {
-            &self.layout.bulk
-        }
+        if lane == MSG { &self.layout.msg } else { &self.layout.bulk }
     }
 }
 
@@ -231,15 +220,7 @@ struct End {
 
 impl End {
     fn new(ring: Arc<Ring>, data_ready: GkEventFd, space_ready: GkEventFd, side: Side) -> Self {
-        Self {
-            ring,
-            data_ready,
-            space_ready,
-            side,
-            nonblocking: false,
-            detached: false,
-            armed: [false; 2],
-        }
+        Self { ring, data_ready, space_ready, side, nonblocking: false, detached: false, armed: [false; 2] }
     }
 
     fn lane(&self, lane: usize) -> &Lane {
@@ -284,10 +265,7 @@ impl End {
         if self.owner().load(Ordering::Relaxed) == current_pid() {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "this channel end belongs to another process (call claim() after fork)",
-            ))
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "this channel end belongs to another process (call claim() after fork)"))
         }
     }
 
@@ -405,10 +383,7 @@ impl Drop for End {
 }
 
 fn broken() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::BrokenPipe,
-        "the other end of the channel is gone",
-    )
+    io::Error::new(io::ErrorKind::BrokenPipe, "the other end of the channel is gone")
 }
 
 /// Waits up to `timeout` for `efd` to become readable.
@@ -416,33 +391,19 @@ fn wait_readable(efd: &GkEventFd, timeout: Duration) -> io::Result<bool> {
     let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
     #[cfg(unix)]
     {
-        let mut pfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(efd),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfd = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(efd), events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd.
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
         if n < 0 {
             let err = io::Error::last_os_error();
-            return if err.kind() == io::ErrorKind::Interrupted {
-                Ok(false)
-            } else {
-                Err(err)
-            };
+            return if err.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(err) };
         }
         Ok(n > 0)
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Networking::WinSock::{
-            POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
-        };
-        let mut fd = WSAPOLLFD {
-            fd: std::os::windows::io::AsRawSocket::as_raw_socket(efd) as SOCKET,
-            events: POLLRDNORM,
-            revents: 0,
-        };
+        use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll};
+        let mut fd = WSAPOLLFD { fd: std::os::windows::io::AsRawSocket::as_raw_socket(efd) as SOCKET, events: POLLRDNORM, revents: 0 };
         // SAFETY: one valid WSAPOLLFD; the socket is open.
         let n = unsafe { WSAPoll(&mut fd, 1, ms) };
         if n == SOCKET_ERROR {
@@ -472,12 +433,7 @@ impl GkChannel {
         let ring = Arc::new(Ring::create(opts)?);
         let bell = || GkEventFd::new(0, EfdFlags::NONBLOCK | EfdFlags::CLOEXEC);
         let (data_ready, space_ready) = (bell()?, bell()?);
-        let sender = End::new(
-            Arc::clone(&ring),
-            data_ready.try_clone()?,
-            space_ready.try_clone()?,
-            Side::Sender,
-        );
+        let sender = End::new(Arc::clone(&ring), data_ready.try_clone()?, space_ready.try_clone()?, Side::Sender);
         let receiver = End::new(ring, data_ready, space_ready, Side::Receiver);
         Ok((GkSender::from_end(sender), GkReceiver::from_end(receiver)))
     }
@@ -519,12 +475,7 @@ impl GkSender {
     fn from_end(end: End) -> Self {
         let msg_tail = end.lane(MSG).tail_line().pos.load(Ordering::Acquire);
         let bulk_tail = end.lane(BULK).tail_line().pos.load(Ordering::Acquire);
-        Self {
-            end,
-            msg_tail,
-            bulk_tail,
-            bulk: bulk::TxState::default(),
-        }
+        Self { end, msg_tail, bulk_tail, bulk: bulk::TxState::default() }
     }
 
     /// Sends one message (copied into the message ring). Blocks while the
@@ -557,27 +508,17 @@ impl GkSender {
     pub fn reserve_kind(&mut self, kind: u16, len: usize) -> io::Result<SendSlot<'_>> {
         self.end.check_owner()?;
         if len as u64 > self.end.lane(MSG).max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message larger than max_message (use send_bulk)",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "message larger than max_message (use send_bulk)"));
         }
         loop {
             if self.end.peer_closed() {
                 return Err(broken());
             }
             if let Some((pad, idx)) = self.end.lane(MSG).reserve(self.msg_tail, len as u64) {
-                return Ok(SendSlot {
-                    sender: self,
-                    pad,
-                    idx,
-                    len,
-                    kind,
-                });
+                return Ok(SendSlot { sender: self, pad, idx, len, kind });
             }
             let (lane, tail, nb) = (*self.end.lane(MSG), self.msg_tail, self.end.nonblocking);
-            self.end
-                .wait(MSG, nb, || lane.reserve(tail, len as u64).is_some())?;
+            self.end.wait(MSG, nb, || lane.reserve(tail, len as u64).is_some())?;
         }
     }
 
@@ -633,18 +574,10 @@ impl SendSlot<'_> {
     /// # Panics
     /// If `n` is larger than the reserved length.
     pub fn commit(self, n: usize) {
-        assert!(
-            n <= self.len,
-            "commit({n}) exceeds the reserved {} bytes",
-            self.len
-        );
+        assert!(n <= self.len, "commit({n}) exceeds the reserved {} bytes", self.len);
         let s = self.sender;
         // SAFETY: reserved by `reserve(s.msg_tail, self.len)` and `n <= len`.
-        s.msg_tail = unsafe {
-            s.end
-                .lane(MSG)
-                .publish(s.msg_tail, self.pad, self.idx, n as u64, 0, self.kind)
-        };
+        s.msg_tail = unsafe { s.end.lane(MSG).publish(s.msg_tail, self.pad, self.idx, n as u64, 0, self.kind) };
         s.end.wake_peer(MSG);
     }
 }
@@ -660,9 +593,7 @@ impl std::ops::Deref for SendSlot<'_> {
 impl std::ops::DerefMut for SendSlot<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above; nobody else reads it before it is published.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.sender.end.lane(MSG).payload(self.idx), self.len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.sender.end.lane(MSG).payload(self.idx), self.len) }
     }
 }
 
@@ -670,12 +601,7 @@ impl GkReceiver {
     fn from_end(end: End) -> Self {
         let msg_head = end.lane(MSG).head_line().pos.load(Ordering::Acquire);
         let bulk_head = end.lane(BULK).head_line().pos.load(Ordering::Acquire);
-        Self {
-            end,
-            msg_head,
-            bulk_head,
-            bulk: bulk::RxState::default(),
-        }
+        Self { end, msg_head, bulk_head, bulk: bulk::RxState::default() }
     }
 
     /// Waits for the next message.
@@ -686,8 +612,7 @@ impl GkReceiver {
                 return Ok(rec);
             }
             let (lane, head, nb) = (*self.end.lane(MSG), self.msg_head, self.end.nonblocking);
-            self.end
-                .wait(MSG, nb, || !matches!(lane.peek(head), Ok(None)))?;
+            self.end.wait(MSG, nb, || !matches!(lane.peek(head), Ok(None)))?;
         }
     }
 
@@ -714,10 +639,7 @@ impl GkReceiver {
     pub fn recv_kind(&mut self, buf: &mut [u8]) -> io::Result<(u16, usize)> {
         let rec = self.next()?;
         if rec.len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "buffer smaller than the next message",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "buffer smaller than the next message"));
         }
         // SAFETY: `rec` points to `len` published bytes we own until consumed.
         buf[..rec.len].copy_from_slice(unsafe { std::slice::from_raw_parts(rec.ptr, rec.len) });
@@ -751,9 +673,7 @@ impl GkReceiver {
     pub fn recv_with_kind<R>(&mut self, f: impl FnOnce(u16, &[u8]) -> R) -> io::Result<R> {
         let rec = self.next()?;
         // SAFETY: as in `recv`; the sender does not reuse it before `consume`.
-        let r = f(rec.kind, unsafe {
-            std::slice::from_raw_parts(rec.ptr, rec.len)
-        });
+        let r = f(rec.kind, unsafe { std::slice::from_raw_parts(rec.ptr, rec.len) });
         self.consume(rec.next);
         Ok(r)
     }

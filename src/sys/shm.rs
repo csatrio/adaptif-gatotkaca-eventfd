@@ -115,11 +115,7 @@ impl SharedPage {
     fn is_page(ptr: NonNull<u8>, len: usize) -> bool {
         // SAFETY: the view is at least `len >= size_of::<State>()` bytes
         // (checked by the region before calling us) and page-aligned.
-        len >= size_of::<State>()
-            && unsafe { ptr.cast::<State>().as_ref() }
-                .magic
-                .load(Ordering::Acquire)
-                == MAGIC
+        len >= size_of::<State>() && unsafe { ptr.cast::<State>().as_ref() }.magic.load(Ordering::Acquire) == MAGIC
     }
 
     pub(crate) fn is_nonblocking(&self) -> bool {
@@ -127,9 +123,7 @@ impl SharedPage {
     }
 
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) {
-        self.state()
-            .nonblocking
-            .store(nonblocking, Ordering::Relaxed);
+        self.state().nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 
     /// True if the counter is > 0 (initial readiness, recovery).
@@ -160,11 +154,7 @@ impl SharedPage {
                 let _guard = self.lock(signal)?;
                 let value = state.counter.load(Ordering::Relaxed);
                 if value > 0 {
-                    let (ret, new) = if state.semaphore.load(Ordering::Relaxed) {
-                        (1, value - 1)
-                    } else {
-                        (value, 0)
-                    };
+                    let (ret, new) = if state.semaphore.load(Ordering::Relaxed) { (1, value - 1) } else { (value, 0) };
                     if new == 0 {
                         signal.clear_readable()?;
                     }
@@ -239,15 +229,8 @@ impl State {
     /// Takes the lock (see the module docs for the waiting strategy).
     fn lock(&self) -> Guard<'_> {
         let me = current_pid();
-        if self
-            .lock
-            .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Guard {
-                lock: &self.lock,
-                recovered: false,
-            };
+        if self.lock.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return Guard { lock: &self.lock, recovered: false };
         }
         self.lock_slow(me)
     }
@@ -260,15 +243,8 @@ impl State {
             // Test before test-and-set, so waiters don't fight over the line.
             let owner = self.lock.load(Ordering::Relaxed);
             if owner == 0 {
-                if self
-                    .lock
-                    .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return Guard {
-                        lock: &self.lock,
-                        recovered: false,
-                    };
+                if self.lock.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return Guard { lock: &self.lock, recovered: false };
                 }
                 backoff.spin();
                 continue;
@@ -280,15 +256,8 @@ impl State {
             // Held for a while. Another thread of this process is alive by
             // definition; another process may have died holding it.
             if owner != me && !process_alive(owner) {
-                if self
-                    .lock
-                    .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return Guard {
-                        lock: &self.lock,
-                        recovered: true,
-                    };
+                if self.lock.compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return Guard { lock: &self.lock, recovered: true };
                 }
                 continue;
             }
@@ -475,10 +444,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_liveness_of_children() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
-            .spawn()
-            .unwrap();
+        let mut child = std::process::Command::new("cmd").args(["/C", "ping -n 30 127.0.0.1 >NUL"]).spawn().unwrap();
         let pid = child.id();
         assert!(process_alive(pid));
         child.kill().unwrap();
@@ -486,10 +452,7 @@ mod tests {
         // stays around and must be reported dead.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while process_alive(pid) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child not seen as exited"
-            );
+            assert!(std::time::Instant::now() < deadline, "child not seen as exited");
             thread::sleep(Duration::from_millis(5));
         }
         child.wait().unwrap();
@@ -502,16 +465,7 @@ mod tests {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
         // SAFETY: a fresh unnamed, zero-filled section.
-        let raw = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                4096,
-                std::ptr::null(),
-            )
-        };
+        let raw = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4096, std::ptr::null()) };
         assert!(!raw.is_null());
         // SAFETY: fresh handle we own; adopt must reject it and leave it open.
         let section = unsafe { OwnedHandle::from_raw_handle(raw) };

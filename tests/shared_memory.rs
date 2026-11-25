@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use adaptif_gatotkaca_eventfd::{
-    EfdFlags, GkEventFd, GkListener, GkProcess, GkSharedMemory, HugePages, SharedMemoryOptions,
-};
+use adaptif_gatotkaca_eventfd::{EfdFlags, GkEventFd, GkListener, GkProcess, GkSharedMemory, HugePages, SharedMemoryOptions};
 
 fn pattern(i: usize) -> u8 {
     (i.wrapping_mul(2654435761) >> 11) as u8
@@ -46,10 +44,7 @@ fn new_is_zeroed_and_writable() {
     fill(&shm, 0, shm.len(), 0x3c);
     assert!(check(&shm, 0, shm.len(), 0x3c));
     let dbg = format!("{shm:?}");
-    assert!(
-        dbg.contains("GkSharedMemory") && dbg.contains("len"),
-        "{dbg}"
-    );
+    assert!(dbg.contains("GkSharedMemory") && dbg.contains("len"), "{dbg}");
 }
 
 #[test]
@@ -60,32 +55,15 @@ fn lengths_round_up_to_the_page_size() {
     assert_eq!(one.len(), page);
     assert_eq!(GkSharedMemory::new(page).unwrap().len(), page);
     assert_eq!(GkSharedMemory::new(page + 1).unwrap().len(), 2 * page);
-    assert_eq!(
-        GkSharedMemory::new(0).unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
+    assert_eq!(GkSharedMemory::new(0).unwrap_err().kind(), ErrorKind::InvalidInput);
     assert!(GkSharedMemory::new(usize::MAX).is_err());
 }
 
 #[test]
 fn options() {
-    assert_eq!(
-        SharedMemoryOptions::default(),
-        SharedMemoryOptions {
-            huge_pages: HugePages::Off,
-            huge_page_size: None,
-            populate: false,
-        }
-    );
+    assert_eq!(SharedMemoryOptions::default(), SharedMemoryOptions { huge_pages: HugePages::Off, huge_page_size: None, populate: false });
     assert_eq!(HugePages::default(), HugePages::Off);
-    let populated = GkSharedMemory::with_options(
-        3 << 20,
-        SharedMemoryOptions {
-            populate: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let populated = GkSharedMemory::with_options(3 << 20, SharedMemoryOptions { populate: true, ..Default::default() }).unwrap();
     assert_eq!(populated.len(), 3 << 20);
     // SAFETY: only this thread uses the memory.
     assert!(unsafe { populated.as_slice() }.iter().all(|&b| b == 0));
@@ -97,15 +75,9 @@ fn options() {
 #[test]
 fn prefer_works_everywhere() {
     for populate in [false, true] {
-        let shm = GkSharedMemory::with_options(
-            4 << 20,
-            SharedMemoryOptions {
-                huge_pages: HugePages::Prefer,
-                populate,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let shm =
+            GkSharedMemory::with_options(4 << 20, SharedMemoryOptions { huge_pages: HugePages::Prefer, populate, ..Default::default() })
+                .unwrap();
         assert!(shm.len() >= 4 << 20);
         assert_eq!(shm.len() % shm.page_size(), 0);
         fill(&shm, 0, shm.len(), 7);
@@ -116,13 +88,7 @@ fn prefer_works_everywhere() {
 #[test]
 fn require_gives_huge_pages_or_a_clear_error() {
     let strict = std::env::var_os("GK_TEST_HUGEPAGES").is_some_and(|v| v == "1");
-    let r = GkSharedMemory::with_options(
-        4 << 20,
-        SharedMemoryOptions {
-            huge_pages: HugePages::Require,
-            ..Default::default()
-        },
-    );
+    let r = GkSharedMemory::with_options(4 << 20, SharedMemoryOptions { huge_pages: HugePages::Require, ..Default::default() });
     match r {
         Ok(shm) => {
             assert!(shm.is_huge());
@@ -135,33 +101,16 @@ fn require_gives_huge_pages_or_a_clear_error() {
         Err(e) => {
             assert!(!strict, "GK_TEST_HUGEPAGES=1 but Require failed: {e}");
             assert!(
-                matches!(
-                    e.kind(),
-                    ErrorKind::Unsupported | ErrorKind::PermissionDenied | ErrorKind::OutOfMemory
-                ),
+                matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::PermissionDenied | ErrorKind::OutOfMemory),
                 "unexpected error: {e:?}"
             );
         }
     }
     // macOS/iOS and the unix systems without huge page support always say
     // Unsupported.
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-        target_os = "illumos"
-    ))]
+    #[cfg(any(target_vendor = "apple", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly", target_os = "illumos"))]
     assert_eq!(
-        GkSharedMemory::with_options(
-            1,
-            SharedMemoryOptions {
-                huge_pages: HugePages::Require,
-                ..Default::default()
-            }
-        )
-        .unwrap_err()
-        .kind(),
+        GkSharedMemory::with_options(1, SharedMemoryOptions { huge_pages: HugePages::Require, ..Default::default() }).unwrap_err().kind(),
         ErrorKind::Unsupported
     );
 }
@@ -249,20 +198,11 @@ fn send_to_and_recv_from() {
     // An eventfd where shared memory is expected, and the other way round.
     let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
     efd.send_to(&a).unwrap();
-    assert_eq!(
-        GkSharedMemory::recv_from(&b).unwrap_err().kind(),
-        ErrorKind::InvalidData
-    );
+    assert_eq!(GkSharedMemory::recv_from(&b).unwrap_err().kind(), ErrorKind::InvalidData);
     shm.send_to(&a).unwrap();
-    assert_eq!(
-        GkEventFd::recv_from(&b).unwrap_err().kind(),
-        ErrorKind::InvalidData
-    );
+    assert_eq!(GkEventFd::recv_from(&b).unwrap_err().kind(), ErrorKind::InvalidData);
     drop(a);
-    assert_eq!(
-        GkSharedMemory::recv_from(&b).unwrap_err().kind(),
-        ErrorKind::UnexpectedEof
-    );
+    assert_eq!(GkSharedMemory::recv_from(&b).unwrap_err().kind(), ErrorKind::UnexpectedEof);
 }
 
 /// The uniform process API (all OS), between two threads of this process.
@@ -276,10 +216,7 @@ fn through_gk_process() {
         let ping = peer.recv().unwrap();
         let pong = peer.recv().unwrap();
         // A channel end is not shared memory: refused.
-        assert_eq!(
-            peer.recv_as::<GkSharedMemory>().unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
+        assert_eq!(peer.recv_as::<GkSharedMemory>().unwrap_err().kind(), ErrorKind::InvalidData);
         // Shared memory is not an eventfd: refused.
         assert_eq!(peer.recv().unwrap_err().kind(), ErrorKind::InvalidData);
         assert_eq!(ping.read().unwrap(), 1);

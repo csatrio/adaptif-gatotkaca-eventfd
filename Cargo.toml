@@ -53,6 +53,15 @@ windows-sys = { version = "0.59", features = [
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 proptest = "1"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(gk_native)", "cfg(docsrs)"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
 [package.metadata.docs.rs]
 # Not all-features: `force-shim` would document the Linux shim instead of the
 # kernel eventfd.

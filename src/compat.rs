@@ -180,15 +180,10 @@ pub const TOKEN_MAX: usize = 4096;
 
 /// Inheritable exports kept alive until `eventfd_export_release` (C callers
 /// have no destructor to end them).
-fn exports()
--> std::sync::MutexGuard<'static, std::collections::HashMap<String, crate::InheritableExport>> {
-    static EXPORTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, crate::InheritableExport>>,
-    > = std::sync::OnceLock::new();
-    EXPORTS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn exports() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, crate::InheritableExport>> {
+    static EXPORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, crate::InheritableExport>>> =
+        std::sync::OnceLock::new();
+    EXPORTS.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// `-1` with `errno` from `e`; bad tokens or descriptors of the wrong kind
@@ -245,11 +240,7 @@ const EFAULT: c_int = 14;
 /// # Safety
 ///
 /// `buf` must be valid for writing `len` bytes.
-pub unsafe fn eventfd_export_inheritable(
-    fd: c_int,
-    buf: *mut core::ffi::c_char,
-    len: usize,
-) -> c_int {
+pub unsafe fn eventfd_export_inheritable(fd: c_int, buf: *mut core::ffi::c_char, len: usize) -> c_int {
     match imp::export_inheritable(fd) {
         Ok(export) => {
             // SAFETY: forwarded to the caller.
@@ -366,12 +357,7 @@ pub fn eventfd_process_recv(process: &mut crate::GkProcess) -> c_int {
 ///
 /// `buf` must be valid for writing `len` bytes.
 #[cfg(windows)]
-pub unsafe fn eventfd_export_to(
-    fd: c_int,
-    pid: u32,
-    buf: *mut core::ffi::c_char,
-    len: usize,
-) -> c_int {
+pub unsafe fn eventfd_export_to(fd: c_int, pid: u32, buf: *mut core::ffi::c_char, len: usize) -> c_int {
     match imp::export_to(fd, pid) {
         // SAFETY: forwarded to the caller.
         Ok(token) => unsafe { copy_token(&token, buf, len) },
@@ -471,12 +457,7 @@ fn errno_location() -> *mut c_int {
         return libc::__errno_location();
         #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
         return libc::__error();
-        #[cfg(any(
-            target_os = "android",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "nuttx",
-        ))]
+        #[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd", target_os = "nuttx",))]
         return libc::__errno();
         #[cfg(any(target_os = "solaris", target_os = "illumos"))]
         return libc::___errno();
@@ -573,9 +554,7 @@ mod imp {
             return Err(crate::error::bad_descriptor());
         }
         // SAFETY: `fd` is open; ManuallyDrop means we never close it.
-        Ok(std::mem::ManuallyDrop::new(unsafe {
-            <crate::GkEventFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-        }))
+        Ok(std::mem::ManuallyDrop::new(unsafe { <crate::GkEventFd as std::os::fd::FromRawFd>::from_raw_fd(fd) }))
     }
 
     pub(super) fn export_inheritable(fd: c_int) -> std::io::Result<crate::InheritableExport> {
@@ -594,8 +573,7 @@ mod imp {
             return Err(crate::error::bad_descriptor());
         }
         // SAFETY: `sock` is open; only borrowed for this call.
-        efd.inner
-            .send_to(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })
+        efd.inner.send_to(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })
     }
 
     pub(super) fn recv(sock: c_int) -> std::io::Result<c_int> {
@@ -603,11 +581,8 @@ mod imp {
             return Err(crate::error::bad_descriptor());
         }
         // SAFETY: `sock` is open; only borrowed for this call.
-        let inner =
-            crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
-        Ok(std::os::fd::IntoRawFd::into_raw_fd(crate::GkEventFd {
-            inner,
-        }))
+        let inner = crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(crate::GkEventFd { inner }))
     }
 
     pub(super) fn process_send(process: &mut crate::GkProcess, fd: c_int) -> std::io::Result<()> {
@@ -687,10 +662,7 @@ mod imp {
     #[cfg(unix)]
     impl Registry {
         fn new() -> Self {
-            Self {
-                map: IntMap::default(),
-                by_pipe: IntMap::default(),
-            }
+            Self { map: IntMap::default(), by_pipe: IntMap::default() }
         }
 
         /// Registers `fd` (which must be open on the pipe `id`). A stale
@@ -810,12 +782,7 @@ mod imp {
 
     /// `dup2`/`dup3` core: makes `new` a descriptor of `old`'s eventfd.
     #[cfg(unix)]
-    fn dup_to(
-        old: c_int,
-        new: c_int,
-        check: impl FnOnce() -> Option<c_int>,
-        cloexec: bool,
-    ) -> c_int {
+    fn dup_to(old: c_int, new: c_int, check: impl FnOnce() -> Option<c_int>, cloexec: bool) -> c_int {
         let mut reg = write_lock();
         let Some((core, id)) = reg.resolve(old) else {
             return fail_errno(errno::EBADF);
@@ -882,10 +849,7 @@ mod imp {
     #[cfg(windows)]
     impl Registry {
         fn new() -> Self {
-            Self {
-                map: IntMap::default(),
-                next: FIRST_SYNTHETIC_FD,
-            }
+            Self { map: IntMap::default(), next: FIRST_SYNTHETIC_FD }
         }
 
         /// Registers `efd` under the next free synthetic number.
@@ -895,11 +859,7 @@ mod imp {
             }
             loop {
                 let fd = self.next;
-                self.next = if fd == c_int::MAX {
-                    FIRST_SYNTHETIC_FD
-                } else {
-                    fd + 1
-                };
+                self.next = if fd == c_int::MAX { FIRST_SYNTHETIC_FD } else { fd + 1 };
                 if let std::collections::hash_map::Entry::Vacant(slot) = self.map.entry(fd) {
                     slot.insert(efd);
                     return fd;
@@ -975,16 +935,12 @@ mod imp {
 
     #[cfg(windows)]
     pub(super) fn export_inheritable(fd: c_int) -> io::Result<crate::InheritableExport> {
-        lookup(fd)
-            .ok_or_else(crate::error::bad_descriptor)?
-            .export_inheritable()
+        lookup(fd).ok_or_else(crate::error::bad_descriptor)?.export_inheritable()
     }
 
     #[cfg(windows)]
     pub(super) fn export_to(fd: c_int, pid: u32) -> io::Result<String> {
-        lookup(fd)
-            .ok_or_else(crate::error::bad_descriptor)?
-            .export_to(pid)
+        lookup(fd).ok_or_else(crate::error::bad_descriptor)?.export_to(pid)
     }
 
     #[cfg(windows)]
@@ -1007,9 +963,7 @@ mod imp {
     #[cfg(unix)]
     fn register(efd: GkEventFd) -> io::Result<c_int> {
         let (core, fd) = efd.into_core();
-        let id = core
-            .pipe_id()
-            .ok_or_else(|| io::Error::from_raw_os_error(errno::EIO))?;
+        let id = core.pipe_id().ok_or_else(|| io::Error::from_raw_os_error(errno::EIO))?;
         let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
         write_lock().insert(fd, core, id);
         Ok(fd)
@@ -1037,8 +991,7 @@ mod imp {
             return Err(crate::error::bad_descriptor());
         }
         // SAFETY: `sock` is open; only borrowed for this call.
-        let inner =
-            crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
+        let inner = crate::sys::Inner::recv_from(unsafe { std::os::fd::BorrowedFd::borrow_raw(sock) })?;
         register(GkEventFd { inner })
     }
 
@@ -1322,11 +1275,7 @@ pub(crate) mod tests {
         let fd = eventfd(0, EFD_NONBLOCK);
         assert!(fd >= 0);
         let poll = || {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
             // SAFETY: one valid pollfd.
             let n = unsafe { libc::poll(&mut pfd, 1, 0) };
             assert!(n >= 0);
@@ -1350,11 +1299,7 @@ pub(crate) mod tests {
         let sock = eventfd_socket(fd);
         assert_ne!(sock, std::os::windows::io::RawSocket::MAX);
         let poll = || {
-            let mut pfd = WSAPOLLFD {
-                fd: sock as usize,
-                events: POLLRDNORM,
-                revents: 0,
-            };
+            let mut pfd = WSAPOLLFD { fd: sock as usize, events: POLLRDNORM, revents: 0 };
             // SAFETY: one valid WSAPOLLFD.
             let n = unsafe { WSAPoll(&mut pfd, 1, 0) };
             assert!(n >= 0);
@@ -1488,11 +1433,7 @@ pub(crate) mod tests {
         let d = eventfd_dup(fd);
         assert!(fd >= 0 && d >= 0);
         let readable = |fd: c_int| {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
             // SAFETY: one valid pollfd.
             assert!(unsafe { libc::poll(&mut pfd, 1, 0) } >= 0);
             pfd.revents & libc::POLLIN != 0
@@ -1597,10 +1538,7 @@ pub(crate) mod tests {
 
             // Too small a buffer.
             let mut small = [0 as core::ffi::c_char; 8];
-            assert_eq!(
-                eventfd_export_to(fd, std::process::id(), small.as_mut_ptr(), 8),
-                -1
-            );
+            assert_eq!(eventfd_export_to(fd, std::process::id(), small.as_mut_ptr(), 8), -1);
             assert_eq!(errno(), ERANGE);
 
             // Inheritable export: release closes our copies; unknown tokens fail.
@@ -1666,29 +1604,19 @@ pub(crate) mod tests {
             let lit = header
                 .lines()
                 .find_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
-                    ["#define", n, lit]
-                        if n == name && lit.starts_with(|c: char| c.is_ascii_digit()) =>
-                    {
-                        Some(lit)
-                    }
+                    ["#define", n, lit] if n == name && lit.starts_with(|c: char| c.is_ascii_digit()) => Some(lit),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{name} not defined numerically in header"));
             match lit.strip_prefix("0x") {
                 Some(hex) => c_int::from_str_radix(hex, 16).unwrap(),
-                None if lit.len() > 1 && lit.starts_with('0') => {
-                    c_int::from_str_radix(&lit[1..], 8).unwrap()
-                }
+                None if lit.len() > 1 && lit.starts_with('0') => c_int::from_str_radix(&lit[1..], 8).unwrap(),
                 None => lit.parse().unwrap(),
             }
         };
         // These are the shim values of src/flags.rs (also what C code on
         // shim platforms sees).
-        let (sem, nb, cloexec) = if NATIVE {
-            (0o1, 0o4000, 0o2000000)
-        } else {
-            (EFD_SEMAPHORE, EFD_NONBLOCK, EFD_CLOEXEC)
-        };
+        let (sem, nb, cloexec) = if NATIVE { (0o1, 0o4000, 0o2000000) } else { (EFD_SEMAPHORE, EFD_NONBLOCK, EFD_CLOEXEC) };
         assert_eq!(value("GK_EFD_SEMAPHORE"), sem);
         assert_eq!(value("GK_EFD_NONBLOCK"), nb);
         assert_eq!(value("GK_EFD_CLOEXEC"), cloexec);
