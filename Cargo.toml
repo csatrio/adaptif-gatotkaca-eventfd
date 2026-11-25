@@ -1,10 +1,10 @@
 [package]
 name = "adaptif-gatotkaca-eventfd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["PT Adaptif Sinergi Dinamis"]
-description = "Cross-platform eventfd with Linux semantics everywhere (the kernel eventfd on Linux and the BSDs, a faithful shim on macOS and Windows), plus shared-memory channels and shared memory with huge pages, all shareable across processes, with a C ABI matching <sys/eventfd.h>."
+description = "Cross-platform eventfd with Linux semantics everywhere (the kernel eventfd on Linux and the BSDs, a faithful shim on macOS and Windows), plus shared-memory channels (single- and multi-producer), zero-copy shared-memory buffer pools and shared memory with huge pages, all shareable across processes, with a C ABI matching <sys/eventfd.h>."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://adaptif.co.id/"

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-26
+
+### Added
+
+- Multi-producer channels: `GkChannel::new_mpsc()` /
+  `mpsc_with_options()` return a `GkMpSender` (`Clone + Send + Sync`) and a
+  plain `GkReceiver`. Messages are lock-free (`send`, `send_kind`,
+  `try_send`, `try_send_kind`, `reserve`/`try_reserve` + `MpSendSlot`);
+  each thread's messages keep their order. Bulk transfers through
+  `GkMpSender::bulk()` (`MpBulk`), one at a time. All clones belong to one
+  process; the end moves between processes with `GkProcess` /
+  `send_to`/`recv_from` and survives `fork` (`claim`, `detach`).
+- `GkReceiver::recv_batch(max, f)`: receive up to `max` messages in place,
+  freeing the batch's space and waking the sender once.
+- `peer_gone()` and `peer_pid()` on `GkSender`, `GkReceiver` and
+  `GkMpSender`, for non-blocking users that must notice a dead peer.
+- Zero-copy pools (module `pool`): `GkShmPool` (allocating side, buddy
+  allocator over `granule`-sized blocks, `ShmPoolOptions`, `stats`,
+  `reclaim_all`), `ShmBlock`, `ShmLease` (16 bytes), `GkShmPoolView`
+  (borrowing side, shareable with `GkProcess`/`send_to`/`fork`) and
+  `ShmBuf` (read in place; dropping it gives the block back, lock-free).
+  Stale and duplicate returns are refused by generation.
+- C: `gk_channel_new_mpsc`, `gk_mp_sender_*`,
+  `gk_process_send_mp_sender` / `gk_process_recv_mp_sender`,
+  `gk_receiver_recv_batch` (`gk_recv_fn`), `gk_sender_peer_gone`,
+  `gk_receiver_peer_gone`, `gk_shm_pool_*`, `gk_shm_block_*`,
+  `gk_shm_buf_*`, `gk_shm_pool_view_*`, `gk_process_send_shm_pool_view` /
+  `gk_process_recv_shm_pool_view`. Example: `examples/c/mpsc_pool.c`.
+- `examples/channel_bench.rs`: `recv_batch`, multi-producer and pool
+  numbers.
+- `rustfmt.toml` (140 columns) and crate lints (`unsafe_op_in_unsafe_fn`,
+  `missing_docs`, `undocumented_unsafe_blocks`, `missing_safety_doc`).
+
+### Changed
+
+- Channel readiness is guaranteed for level-triggered pollers: a fresh
+  channel starts with the receiver waiting (the first message rings it),
+  only `WouldBlock` clears readiness, and data left in the other lane rings
+  the doorbell again when one lane returns `WouldBlock`.
+- Channel shared-memory layout version 4 (a mode word, the receiver's
+  initial waiting flags). 0.2 and 0.3 processes refuse each other's channel
+  ends (`InvalidData`).
+- An end of the wrong mode (multi-producer received as `GkSender`, or the
+  reverse) is refused with `InvalidData` and closed, so the peer gets
+  `BrokenPipe`.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added
@@ -152,6 +198,7 @@ First release.
 - `force-shim` feature: use the unix shim on native platforms, for testing
   the shim against the kernel eventfd.
 
-[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/releases/tag/v0.1.0
