@@ -392,6 +392,51 @@ int gk_process_recv(gk_process *process);
 void gk_process_free(gk_process *process);
 
 /*
+ * Byte messages on the same connection (since 0.3.1), e.g. a handshake.
+ * A message holds 0 to GK_PROCESS_BYTES_MAX bytes; byte messages and
+ * objects (gk_process_send*, gk_process_recv*) may be mixed and arrive in
+ * order, but the receiver must ask for the right kind each time: the wrong
+ * kind fails with EINVAL (an object is closed, a byte message dropped) and
+ * the connection stays usable. Don't send on one gk_process from several
+ * threads at once.
+ */
+#define GK_PROCESS_BYTES_MAX 65536
+
+/*
+ * Sends `len` bytes from `buf` (NULL allowed when len is 0) as one byte
+ * message. Blocks until written (the peer may have to read first).
+ * Returns 0, or -1 with errno (EMSGSIZE if len > GK_PROCESS_BYTES_MAX:
+ * nothing is sent).
+ */
+int gk_process_send_bytes(gk_process *process, const void *buf, size_t len);
+
+/*
+ * Receives a byte message into `buf` (`cap` bytes). Returns its length, or
+ * -1 with errno: EMSGSIZE if it doesn't fit (the message is kept for the
+ * next call; a GK_PROCESS_BYTES_MAX buffer always fits), EINVAL if an
+ * object was sent instead, EIO once the peer closed the connection.
+ */
+intptr_t gk_process_recv_bytes(gk_process *process, void *buf, size_t cap);
+
+/*
+ * The id of the process at the other end, 0 if unknown (not connected yet,
+ * or the OS can't tell: DragonFly), or -1 with errno = EINVAL for NULL.
+ * Read when the connection is made, so it stays known after the peer exits.
+ */
+int64_t gk_process_peer_pid(const gk_process *process);
+
+#ifndef _WIN32
+/*
+ * The connection's unix socket, to poll for readable: a message arrived,
+ * or EOF once the peer closed the connection or exited (a lifeline).
+ * Completes a gk_process_for_child connection first (waits for the child).
+ * Owned by `process`: don't close it, and don't read or write it yourself.
+ * Returns -1 with errno on failure.
+ */
+int gk_process_fd(gk_process *process);
+#endif
+
+/*
  * Channels: one-way data passing between threads or processes through
  * shared memory (the C form of the Rust GkChannel / GkSender / GkReceiver).
  * A channel has two independent lanes, not ordered relative to each other:

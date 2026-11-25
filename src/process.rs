@@ -4,6 +4,9 @@
 //! hands it an eventfd and [`GkProcess::recv`] receives one, with the same
 //! code on every OS. Afterwards both processes share the counter. Channel
 //! ends and shared memory travel the same way ([`GkProcess::recv_as`]).
+//! Small byte messages (a handshake, a bootstrap) travel on the same
+//! connection with [`GkProcess::send_bytes`] / [`GkProcess::recv_bytes`],
+//! and [`GkProcess::peer_pid`] names the process at the other end.
 //!
 //! | | unix (Linux, macOS, BSDs, ...) | Windows |
 //! |---|---|---|
@@ -42,6 +45,21 @@
 //! The existing per-OS calls (`send_to`/`recv_from`, `export_to`,
 //! `export_inheritable`/`import`) are unchanged; this is a thin layer over
 //! them.
+//!
+//! # Byte messages and the connection as a lifeline
+//!
+//! ```no_run
+//! use adaptif_gatotkaca_eventfd::GkProcess;
+//!
+//! let mut peer = GkProcess::connect("server")?;
+//! peer.send_bytes(b"HELLO")?;
+//! let mut reply = Vec::new();
+//! peer.recv_bytes(&mut reply)?;
+//! // unix: the descriptor turns readable (EOF) when the server exits.
+//! # #[cfg(unix)]
+//! let fd = std::os::fd::AsRawFd::as_raw_fd(&peer);
+//! # Ok::<(), std::io::Error>(())
+//! ```
 
 use std::io;
 use std::process::{Child, Command};
@@ -52,10 +70,27 @@ use crate::GkEventFd;
 /// how to reach its parent (read by [`GkProcess::from_parent`]).
 pub const PARENT_ENV: &str = "GK_EVENTFD_PARENT";
 
-/// A connection to another process, over which eventfds can be sent and
+/// Largest byte message [`GkProcess::send_bytes`] sends and
+/// [`GkProcess::recv_bytes`] accepts: 64 KiB.
+pub const BYTES_MAX: usize = 64 * 1024;
+
+/// Tag of a byte message on the wire (objects carry their own tags).
+pub(crate) const BYTES_TAG: [u8; 8] = *b"gkbyt1:b";
+
+fn wrong_kind_bytes() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object: a byte message was sent")
+}
+
+/// A connection to another process, over which eventfds (and other
+/// [`Shareable`] objects) and small byte messages can be sent and
 /// received. See the [module docs](self).
 #[derive(Debug)]
-pub struct GkProcess(imp::Process);
+pub struct GkProcess {
+    inner: imp::Process,
+    /// C API: a byte message that did not fit the caller's buffer, kept for
+    /// the next receive.
+    held: Option<Vec<u8>>,
+}
 
 /// Accepts [`GkProcess`] connections under a name. See the
 /// [module docs](self).
@@ -77,15 +112,19 @@ impl GkListener {
 
     /// Waits for the next process to [`connect`](GkProcess::connect).
     pub fn accept(&self) -> io::Result<GkProcess> {
-        Ok(GkProcess(self.0.accept()?))
+        Ok(GkProcess::new(self.0.accept()?))
     }
 }
 
 impl GkProcess {
+    fn new(inner: imp::Process) -> Self {
+        Self { inner, held: None }
+    }
+
     /// Connects to the process listening under `name` (see
     /// [`GkListener::bind`]).
     pub fn connect(name: &str) -> io::Result<Self> {
-        Ok(Self(imp::Process::connect(name)?))
+        Ok(Self::new(imp::Process::connect(name)?))
     }
 
     /// Spawns `cmd` and returns the child with a connection to it. The child
@@ -104,20 +143,20 @@ impl GkProcess {
     /// returns it and the value for the child's [`PARENT_ENV`].
     pub(crate) fn for_child() -> io::Result<(Self, String)> {
         let (process, name) = imp::Process::for_child()?;
-        Ok((Self(process), name))
+        Ok((Self::new(process), name))
     }
 
     /// Only accept the child with this process id (Windows; no-op on unix,
     /// where the private socket path is the protection).
     pub(crate) fn expect_pid(&mut self, pid: u32) {
-        self.0.expect_pid(pid);
+        self.inner.expect_pid(pid);
     }
 
     /// The connected unix socket (connecting a pending child first).
     #[cfg(unix)]
     #[cfg_attr(gk_native, allow(dead_code))]
     pub(crate) fn unix_stream(&mut self) -> io::Result<&std::os::unix::net::UnixStream> {
-        self.0.stream()
+        self.inner.stream()
     }
 
     /// In a child started by [`GkProcess::spawn`]: connects to the parent.
@@ -132,8 +171,9 @@ impl GkProcess {
     /// [`GkReceiver`](crate::GkReceiver) or
     /// [`GkSharedMemory`](crate::GkSharedMemory)) to the other process, which
     /// receives it with [`recv`](Self::recv) (eventfd) or
-    /// [`recv_as`](Self::recv_as); both then share it. Don't interleave other
-    /// traffic on the same connection.
+    /// [`recv_as`](Self::recv_as); both then share it. Only this crate's
+    /// traffic may use the connection: objects and
+    /// [byte messages](Self::send_bytes), from one thread at a time.
     ///
     /// A channel end sent this way now belongs to the other process: this
     /// process's copy is detached (dropping it doesn't close the channel).
@@ -143,28 +183,147 @@ impl GkProcess {
     /// copy of the shared memory section stays open in this `GkProcess` until
     /// it is dropped (one small handle per object per `send`).
     pub fn send<T: Shareable>(&mut self, obj: &T) -> io::Result<()> {
-        self.0.send(obj)
+        self.inner.send(obj)
     }
 
     /// Receives an eventfd sent with [`send`](Self::send). Fails with
     /// [`io::ErrorKind::InvalidData`] for anything else (closing whatever
-    /// was received) and [`io::ErrorKind::UnexpectedEof`] if the other process
-    /// closed the connection.
+    /// was received; a byte message is read to its end, so the connection
+    /// stays usable) and [`io::ErrorKind::UnexpectedEof`] if the other
+    /// process closed the connection.
     pub fn recv(&mut self) -> io::Result<GkEventFd> {
-        self.0.recv()
+        self.recv_as()
     }
 
     /// Receives an object of type `T` sent with [`send`](Self::send), e.g.
     /// `peer.recv_as::<GkReceiver>()`. Fails like [`recv`](Self::recv) if
     /// something else was sent.
     pub fn recv_as<T: Shareable>(&mut self) -> io::Result<T> {
-        self.0.recv()
+        if self.held.take().is_some() {
+            return Err(wrong_kind_bytes());
+        }
+        self.inner.recv()
     }
 
-    /// Windows: the other process's id, once connected.
+    /// Sends `msg` as one byte message (empty, or up to [`BYTES_MAX`]
+    /// bytes; longer is [`io::ErrorKind::InvalidInput`] and nothing is
+    /// sent). The other process receives it with
+    /// [`recv_bytes`](Self::recv_bytes). Byte messages and objects
+    /// ([`send`](Self::send)) may be mixed on one connection and arrive in
+    /// the order they were sent, but the receiver must expect the right
+    /// kind each time.
+    ///
+    /// Frame: an 8-byte tag, the length as a little-endian `u32`, the bytes
+    /// (unix socket, no descriptors; on Windows inside the named pipe's
+    /// length-prefixed frame). Blocks until the bytes are written, which
+    /// may wait for the peer to read. A connection from
+    /// [`spawn`](Self::spawn) is completed first (waits for the child).
+    ///
+    /// Don't call this from several threads on clones of the same
+    /// connection, or interleave it with object sends from another thread:
+    /// frames would mix.
+    pub fn send_bytes(&mut self, msg: &[u8]) -> io::Result<()> {
+        if msg.len() > BYTES_MAX {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "byte message longer than BYTES_MAX (64 KiB)"));
+        }
+        self.inner.send_bytes(msg)
+    }
+
+    /// Receives a byte message sent with [`send_bytes`](Self::send_bytes),
+    /// replacing the contents of `buf`; returns its length. Blocks until it
+    /// arrives.
+    ///
+    /// Fails with [`io::ErrorKind::InvalidData`] if an object was sent
+    /// instead (whatever it carried is closed; the connection stays usable)
+    /// or the frame is malformed, and [`io::ErrorKind::UnexpectedEof`] if the
+    /// other process closed the connection or exited.
+    pub fn recv_bytes(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        if let Some(held) = self.held.take() {
+            buf.clear();
+            buf.extend_from_slice(&held);
+            return Ok(buf.len());
+        }
+        self.inner.recv_bytes(buf)?;
+        Ok(buf.len())
+    }
+
+    /// C API: receives a byte message into `out`. One that doesn't fit is
+    /// kept for the next call and reported as `InvalidInput`.
+    #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+    pub(crate) fn recv_bytes_into(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let msg = match self.held.take() {
+            Some(msg) => msg,
+            None => {
+                let mut msg = Vec::new();
+                self.inner.recv_bytes(&mut msg)?;
+                msg
+            }
+        };
+        if msg.len() > out.len() {
+            self.held = Some(msg);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "buffer smaller than the byte message"));
+        }
+        out[..msg.len()].copy_from_slice(&msg);
+        Ok(msg.len())
+    }
+
+    /// The id of the process at the other end, or `None` if it is not
+    /// known: not connected yet (a [`spawn`](Self::spawn) whose child hasn't
+    /// been reached), or the OS can't tell.
+    ///
+    /// | OS | source |
+    /// |---|---|
+    /// | Linux, Android | `SO_PEERCRED` |
+    /// | macOS, iOS | `LOCAL_PEERPID` |
+    /// | FreeBSD 13+ | `LOCAL_PEERCRED` (`xucred.cr_pid`) |
+    /// | NetBSD | `LOCAL_PEEREID` |
+    /// | OpenBSD | `SO_PEERCRED` |
+    /// | illumos | `getpeerucred` |
+    /// | DragonFly, other unix | `None` |
+    /// | Windows | the named pipe's client / server process id |
+    ///
+    /// On unix it is the process that made the connection (`connect`) or
+    /// listened for it (`bind`), as the kernel recorded it when the
+    /// connection was made; it is read once, when this `GkProcess` is
+    /// connected, and kept (so it stays known after the peer exits). A
+    /// socket handed to another process later still names the original one.
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.inner.peer_pid()
+    }
+
+    /// Windows: the other process's id, once connected. Same as
+    /// [`peer_pid`](Self::peer_pid), which exists on every OS.
     #[cfg(windows)]
     pub fn pid(&self) -> Option<u32> {
-        self.0.pid()
+        self.peer_pid()
+    }
+}
+
+/// Unix: the connection's socket, for a poller (`poll`, `epoll`, `kqueue`,
+/// tokio `AsyncFd`, asyncio `add_reader`) to watch for **readable**.
+///
+/// It turns readable when a message arrives, and stays readable (`recv`
+/// returns 0, EOF) once the other process closed the connection or exited:
+/// that makes the connection a lifeline. Read and write it only through
+/// this crate's calls; a raw `read` would take part of a frame.
+///
+/// For a [`spawn`](GkProcess::spawn) (or C `gk_process_for_child`)
+/// connection whose child has not been reached yet, this is the private
+/// listening socket instead, which turns readable when the child connects
+/// and is closed once the connection completes. Exchange a message first
+/// (any send or receive completes it) before registering the descriptor.
+#[cfg(unix)]
+impl std::os::fd::AsFd for GkProcess {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.fd()
+    }
+}
+
+/// Unix: see [`AsFd`](std::os::fd::AsFd) above.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for GkProcess {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.inner.fd())
     }
 }
 
@@ -222,7 +381,7 @@ impl private::Sealed for GkEventFd {
 #[cfg(unix)]
 impl From<std::os::unix::net::UnixStream> for GkProcess {
     fn from(stream: std::os::unix::net::UnixStream) -> Self {
-        Self(imp::Process::Ready(stream))
+        Self::new(imp::Process::ready(stream))
     }
 }
 
@@ -298,7 +457,7 @@ mod imp {
         }
 
         pub(super) fn accept(&self) -> io::Result<Process> {
-            Ok(Process::Ready(self.sock.accept()?.0))
+            Ok(Process::ready(self.sock.accept()?.0))
         }
     }
 
@@ -311,14 +470,24 @@ mod imp {
 
     #[derive(Debug)]
     pub(super) enum Process {
-        Ready(UnixStream),
+        Ready {
+            stream: UnixStream,
+            /// The peer's pid, read when the connection was made (some
+            /// OSes, e.g. macOS, forget it once the peer has gone).
+            pid: Option<u32>,
+        },
         /// `spawn`ed: waiting for the child to connect.
         Pending(Listener),
     }
 
     impl Process {
+        pub(super) fn ready(stream: UnixStream) -> Self {
+            let pid = crate::sys::unix_share::peer_pid(std::os::fd::AsFd::as_fd(&stream));
+            Self::Ready { stream, pid }
+        }
+
         pub(super) fn connect(name: &str) -> io::Result<Self> {
-            Ok(Self::Ready(UnixStream::connect(path_for(name))?))
+            Ok(Self::ready(UnixStream::connect(path_for(name))?))
         }
 
         pub(super) fn for_child() -> io::Result<(Self, String)> {
@@ -336,7 +505,7 @@ mod imp {
                 *self = ready;
             }
             match self {
-                Self::Ready(stream) => Ok(stream),
+                Self::Ready { stream, .. } => Ok(stream),
                 Self::Pending(_) => unreachable!(),
             }
         }
@@ -348,6 +517,29 @@ mod imp {
         pub(super) fn recv<T: Sealed>(&mut self) -> io::Result<T> {
             T::recv_over(std::os::fd::AsFd::as_fd(self.stream()?))
         }
+
+        pub(super) fn send_bytes(&mut self, msg: &[u8]) -> io::Result<()> {
+            crate::sys::unix_share::send_bytes(std::os::fd::AsFd::as_fd(self.stream()?), msg)
+        }
+
+        pub(super) fn recv_bytes(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+            crate::sys::unix_share::recv_bytes(std::os::fd::AsFd::as_fd(self.stream()?), buf)
+        }
+
+        pub(super) fn peer_pid(&self) -> Option<u32> {
+            match self {
+                Self::Ready { pid, .. } => *pid,
+                Self::Pending(_) => None,
+            }
+        }
+
+        /// The connected socket, or the listening one while pending.
+        pub(super) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            match self {
+                Self::Ready { stream, .. } => std::os::fd::AsFd::as_fd(stream),
+                Self::Pending(listener) => std::os::fd::AsFd::as_fd(&listener.sock),
+            }
+        }
     }
 }
 
@@ -358,7 +550,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::private::Sealed;
-    use super::unique_name;
+    use super::{BYTES_MAX, BYTES_TAG, unique_name};
     use crate::compat::TOKEN_MAX;
     use std::fs::File;
 
@@ -366,6 +558,8 @@ mod imp {
     /// `TOKEN_MAX`, but a channel end carries two eventfds plus a section
     /// (about 5 KB), so allow a few of them.
     const OFFER_MAX: usize = 4 * TOKEN_MAX;
+    /// Largest frame on the pipe: an offer, or a byte message's tag and bytes.
+    const FRAME_MAX: usize = if OFFER_MAX > 8 + BYTES_MAX { OFFER_MAX } else { 8 + BYTES_MAX };
     use std::io::{self, Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::Mutex;
@@ -479,7 +673,7 @@ mod imp {
             Self { state: State::Ready { pipe: File::from(pipe), pid }, offered: Vec::new() }
         }
 
-        pub(super) fn pid(&self) -> Option<u32> {
+        pub(super) fn peer_pid(&self) -> Option<u32> {
             match self.state {
                 State::Ready { pid, .. } => Some(pid),
                 State::Pending { .. } => None,
@@ -541,7 +735,7 @@ mod imp {
                 // Only our child may connect; anyone else is dropped.
                 let ready = loop {
                     let p = listener.accept()?;
-                    if child.is_none() || p.pid() == *child {
+                    if child.is_none() || p.peer_pid() == *child {
                         break p.state;
                     }
                 };
@@ -563,18 +757,55 @@ mod imp {
             pipe.flush()
         }
 
-        pub(super) fn recv<T: Sealed>(&mut self) -> io::Result<T> {
-            let (pipe, pid) = self.connection()?;
+        /// Reads one frame: a little-endian `u32` length and that many
+        /// bytes (an offer's token, or a byte message's tag and bytes).
+        fn read_frame(pipe: &mut File) -> io::Result<Vec<u8>> {
             let mut len = [0u8; 4];
             pipe.read_exact(&mut len)?;
             let len = u32::from_le_bytes(len) as usize;
-            if len > OFFER_MAX {
+            if len > FRAME_MAX {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "eventfd message too long"));
             }
-            let mut token = vec![0u8; len];
-            pipe.read_exact(&mut token)?;
-            let token = String::from_utf8(token).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "eventfd message"))?;
+            let mut frame = vec![0u8; len];
+            pipe.read_exact(&mut frame)?;
+            Ok(frame)
+        }
+
+        pub(super) fn recv<T: Sealed>(&mut self) -> io::Result<T> {
+            let (pipe, pid) = self.connection()?;
+            let frame = Self::read_frame(pipe)?;
+            if frame.starts_with(&BYTES_TAG) {
+                return Err(super::wrong_kind_bytes());
+            }
+            if frame.len() > OFFER_MAX {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "eventfd message too long"));
+            }
+            let token = String::from_utf8(frame).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "eventfd message"))?;
             T::take(&token, pid)
+        }
+
+        pub(super) fn send_bytes(&mut self, msg: &[u8]) -> io::Result<()> {
+            let (pipe, _) = self.connection()?;
+            let len = BYTES_TAG.len() + msg.len();
+            let mut frame = Vec::with_capacity(4 + len);
+            frame.extend_from_slice(&(len as u32).to_le_bytes());
+            frame.extend_from_slice(&BYTES_TAG);
+            frame.extend_from_slice(msg);
+            pipe.write_all(&frame)?;
+            pipe.flush()
+        }
+
+        pub(super) fn recv_bytes(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
+            let (pipe, _) = self.connection()?;
+            let frame = Self::read_frame(pipe)?;
+            // An offer is just text naming handles in the sender, which keeps
+            // them; ignoring it leaks nothing here.
+            let Some(msg) = frame.strip_prefix(&BYTES_TAG) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "not a byte message: an object was sent"));
+            };
+            buf.clear();
+            buf.extend_from_slice(msg);
+            Ok(())
         }
     }
 }

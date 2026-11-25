@@ -6,6 +6,11 @@
  *   parent: gk_process_for_child -> spawn with GK_EVENTFD_PARENT -> send
  *   child:  gk_process_from_parent -> recv
  *
+ * Then they exchange byte messages on the same connection (a handshake:
+ * "hello" / "welcome"), check each other's process id, and on unix the
+ * parent watches the connection's descriptor turn readable (EOF) once the
+ * child has exited: the connection doubles as a lifeline.
+ *
  * Run it without arguments; it re-runs itself with "child".
  * Exits 0 on success; otherwise prints the failed check and exits 1.
  */
@@ -25,6 +30,7 @@
 #ifdef _WIN32
 #include <process.h> /* _spawnl, _cwait */
 #else
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -53,6 +59,18 @@ static int child(void) {
         CHECK(gk_eventfd_write(efd, 7) == 0); /* ring back */
         CHECK(gk_eventfd_close(efd) == 0);
     }
+
+    /* Handshake: a byte message each way. */
+    static char msg[GK_PROCESS_BYTES_MAX]; /* always large enough */
+    intptr_t n = gk_process_recv_bytes(parent, msg, sizeof msg);
+    CHECK(n == 5 && memcmp(msg, "hello", 5) == 0);
+    int64_t ppid = gk_process_peer_pid(parent);
+#ifdef _WIN32
+    CHECK(ppid > 0);
+#else
+    CHECK(ppid == 0 || ppid == (int64_t)getppid()); /* 0: the OS can't tell */
+#endif
+    CHECK(gk_process_send_bytes(parent, "welcome", 7) == 0);
     gk_process_free(parent);
     return failures ? 1 : 0;
 }
@@ -89,13 +107,34 @@ int main(int argc, char **argv) {
     CHECK(gk_eventfd_write(efd, 5) == 0);    /* ring */
     CHECK(gk_process_send(kid, efd) == 0);   /* waits for the child to connect */
 
+    /* Handshake on the same connection. */
+    CHECK(gk_process_send_bytes(kid, "hello", 5) == 0);
+    char small[2];
+    CHECK(gk_process_recv_bytes(kid, small, sizeof small) == -1); /* too small: kept */
+    CHECK(errno == EMSGSIZE);
+    char reply[16];
+    CHECK(gk_process_recv_bytes(kid, reply, sizeof reply) == 7);
+    CHECK(memcmp(reply, "welcome", 7) == 0);
+#ifndef _WIN32
+    int64_t peer = gk_process_peer_pid(kid);
+    CHECK(peer == 0 || peer == (int64_t)pid); /* 0: the OS can't tell */
+    int link = gk_process_fd(kid);
+    CHECK(link >= 0);
+#else
+    CHECK(gk_process_peer_pid(kid) > 0);
+#endif
+
 #ifdef _WIN32
     CHECK(_cwait(&status, h, 0) != -1);
 #else
     CHECK(waitpid(pid, &status, 0) == pid);
     status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    /* The child is gone: its end of the connection reads as EOF. */
+    struct pollfd pfd = {link, POLLIN, 0};
+    CHECK(poll(&pfd, 1, 5000) == 1);
 #endif
     CHECK(status == 0);
+    CHECK(gk_process_recv_bytes(kid, reply, sizeof reply) == -1); /* EOF */
 
     CHECK(gk_eventfd_read(efd, &v) == 0);    /* the child rang back */
     CHECK(v == 7);

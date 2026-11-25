@@ -459,6 +459,120 @@ pub unsafe extern "C" fn gk_process_free(process: *mut GkProcess) {
     }
 }
 
+/// Sets `errno` for a byte-message error: `EMSGSIZE` for sizes (message too
+/// long, buffer too small), `EINVAL` for the wrong kind (as
+/// `gk_process_recv`).
+fn bytes_errno(e: &std::io::Error) {
+    use crate::error::errno::{EINVAL, EMSGSIZE};
+    compat::set_errno(match e.kind() {
+        std::io::ErrorKind::InvalidInput => EMSGSIZE,
+        std::io::ErrorKind::InvalidData => EINVAL,
+        _ => crate::error::to_errno(e),
+    });
+}
+
+/// `int gk_process_send_bytes(gk_process *process, const void *buf, size_t len);`
+///
+/// Sends `len` bytes (at most `GK_PROCESS_BYTES_MAX`, may be 0) as one
+/// byte message. `0`, or `-1` with `errno` (`EMSGSIZE` if too long).
+///
+/// # Safety
+/// `process` must be a live handle (or null); `buf` must be valid for
+/// reading `len` bytes (it may be null when `len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_bytes(process: *mut GkProcess, buf: *const c_void, len: usize) -> c_int {
+    guard(-1, || {
+        with(process, -1, |p| {
+            let msg: &[u8] = if len == 0 {
+                &[]
+            } else if buf.is_null() {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return -1;
+            } else {
+                // SAFETY: the caller guarantees `len` readable bytes.
+                unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) }
+            };
+            match p.send_bytes(msg) {
+                Ok(()) => 0,
+                Err(e) => {
+                    bytes_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `intptr_t gk_process_recv_bytes(gk_process *process, void *buf, size_t cap);`
+///
+/// Receives a byte message into `buf` and returns its length, or `-1` with
+/// `errno`: `EMSGSIZE` if `cap` is too small (the message is kept for the
+/// next call; `GK_PROCESS_BYTES_MAX` always fits), `EINVAL` if an object
+/// was sent instead.
+///
+/// # Safety
+/// `process` must be a live handle (or null); `buf` must be valid for
+/// writing `cap` bytes (it may be null when `cap` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_bytes(process: *mut GkProcess, buf: *mut c_void, cap: usize) -> isize {
+    guard(-1, || {
+        with(process, -1, |p| {
+            let out: &mut [u8] = if cap == 0 {
+                &mut []
+            } else if buf.is_null() {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return -1;
+            } else {
+                // SAFETY: the caller guarantees `cap` writable bytes.
+                unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), cap) }
+            };
+            match p.recv_bytes_into(out) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    bytes_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `int gk_process_fd(gk_process *process);` (unix only)
+///
+/// The connection's socket, to poll for readable (a message, or EOF once
+/// the peer closed or exited). Completes a pending `gk_process_for_child`
+/// connection first (waits for the child). Owned by `process`: don't close
+/// it, and read it only through this API. `-1` with `errno` on failure.
+///
+/// # Safety
+/// `process` must be a live handle (or null).
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_fd(process: *mut GkProcess) -> c_int {
+    guard(-1, || {
+        with(process, -1, |p| match p.unix_stream() {
+            Ok(stream) => std::os::fd::AsRawFd::as_raw_fd(stream),
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `int64_t gk_process_peer_pid(const gk_process *process);`
+///
+/// The id of the process at the other end, `0` if it is not known (not
+/// connected yet, or the OS can't tell), `-1` with `errno = EINVAL` for a
+/// null handle.
+///
+/// # Safety
+/// `process` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_peer_pid(process: *const GkProcess) -> i64 {
+    guard(-1, || with_ref(process, -1, |p| p.peer_pid().map_or(0, i64::from)))
+}
+
 // ---------------------------------------------------------------------------
 // Channels (GkSender / GkReceiver as opaque C handles)
 // ---------------------------------------------------------------------------
@@ -2299,6 +2413,90 @@ mod tests {
             gk_listener_free(l);
         }
     }
+
+    #[test]
+    fn process_api_bytes_fd_and_peer_pid() {
+        use crate::error::errno::{EINVAL, EMSGSIZE};
+        let _g = compat::tests::lock();
+        let name = std::ffi::CString::new(format!("ffi-bytes-{}", std::process::id())).unwrap();
+        // SAFETY: valid C string and buffers; handles from this API.
+        unsafe {
+            let l = gk_listener_bind(name.as_ptr());
+            assert!(!l.is_null(), "bind: errno {}", compat::errno());
+            let l_addr = l as usize;
+            let accepting = std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+            let q = gk_process_connect(name.as_ptr());
+            assert!(!q.is_null());
+            let p = accepting.join().unwrap() as *mut GkProcess;
+            assert!(!p.is_null());
+
+            // Both ends name this process where the OS can tell (0 otherwise).
+            let me = i64::from(std::process::id());
+            for h in [p, q] {
+                let pid = gk_process_peer_pid(h);
+                assert!(pid == me || pid == 0, "peer pid {pid}");
+                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                assert_eq!(pid, me);
+            }
+            #[cfg(unix)]
+            assert!(gk_process_fd(q) >= 0);
+
+            // Round trip; a buffer too small keeps the message (EMSGSIZE).
+            let msg = b"hello, control link";
+            assert_eq!(gk_process_send_bytes(p, msg.as_ptr().cast(), msg.len()), 0);
+            let mut small = [0u8; 4];
+            assert_eq!(gk_process_recv_bytes(q, small.as_mut_ptr().cast(), small.len()), -1);
+            assert_eq!(compat::errno(), EMSGSIZE);
+            let mut buf = vec![0u8; GK_BYTES_MAX_FOR_TESTS];
+            let n = gk_process_recv_bytes(q, buf.as_mut_ptr().cast(), buf.len());
+            assert_eq!(n, msg.len() as isize, "errno {}", compat::errno());
+            assert_eq!(&buf[..msg.len()], msg);
+
+            // Empty message, null buffer.
+            assert_eq!(gk_process_send_bytes(p, core::ptr::null(), 0), 0);
+            assert_eq!(gk_process_recv_bytes(q, core::ptr::null_mut(), 0), 0);
+
+            // Too long: EMSGSIZE, nothing sent.
+            let big = vec![7u8; GK_BYTES_MAX_FOR_TESTS + 1];
+            assert_eq!(gk_process_send_bytes(p, big.as_ptr().cast(), big.len()), -1);
+            assert_eq!(compat::errno(), EMSGSIZE);
+
+            // An object where bytes are expected: EINVAL, connection usable.
+            let fd = gk_eventfd(0, EFD_NONBLOCK_FOR_TESTS);
+            assert_eq!(gk_process_send(p, fd), 0);
+            assert_eq!(gk_process_recv_bytes(q, buf.as_mut_ptr().cast(), buf.len()), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            // And the reverse.
+            assert_eq!(gk_process_send_bytes(p, msg.as_ptr().cast(), msg.len()), 0);
+            assert_eq!(gk_process_recv(q), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            // The largest message, sent from another thread (it doesn't fit
+            // the socket buffer, so the send waits for this receive).
+            let p_addr = p as usize;
+            let sending = std::thread::spawn(move || {
+                let big = vec![7u8; GK_BYTES_MAX_FOR_TESTS];
+                gk_process_send_bytes(p_addr as *mut GkProcess, big.as_ptr().cast(), big.len())
+            });
+            let n = gk_process_recv_bytes(q, buf.as_mut_ptr().cast(), buf.len());
+            assert_eq!(sending.join().unwrap(), 0);
+            assert_eq!(n, GK_BYTES_MAX_FOR_TESTS as isize);
+            assert!(buf.iter().all(|&b| b == 7));
+
+            // Null handles.
+            assert_eq!(gk_process_send_bytes(core::ptr::null_mut(), core::ptr::null(), 0), -1);
+            assert_eq!(gk_process_recv_bytes(core::ptr::null_mut(), core::ptr::null_mut(), 0), -1);
+            assert_eq!(gk_process_peer_pid(core::ptr::null()), -1);
+            #[cfg(unix)]
+            assert_eq!(gk_process_fd(core::ptr::null_mut()), -1);
+
+            assert_eq!(gk_eventfd_close(fd), 0);
+            gk_process_free(p);
+            gk_process_free(q);
+            gk_listener_free(l);
+        }
+    }
+
+    const GK_BYTES_MAX_FOR_TESTS: usize = crate::process::BYTES_MAX;
 
     const EFD_NONBLOCK_FOR_TESTS: c_int = compat::EFD_NONBLOCK;
 

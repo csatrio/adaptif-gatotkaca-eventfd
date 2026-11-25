@@ -159,6 +159,10 @@ fn child_entry() {
         shm_child();
         return;
     }
+    if role.starts_with("bytes_") {
+        bytes_child(&role);
+        return;
+    }
     let efd = if let Ok(token) = std::env::var("GK_TOKEN") {
         // SAFETY: the parent made this token for this process, once.
         unsafe { GkEventFd::import(&token) }.expect("import")
@@ -651,4 +655,216 @@ fn pool_blocks_lent_to_a_child_come_back() {
     join(Spawned(child, Some(peer)));
     let s = pool.stats();
     assert_eq!((s.lent, s.bad_returns, s.free), (0, 0, 1 << 20), "every block came back from the child");
+}
+
+// ---------------------------------------------------------------------------
+// Byte messages, the connection's descriptor and the peer's pid
+// ---------------------------------------------------------------------------
+
+use adaptif_gatotkaca_eventfd::process::BYTES_MAX;
+
+/// OSes where `GkProcess::peer_pid` knows the peer.
+const PEER_PID_KNOWN: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    windows
+));
+
+fn bytes_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect()
+}
+
+fn spawn_bytes_child(role: &str) -> (Child, GkProcess) {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+        .env("GK_CHILD_ROLE", role)
+        .env("GK_PARENT_PID", std::process::id().to_string());
+    GkProcess::spawn(&mut cmd).unwrap()
+}
+
+fn bytes_child(role: &str) {
+    let mut parent = GkProcess::from_parent().unwrap();
+    let mut buf = Vec::new();
+    match role {
+        // Echo every message back until an empty one arrives (echoed too).
+        "bytes_echo" => {
+            if PEER_PID_KNOWN {
+                let want: u32 = std::env::var("GK_PARENT_PID").unwrap().parse().unwrap();
+                assert_eq!(parent.peer_pid(), Some(want), "peer_pid in the child");
+            }
+            loop {
+                let n = parent.recv_bytes(&mut buf).expect("recv_bytes");
+                assert_eq!(n, buf.len());
+                parent.send_bytes(&buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        // Bytes and objects mixed on one connection, received in order.
+        "bytes_mixed" => {
+            parent.recv_bytes(&mut buf).unwrap();
+            assert_eq!(buf, b"first");
+            let efd = parent.recv().expect("eventfd after bytes");
+            parent.recv_bytes(&mut buf).unwrap();
+            assert_eq!(buf, bytes_payload(BYTES_MAX));
+            let shm: GkSharedMemory = parent.recv_as().expect("shared memory after bytes");
+            parent.recv_bytes(&mut buf).unwrap();
+            assert_eq!(buf, b"");
+            // SAFETY: the parent wrote before sending and doesn't write now.
+            let first = unsafe { shm.as_slice() }[0];
+            parent.send_bytes(&[first]).unwrap();
+            efd.write(9).unwrap();
+            parent.send(&efd).unwrap();
+            parent.send_bytes(b"last").unwrap();
+            // Keep `parent` (Windows: the offered handles) until the parent
+            // has received everything.
+            let _ = parent.recv_bytes(&mut buf);
+        }
+        // The wrong kind is refused both ways; the connection stays usable.
+        "bytes_wrong_kind" => {
+            let e = parent.recv_bytes(&mut buf).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "object received as bytes: {e}");
+            let e = parent.recv().unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "bytes received as an object: {e}");
+            let e = parent.recv_as::<GkReceiver>().unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "large bytes received as an object: {e}");
+            parent.recv_bytes(&mut buf).unwrap();
+            assert_eq!(buf, b"still in sync");
+            let efd = parent.recv().expect("eventfd after the refusals");
+            efd.write(1).unwrap();
+            parent.send_bytes(b"ok").unwrap();
+            let _ = parent.recv_bytes(&mut buf);
+        }
+        // Say we are ready, then wait to be killed.
+        "bytes_wait" => {
+            parent.send_bytes(b"ready").unwrap();
+            thread::sleep(Duration::from_secs(60));
+        }
+        other => panic!("unknown role {other}"),
+    }
+}
+
+/// Byte messages parent <-> child: empty, small, exactly `BYTES_MAX`, and
+/// too large (refused before anything is sent); `peer_pid` on both sides.
+#[test]
+fn bytes_round_trip_with_child() {
+    let (child, mut peer) = spawn_bytes_child("bytes_echo");
+    assert_eq!(peer.peer_pid(), None, "not connected yet");
+    let too_big = vec![0u8; BYTES_MAX + 1];
+    assert_eq!(peer.send_bytes(&too_big).unwrap_err().kind(), ErrorKind::InvalidInput);
+    let mut buf = Vec::new();
+    for len in [1, 5, 4096, 65_000, BYTES_MAX, 0] {
+        let msg = bytes_payload(len);
+        // The largest messages don't fit the socket buffer: the child reads
+        // while we write, then echoes.
+        peer.send_bytes(&msg).unwrap();
+        assert_eq!(peer.recv_bytes(&mut buf).unwrap(), len);
+        assert!(buf == msg, "echo of {len} bytes differs");
+        if PEER_PID_KNOWN {
+            assert_eq!(peer.peer_pid(), Some(child.id()), "peer_pid in the parent");
+        }
+    }
+    join(Spawned(child, Some(peer)));
+}
+
+/// Bytes and objects mixed on one connection arrive in order.
+#[test]
+fn bytes_and_objects_mixed_in_order() {
+    let (child, mut peer) = spawn_bytes_child("bytes_mixed");
+    let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+    let shm = GkSharedMemory::new(4096).unwrap();
+    // SAFETY: nobody else uses the memory yet.
+    unsafe { shm.as_mut_slice()[0] = 0x5a };
+    peer.send_bytes(b"first").unwrap();
+    peer.send(&efd).unwrap();
+    peer.send_bytes(&bytes_payload(BYTES_MAX)).unwrap();
+    peer.send(&shm).unwrap();
+    peer.send_bytes(b"").unwrap();
+    let mut buf = Vec::new();
+    peer.recv_bytes(&mut buf).unwrap();
+    assert_eq!(buf, [0x5a]);
+    let back = peer.recv().unwrap();
+    assert_eq!(efd.read().unwrap(), 9);
+    back.write(2).unwrap();
+    assert_eq!(efd.read().unwrap(), 2, "the eventfd came back");
+    peer.recv_bytes(&mut buf).unwrap();
+    assert_eq!(buf, b"last");
+    peer.send_bytes(b"done").unwrap();
+    join(Spawned(child, Some(peer)));
+}
+
+/// Receiving the wrong kind is `InvalidData` and leaves the connection in
+/// sync, both ways.
+#[test]
+fn bytes_wrong_kind_is_refused() {
+    let (child, mut peer) = spawn_bytes_child("bytes_wrong_kind");
+    let efd = GkEventFd::new(0, EfdFlags::NONE).unwrap();
+    peer.send(&efd).unwrap(); // received as bytes: refused
+    peer.send_bytes(b"not an object").unwrap(); // received as an eventfd: refused
+    peer.send_bytes(&bytes_payload(BYTES_MAX)).unwrap(); // received as a receiver: refused
+    peer.send_bytes(b"still in sync").unwrap();
+    peer.send(&efd).unwrap();
+    assert_eq!(efd.read().unwrap(), 1);
+    let mut buf = Vec::new();
+    peer.recv_bytes(&mut buf).unwrap();
+    assert_eq!(buf, b"ok");
+    peer.send_bytes(b"done").unwrap();
+    join(Spawned(child, Some(peer)));
+}
+
+/// The connection is a lifeline: when the child is killed, its descriptor
+/// turns readable (unix) and receiving reports EOF.
+#[test]
+fn connection_turns_readable_when_the_child_dies() {
+    let (mut child, mut peer) = spawn_bytes_child("bytes_wait");
+    let mut buf = Vec::new();
+    peer.recv_bytes(&mut buf).unwrap();
+    assert_eq!(buf, b"ready");
+    #[cfg(unix)]
+    let poll = |ms| {
+        let mut pfd = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&peer), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        assert!(n >= 0);
+        n > 0
+    };
+    #[cfg(unix)]
+    assert!(!poll(0), "readable while the child lives and sends nothing");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    #[cfg(unix)]
+    assert!(poll(5_000), "not readable after the child died");
+    let e = peer.recv_bytes(&mut buf).unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset), "{e}");
+}
+
+/// In one process both ends name this process.
+#[test]
+fn peer_pid_between_threads() {
+    let name = format!("test-pid-{}", std::process::id());
+    let listener = GkListener::bind(&name).unwrap();
+    let client = thread::spawn(move || {
+        let mut peer = GkProcess::connect(&name).unwrap();
+        let pid = peer.peer_pid();
+        let mut buf = Vec::new();
+        peer.recv_bytes(&mut buf).unwrap();
+        (pid, buf)
+    });
+    let mut peer = listener.accept().unwrap();
+    peer.send_bytes(b"hi").unwrap();
+    let (client_pid, buf) = client.join().unwrap();
+    assert_eq!(buf, b"hi");
+    let me = Some(std::process::id());
+    if PEER_PID_KNOWN {
+        assert_eq!(peer.peer_pid(), me);
+        assert_eq!(client_pid, me);
+    } else {
+        assert_eq!(peer.peer_pid(), None);
+    }
 }

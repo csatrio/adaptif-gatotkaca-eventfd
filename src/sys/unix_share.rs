@@ -6,7 +6,9 @@
 //!
 //! Everything is identified by an 8-byte tag: `gkefd1:n` / `gkefd1:u` for
 //! an eventfd (native / unix shim), `gkch1:Sn` etc. for channel ends,
-//! `gkshm1:r` for shared memory. Tokens
+//! `gkshm1:r` for shared memory, `gkbyt1:b` for a byte message
+//! (`GkProcess::send_bytes`: the tag, a little-endian `u32` length and the
+//! bytes, no descriptors). Tokens
 //! are text: `<tag>:<fd>[:<fd>...]` with decimal descriptor numbers. A
 //! native eventfd token is simply
 //! the inherited eventfd's number.
@@ -166,8 +168,28 @@ fn write_all(sock: BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
 
 /// Receives a message sent by [`send`] with `tag` and exactly `n`
 /// descriptors. The descriptors are close-on-exec and owned by the caller;
-/// on any mismatch they are closed and an error is returned.
+/// on any mismatch they are closed and an error is returned. A byte message
+/// ([`send_bytes`]) found instead is read to its end, so the connection stays
+/// usable, and refused the same way.
 pub(crate) fn recv(sock: BorrowedFd<'_>, tag: &str, n: usize) -> io::Result<Vec<OwnedFd>> {
+    let (head, fds) = recv_head(sock)?;
+    if head == BYTES_TAG {
+        drop(fds);
+        skip_bytes_body(sock)?;
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object: a byte message was sent"));
+    }
+    if head != header(tag) || fds.len() != n {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object (sent by a different backend?)"));
+    }
+    for fd in &fds {
+        set_cloexec(fd.as_fd())?;
+    }
+    Ok(fds)
+}
+
+/// Reads the next message's 8-byte tag and the descriptors attached to it
+/// (owned, so dropping them closes them).
+fn recv_head(sock: BorrowedFd<'_>) -> io::Result<([u8; TAG_LEN], Vec<OwnedFd>)> {
     let mut head = [0u8; TAG_LEN];
     let mut iov = libc::iovec { iov_base: head.as_mut_ptr().cast(), iov_len: TAG_LEN };
     let mut cbuf = CmsgBuf([0; 64]);
@@ -212,13 +234,158 @@ pub(crate) fn recv(sock: BorrowedFd<'_>, tag: &str, n: usize) -> io::Result<Vec<
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     read_exact(sock, &mut head[got..])?;
-    if head != header(tag) || fds.len() != n {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not the expected kind of object (sent by a different backend?)"));
+    Ok((head, fds))
+}
+
+/// Tag of a byte message.
+const BYTES_TAG: [u8; TAG_LEN] = crate::process::BYTES_TAG;
+
+/// Sends a byte message (`GkProcess::send_bytes`): the tag, the length as
+/// a little-endian `u32`, the bytes. No descriptors. The caller checked
+/// `msg.len() <= BYTES_MAX`.
+pub(crate) fn send_bytes(sock: BorrowedFd<'_>, msg: &[u8]) -> io::Result<()> {
+    debug_assert!(msg.len() <= crate::process::BYTES_MAX);
+    let mut frame = Vec::with_capacity(TAG_LEN + 4 + msg.len());
+    frame.extend_from_slice(&BYTES_TAG);
+    frame.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+    frame.extend_from_slice(msg);
+    write_all(sock, &frame)
+}
+
+/// Receives a byte message sent with [`send_bytes`] into `buf` (replacing
+/// its contents). An object found instead is refused with `InvalidData`
+/// (its descriptors are closed); the connection stays usable.
+pub(crate) fn recv_bytes(sock: BorrowedFd<'_>, buf: &mut Vec<u8>) -> io::Result<()> {
+    let (head, fds) = recv_head(sock)?;
+    if head != BYTES_TAG {
+        drop(fds);
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a byte message: an object was sent"));
     }
-    for fd in &fds {
-        set_cloexec(fd.as_fd())?;
+    let len = read_bytes_len(sock)?;
+    buf.clear();
+    buf.resize(len, 0);
+    read_exact(sock, buf)?;
+    if !fds.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "byte message with descriptors attached"));
     }
-    Ok(fds)
+    Ok(())
+}
+
+/// Reads a byte message's length, refusing more than `BYTES_MAX`.
+fn read_bytes_len(sock: BorrowedFd<'_>) -> io::Result<usize> {
+    let mut len = [0u8; 4];
+    read_exact(sock, &mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > crate::process::BYTES_MAX {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "byte message longer than BYTES_MAX"));
+    }
+    Ok(len)
+}
+
+/// Reads and discards the rest of a byte message whose tag was read.
+fn skip_bytes_body(sock: BorrowedFd<'_>) -> io::Result<()> {
+    let mut rest = read_bytes_len(sock)?;
+    let mut scratch = [0u8; 4096];
+    while rest > 0 {
+        let n = rest.min(scratch.len());
+        read_exact(sock, &mut scratch[..n])?;
+        rest -= n;
+    }
+    Ok(())
+}
+
+/// The process id of the peer of the connected unix socket `sock`, as the
+/// kernel recorded it when the connection was made; `None` where the OS
+/// can't tell.
+pub(crate) fn peer_pid(sock: BorrowedFd<'_>) -> Option<u32> {
+    let pid = peer_pid_os(sock.as_raw_fd())?;
+    u32::try_from(pid).ok().filter(|&p| p != 0)
+}
+
+/// Reads one socket option of type `T`.
+#[allow(dead_code)]
+fn sockopt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int) -> Option<T> {
+    let mut v = std::mem::MaybeUninit::<T>::zeroed();
+    let mut len = size_of::<T>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `v`, which has room
+    // for a `T`; on success `T` (plain C data, zero-initialised) is valid.
+    let r = unsafe { libc::getsockopt(fd, level, name, v.as_mut_ptr().cast(), &mut len) };
+    if r == -1 || (len as usize) < size_of::<T>() {
+        return None;
+    }
+    // SAFETY: zero-initialised and filled by the kernel; plain C data.
+    Some(unsafe { v.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    /// `struct ucred` (declared here: the libc crate lacks it on Android).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Ucred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    sockopt::<Ucred>(fd, libc::SOL_SOCKET, libc::SO_PEERCRED).map(|c| c.pid)
+}
+
+#[cfg(target_vendor = "apple")]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    sockopt::<libc::pid_t>(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID)
+}
+
+#[cfg(target_os = "freebsd")]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    // FreeBSD 13+ fills `cr_pid`; older kernels leave it 0 (-> None).
+    let cred = sockopt::<libc::xucred>(fd, libc::SOL_LOCAL, libc::LOCAL_PEERCRED)?;
+    if cred.cr_version != libc::XUCRED_VERSION {
+        return None;
+    }
+    // SAFETY: a union of a pointer-sized pad and `cr_pid`; the kernel wrote
+    // `cr_pid` (and it was zero-initialised before).
+    Some(unsafe { cred.cr_pid__c_anonymous_union.cr_pid })
+}
+
+#[cfg(target_os = "netbsd")]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    // Level 0 is SOL_LOCAL.
+    sockopt::<libc::unpcbid>(fd, 0, libc::LOCAL_PEEREID).map(|c| c.unp_pid)
+}
+
+#[cfg(target_os = "openbsd")]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    sockopt::<libc::sockpeercred>(fd, libc::SOL_SOCKET, libc::SO_PEERCRED).map(|c| c.pid)
+}
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn peer_pid_os(fd: RawFd) -> Option<libc::pid_t> {
+    let mut cred: *mut libc::ucred_t = std::ptr::null_mut();
+    // SAFETY: getpeerucred allocates a ucred_t for us on success.
+    if unsafe { libc::getpeerucred(fd, &mut cred) } == -1 || cred.is_null() {
+        return None;
+    }
+    // SAFETY: `cred` is the live ucred_t getpeerucred returned.
+    let pid = unsafe { libc::ucred_getpid(cred) };
+    // SAFETY: freed once, as getpeerucred(3C) requires.
+    unsafe { libc::ucred_free(cred) };
+    // ucred_getpid returns -1 when the pid is not available.
+    (pid >= 0).then_some(pid)
+}
+
+/// DragonFly and other unix: no way to learn the peer's pid.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris"
+)))]
+fn peer_pid_os(_fd: RawFd) -> Option<libc::pid_t> {
+    None
 }
 
 fn read_exact(sock: BorrowedFd<'_>, mut buf: &mut [u8]) -> io::Result<()> {

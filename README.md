@@ -41,7 +41,7 @@ in the counter, so always read and write through this crate (see
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-eventfd = "0.2"
+adaptif-gatotkaca-eventfd = "0.3"
 ```
 
 ```rust
@@ -207,6 +207,48 @@ fn main() -> std::io::Result<()> {
 
 `recv` is safe on every OS: received descriptors are always fresh ones this
 process owns.
+
+#### Byte messages, the peer's pid and the connection as a lifeline (0.3.1)
+
+The same connection carries small byte messages, for a handshake or a
+bootstrap, mixed with objects in the order they were sent:
+
+```rust,no_run
+use adaptif_gatotkaca_eventfd::{GkProcess, process::BYTES_MAX};
+
+fn main() -> std::io::Result<()> {
+    let mut server = GkProcess::connect("doorbell")?;
+    server.send_bytes(b"HELLO v1")?; // 0..=BYTES_MAX (64 KiB) bytes
+    let mut reply = Vec::with_capacity(BYTES_MAX);
+    server.recv_bytes(&mut reply)?; // replaces the contents, returns the length
+    let pid = server.peer_pid(); // Some(pid) where the OS can tell
+    Ok(())
+}
+```
+
+- `send_bytes` refuses more than `BYTES_MAX` with `InvalidInput` (nothing
+  is sent). Receiving the wrong kind (`recv_bytes` when an object was sent,
+  or `recv`/`recv_as` when bytes were) is `InvalidData`; the message is
+  consumed (an object's descriptors closed), so the connection stays in
+  sync. Don't send on one connection from several threads at once.
+- `peer_pid()` names the process at the other end on every OS, read once
+  when the connection is made: Linux/Android `SO_PEERCRED`, macOS/iOS
+  `LOCAL_PEERPID`, FreeBSD 13+ `LOCAL_PEERCRED`, NetBSD `LOCAL_PEEREID`,
+  OpenBSD `SO_PEERCRED`, illumos `getpeerucred`, Windows the named pipe's
+  client/server pid. `None` before a spawned child has connected, and on
+  DragonFly (no way to ask). (Windows' older `pid()` is the same method.)
+- Unix: `GkProcess` implements `AsFd` / `AsRawFd`. Register the descriptor
+  for **readable** with any poller: it turns readable when a message
+  arrives and stays readable (EOF) once the peer closed the connection or
+  exited, so the connection doubles as a lifeline. Read it only through
+  the crate. For a `spawn` whose child has not connected yet the
+  descriptor is the private listening socket; exchange a message first.
+
+In C: `gk_process_send_bytes`, `gk_process_recv_bytes(p, buf, cap)`
+(`EMSGSIZE` if `cap` is too small; the message is kept for the next call;
+`GK_PROCESS_BYTES_MAX` always fits), `gk_process_peer_pid` (0 when
+unknown) and, on unix, `gk_process_fd` (completes a pending child
+connection first). See `examples/c/process.c`.
 
 In C the same API uses opaque handles: `gk_listener_bind`,
 `gk_listener_accept`, `gk_listener_free`, `gk_process_connect`,

@@ -1620,5 +1620,6 @@ pub(crate) mod tests {
         assert_eq!(value("GK_EFD_SEMAPHORE"), sem);
         assert_eq!(value("GK_EFD_NONBLOCK"), nb);
         assert_eq!(value("GK_EFD_CLOEXEC"), cloexec);
+        assert_eq!(value("GK_PROCESS_BYTES_MAX") as usize, crate::process::BYTES_MAX);
     }
 }

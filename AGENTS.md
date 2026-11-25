@@ -61,8 +61,8 @@ visible to your crate.
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-eventfd = "0.2"                       # sync API
-# adaptif-gatotkaca-eventfd = { version = "0.2", features = ["mio"] }
+adaptif-gatotkaca-eventfd = "0.3"                       # sync API
+# adaptif-gatotkaca-eventfd = { version = "0.3", features = ["mio"] }
 ```
 
 ### Blocking wakeup between threads (all platforms)
@@ -237,6 +237,29 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   `GK_EVENTFD_PARENT` (`GK_EVENTFD_PARENT_ENV`); spawn it yourself, then
   optionally `gk_process_expect_pid(p, pid)` and `gk_process_send`. See
   `examples/c/process.c`.
+- **Byte messages (0.3.1):** `peer.send_bytes(&[u8])` /
+  `peer.recv_bytes(&mut Vec<u8>) -> len` on the same `GkProcess`, 0 to
+  `process::BYTES_MAX` (64 KiB) bytes; more is `InvalidInput` (nothing
+  sent). Bytes and objects may be mixed and arrive in order, but ask for
+  the right kind: the wrong one is `InvalidData` and is consumed (an
+  object's descriptors closed), so the connection stays in sync. One
+  sending thread per connection. Frame: 8-byte tag `gkbyt1:b`, `u32` LE
+  length, bytes (Windows: inside the pipe's `u32`-length frame).
+- **`peer.peer_pid() -> Option<u32>`** on every OS (Windows `pid()` is the
+  same), read when the connection is made: Linux/Android `SO_PEERCRED`,
+  macOS/iOS `LOCAL_PEERPID`, FreeBSD 13+ `LOCAL_PEERCRED` (`cr_pid`),
+  NetBSD `LOCAL_PEEREID`, OpenBSD `SO_PEERCRED`, illumos `getpeerucred`,
+  Windows the pipe's client/server pid; `None` on DragonFly and before a
+  spawned child has connected.
+- **Lifeline (unix):** `GkProcess: AsFd + AsRawFd`. Poll it for readable:
+  a message arrived, or EOF once the peer closed or exited. Never read or
+  write it yourself. For a not-yet-connected `spawn` it is the private
+  listening socket: exchange a message first, then register it.
+- C: `gk_process_send_bytes(p, buf, len)`,
+  `gk_process_recv_bytes(p, buf, cap)` -> len (`EMSGSIZE` if `cap` is too
+  small, message kept; `GK_PROCESS_BYTES_MAX`; `EINVAL` wrong kind; `EIO`
+  at EOF), `gk_process_peer_pid(p)` (0 = unknown), `gk_process_fd(p)`
+  (unix; completes a pending child connection first).
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 
