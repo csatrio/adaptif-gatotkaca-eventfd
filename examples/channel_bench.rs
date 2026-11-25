@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::thread;
 use std::time::Instant;
 
-use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel};
+use adaptif_gatotkaca_eventfd::{ChannelOptions, GkChannel, GkShmPool, ShmPoolOptions};
 
 fn channel_rate(size: usize, count: usize) -> f64 {
     let (mut tx, mut rx) =
@@ -225,6 +225,87 @@ fn message_latency_during_bulk() -> (f64, f64) {
     (p50, p99)
 }
 
+/// Messages per second from `producers` threads through one multi-producer
+/// channel, received with `recv_batch` (budget 256, as an event loop would).
+fn mpsc_rate(producers: usize, size: usize, count: usize) -> f64 {
+    let (tx, mut rx) =
+        GkChannel::mpsc_with_options(ChannelOptions { capacity: 16 << 20, max_message: 1 << 20, ..Default::default() }).unwrap();
+    let per = count / producers;
+    let start = Instant::now();
+    let writers: Vec<_> = (0..producers)
+        .map(|_| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let msg = vec![7u8; size];
+                for _ in 0..per {
+                    tx.send(&msg).unwrap();
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+    let mut got = 0;
+    while got < per * producers {
+        got += rx.recv_batch(256, |_, m| assert_eq!(m.len(), size)).unwrap();
+    }
+    for w in writers {
+        w.join().unwrap();
+    }
+    got as f64 / start.elapsed().as_secs_f64()
+}
+
+/// One-message `recv` against `recv_batch(256)` on a single-producer channel.
+fn batch_rate(size: usize, count: usize) -> f64 {
+    let (mut tx, mut rx) =
+        GkChannel::with_options(ChannelOptions { capacity: 16 << 20, max_message: 1 << 20, ..Default::default() }).unwrap();
+    let start = Instant::now();
+    let writer = thread::spawn(move || {
+        let msg = vec![7u8; size];
+        for _ in 0..count {
+            tx.send(&msg).unwrap();
+        }
+    });
+    let mut got = 0;
+    while got < count {
+        got += rx.recv_batch(256, |_, m| assert_eq!(m.len(), size)).unwrap();
+    }
+    writer.join().unwrap();
+    count as f64 / start.elapsed().as_secs_f64()
+}
+
+/// Zero-copy hand-over through a pool: alloc + write + lend + 16-byte
+/// message, the other thread takes, reads one byte, drops (gives back).
+fn pool_rate(size: usize, count: usize) -> f64 {
+    let pool = GkShmPool::with_options(ShmPoolOptions { size: 256 << 20, ..Default::default() }).unwrap();
+    let view = pool.view();
+    let (tx, mut rx) = GkChannel::new_mpsc().unwrap();
+    let start = Instant::now();
+    let writer = thread::spawn(move || {
+        for i in 0..count {
+            let mut b = loop {
+                match pool.alloc(size) {
+                    Ok(b) => break b,
+                    Err(_) => thread::yield_now(),
+                }
+            };
+            b.as_mut_slice()[0] = i as u8;
+            tx.send(&b.lend(size).to_bytes()).unwrap();
+        }
+    });
+    let mut got = 0;
+    while got < count {
+        got += rx
+            .recv_batch(256, |_, m| {
+                // SAFETY: each lease is sent once by the pool's owner.
+                let buf = unsafe { view.take(adaptif_gatotkaca_eventfd::ShmLease::from_bytes(m.try_into().unwrap())) }.unwrap();
+                assert_eq!(buf.len(), size);
+            })
+            .unwrap();
+    }
+    writer.join().unwrap();
+    count as f64 / start.elapsed().as_secs_f64()
+}
+
 fn main() {
     println!("messages per second (two threads, higher is better)");
     println!("{:>8}  {:>14}  {:>14}  {:>14}", "size", "GkChannel", "pipe", "unix socket");
@@ -258,6 +339,21 @@ fn main() {
     println!();
     println!("message latency while a 512 MiB transfer is in progress, microseconds");
     println!("  median: {p50:.1}   99th percentile: {p99:.1}");
+    println!();
+    println!("receiving with recv_batch(256), messages per second (two threads)");
+    for size in [64usize, 1024] {
+        println!("{size:>8}  {:>14.0}", batch_rate(size, 2_000_000));
+    }
+    println!();
+    println!("multi-producer channel, 64-byte messages per second, recv_batch(256)");
+    for producers in [1usize, 2, 4, 8] {
+        println!("{producers:>3} producer(s)  {:>14.0}", mpsc_rate(producers, 64, 4_000_000));
+    }
+    println!();
+    println!("zero-copy pool hand-overs per second (alloc + lend + take + give back)");
+    for size in [4096usize, 65536, 1 << 20] {
+        println!("{size:>8}  {:>14.0}", pool_rate(size, if size >= 1 << 20 { 50_000 } else { 500_000 }));
+    }
     println!();
     println!("ping-pong round trip, microseconds (lower is better)");
     println!("  GkChannel:   {:.2}", channel_ping_pong(100_000));

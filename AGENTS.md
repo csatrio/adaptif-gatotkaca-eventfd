@@ -264,7 +264,8 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
     `rx.recv_with_kind(|k, msg| ..)`, `rx.next_kind() -> Option<(k, len)>`;
     bulk: `tx.send_bulk_kind(k, &data)`, `tx.bulk_writer_kind(k, len)`,
     `rx.recv_bulk_vec_kind(..) -> (k, id)`, `BulkReader::kind()`.
-- One sender, one receiver; ends are not `Clone`.
+- One sender, one receiver; ends are not `Clone`. For several sending
+  threads use a multi-producer channel (6a-mp below), not a `Mutex<GkSender>`.
 - Errors: `WouldBlock` (non-blocking; bulk writes may be partial),
   `BrokenPipe` (other end gone, or its process died; after draining),
   `ConnectionAborted` (the sender abandoned a transfer: unfinished
@@ -272,8 +273,16 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   `InvalidInput` (sizes, limit), `PermissionDenied` (end owned by another
   process).
 - Event loops: register the end (mio `Source`, `AsFd`/`AsSocket`, tokio
-  `AsyncFd` on unix) for READABLE; drain every lane you use until
-  `WouldBlock`, then wait. To serve messages mid-transfer, `pause()` the
+  `AsyncFd` on unix) for READABLE. Readiness guarantees (since 0.3):
+  a fresh channel's receiver starts out waiting, so the first message wakes
+  it even if it never called `recv`; only a call returning `WouldBlock`
+  clears readiness, so stopping early (a budget) keeps it readable; when one
+  lane returns `WouldBlock` while the other holds data, the doorbell is rung
+  again. Drain with `rx.recv_batch(max, |kind, msg| ..)`: waits only for the
+  first message, frees the batch's space and wakes the sender once (a panic
+  in the callback leaves the message it panicked on queued). Non-blocking
+  users notice a dead peer with `peer_gone()` (`peer_pid()` names it).
+  To serve messages mid-transfer, `pause()` the
   `BulkReader` (resume with `rx.bulk_reader()`) or `BulkWriter` (resume with
   `tx.resume_bulk()`); dropping them instead discards / abandons the
   transfer.
@@ -294,6 +303,39 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   (unix), `gk_*_socket` (Windows), `gk_process_send_sender`/`_receiver`,
   `gk_process_recv_sender`/`_receiver`; errno `EAGAIN`, `EPIPE`, `EMSGSIZE`,
   `EACCES`, `ECONNABORTED`. See `examples/c/channel.c`.
+  Also `gk_receiver_recv_batch(rx, max, gk_recv_fn, ctx)` and
+  `gk_sender_peer_gone` / `gk_receiver_peer_gone`.
+
+### 6a-mp. Multi-producer channels (`GkMpSender`)
+
+- `let (tx, mut rx) = GkChannel::new_mpsc()?;` /
+  `GkChannel::mpsc_with_options(opts)`. `tx: GkMpSender` is
+  `Clone + Send + Sync`; methods take `&self`. The receiver is a plain
+  `GkReceiver`.
+- Messages are lock-free (CAS-reserve, copy, publish the header). Per
+  thread FIFO; threads interleave in reservation order. `send`/`reserve`
+  block when full (unless `set_nonblocking(true)`, shared by all clones);
+  `try_send`/`try_reserve` never block (`WouldBlock`, then the sender's
+  `AsFd`/`AsSocket` becomes readable when space is freed; no mio `Source`).
+  `reserve_kind(k, len)` + `MpSendSlot::commit(n)` writes in place; a
+  dropped slot becomes padding. Don't hold a slot long: later messages of
+  other threads wait behind it.
+- Bulk: `tx.bulk()` locks the bulk lane (`send_bulk[_kind]`,
+  `bulk_writer[_kind]`, `resume_bulk`), one transfer at a time.
+- All clones belong to one process (the owner). Producers in several
+  processes are not supported: give each process its own channel. Hand the
+  end over with `GkProcess::send(&tx)` + `recv_as::<GkMpSender>()`; after
+  `fork`, `claim()` / `detach()` (affects every clone of that process).
+  The channel closes when the last clone is dropped.
+- Mode mismatch on receipt (an MPSC end received as `GkSender`, or the
+  reverse): `InvalidData`, and the end is closed (the peer gets
+  `BrokenPipe`).
+- C: `gk_channel_new_mpsc`, `gk_mp_sender_clone`, `gk_mp_sender_send[_kind]`,
+  `gk_mp_sender_try_send_kind`, `gk_mp_sender_send_bulk_kind`,
+  `gk_mp_sender_set_nonblocking`, `gk_mp_sender_claim`,
+  `gk_mp_sender_peer_gone`, `gk_mp_sender_fd` / `_socket`,
+  `gk_mp_sender_free` / `_detach`, `gk_process_send_mp_sender` /
+  `gk_process_recv_mp_sender`. Handles are thread-safe (`const`).
 
 ## 6b. Shared memory (`GkSharedMemory`)
 
@@ -328,6 +370,35 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   `gk_shm_fd` (unix) / `gk_shm_handle` (Windows), `gk_shm_free`,
   `gk_process_send_shm`, `gk_process_recv_shm`; errno `EINVAL`, `ENOTSUP`,
   `ENOMEM`, `EPERM`/`EACCES`. See `examples/c/shared_memory.c`.
+
+## 6c. Zero-copy pools (`GkShmPool`)
+
+- Allocating side (one process, any thread):
+  `let pool = GkShmPool::new(size)?` or
+  `GkShmPool::with_options(ShmPoolOptions { size, granule, huge_pages })`
+  (granule: power of two, 64 B to 1 GiB, default 4 KiB; default size
+  64 MiB, 16 MiB on Windows). `pool.alloc(len)? -> ShmBlock`
+  (`OutOfMemory` when nothing fits now, `InvalidInput` if it never can),
+  `block.as_mut_slice()`, `block.lend(len) -> ShmLease` (16 bytes:
+  `to_bytes` / `from_bytes`). Dropping an unlent block frees it.
+- Borrowing side: `GkShmPoolView` (`pool.view()`, or
+  `GkProcess::send(&view)` + `recv_as::<GkShmPoolView>()`, or `fork`).
+  `unsafe { view.take(lease) }? -> ShmBuf` (`Deref<[u8]>`); dropping it
+  gives the block back (one CAS on the shared return stack; any thread).
+  `take` is unsafe: the lease must come from this pool and be taken once.
+- The allocator collects returns when it needs space (and in `stats()`),
+  refusing returns whose generation doesn't match (`bad_returns`).
+  `unsafe pool.reclaim_all()` takes back every lent block once the borrower
+  is known dead.
+- After `fork`, only one process may keep allocating (the bookkeeping is
+  process-local and was copied).
+- C: `gk_shm_pool_options_default`, `gk_shm_pool_new`, `gk_shm_pool_alloc`,
+  `gk_shm_block_ptr` / `_capacity` / `_lend` / `_free`,
+  `gk_shm_pool_new_view`, `gk_shm_pool_view_take`, `gk_shm_buf_ptr` /
+  `_len` / `_free`, `gk_shm_pool_view_free`, `gk_shm_pool_get_stats`,
+  `gk_shm_pool_reclaim_all`, `gk_shm_pool_free`,
+  `gk_process_send_shm_pool_view` / `gk_process_recv_shm_pool_view`.
+  See `examples/c/mpsc_pool.c`.
 
 ## 7. Per-platform checklists
 
@@ -401,8 +472,14 @@ docker run --rm -v "$(pwd)":/w -w /w -v cargo-cache:/usr/local/cargo/registry \
   compares it against the kernel eventfd with random operation sequences.
   Run this after any change to `src/sys/shm.rs` (shared by the unix and
   Windows shims) or `src/sys/unix_shim.rs`.
-- Channel lane logic under Miri (nightly):
-  `cargo +nightly miri test --lib channel::lane`.
+- Channel lane logic (single- and multi-producer) and the pool's buddy
+  allocator under Miri (nightly):
+  `cargo +nightly miri test --lib channel::lane` and
+  `cargo +nightly miri test --lib -- pool::tests::buddy pool::tests::lease`.
+- C examples: build the static library
+  (`cargo rustc --release --features ffi --crate-type staticlib`) and
+  compile/run each `examples/c/*.c` with
+  `cc -std=c11 -Wall -Wextra -Werror -Iinclude <file> target/release/libadaptif_gatotkaca_eventfd.a -lpthread -lm`.
 - Channel benchmark: `cargo run --release --example channel_bench`.
 - Windows tests only run on a Windows machine:
   `cargo test --features mio,ffi`. `tests/windows_share.rs` and the

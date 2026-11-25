@@ -374,9 +374,10 @@ fn worker() -> std::io::Result<()> {
   `WouldBlock`; bulk writes may then be partial, like any `io::Write`.
   `send_bulk` always blocks until the data is in the ring.
 - **Event loops:** a `GkReceiver` is readable (`AsFd`/`AsSocket`, mio,
-  tokio's `AsyncFd` on unix) when data may be waiting in a lane it drained
-  to `WouldBlock`; a `GkSender` when space may have been freed. Drain each
-  lane you use until `WouldBlock`, then wait. `BulkReader::pause` /
+  tokio's `AsyncFd` on unix) while a lane may hold data it has not seen, and
+  only a call that returns `WouldBlock` clears that (see
+  [Event loops](#event-loops-readiness-and-recv_batch) below); a `GkSender`
+  is readable when space may have been freed. `BulkReader::pause` /
   `BulkWriter::pause` (+ `GkSender::resume_bulk`) keep a transfer open while
   you serve the other lane.
 - **In place:** `reserve` / `commit` for messages, `recv_with` and
@@ -385,6 +386,9 @@ fn worker() -> std::io::Result<()> {
   (the receiver after draining). A dropped unfinished `BulkWriter` abandons
   its transfer: the reader gets `ConnectionAborted`. A peer *process* that
   dies is detected by blocking calls within about a quarter second.
+- **Liveness:** `peer_gone()` tells a non-blocking user (an event loop)
+  that the other end was closed or its process died; `peer_pid()` names
+  that process.
 - **Sharing:** `GkProcess::send(&end)` / `recv_as::<GkSender>()` /
   `recv_as::<GkReceiver>()` on every OS, `send_to`/`recv_from` over a
   `UnixStream` on unix, and `fork()` (the process that keeps an end calls
@@ -400,14 +404,97 @@ channel_bench`), macOS on Apple Silicon:
 
 | | `GkChannel` | pipe | unix socket |
 |---|---|---|---|
-| 64 B messages per second | ~13.7 M | ~1.1 M | ~0.9 M |
-| 1 KiB messages per second | ~13.2 M | ~0.9 M | ~0.8 M |
-| 1 GiB bulk transfer (one copy each side) | ~29.6 GiB/s | ~12.8 GiB/s | ~2.6 GiB/s |
-| ping-pong round trip | ~0.27 µs | | ~3.7 µs |
+| 64 B messages per second | ~15.2 M | ~1.2 M | ~0.9 M |
+| 1 KiB messages per second | ~14.7 M | ~1.0 M | ~0.8 M |
+| 1 GiB bulk transfer (one copy each side) | ~28.7 GiB/s | ~12.8 GiB/s | ~2.5 GiB/s |
+| ping-pong round trip | ~0.25 µs | | ~3.6 µs |
 
 A message sent while a 512 MiB transfer is in progress arrives in about
-0.6 µs (99th percentile 1.8 µs). Your numbers will differ; run the
-benchmark on your machine.
+1 µs (99th percentile 2.6 µs). Multi-producer channels (64 B messages,
+`recv_batch(256)`): ~12.9 M/s with 1 producer, ~17.3 M/s with 2, ~5.5 M/s
+with 4 and ~3.6 M/s with 8 (the producers contend for one reservation
+counter). A zero-copy pool hand-over (alloc, lend, take, give back) costs
+~0.1–0.2 µs. Your numbers will differ; run the benchmark on your machine.
+
+### Several producers: `GkMpSender`
+
+`GkChannel::new_mpsc()` (or `mpsc_with_options`) gives a sender that is
+`Clone + Send + Sync`: any number of threads of the owning process send
+through `&self`, without a lock.
+
+```rust
+use adaptif_gatotkaca_eventfd::GkChannel;
+
+let (tx, mut rx) = GkChannel::new_mpsc()?;
+let workers: Vec<_> = (0..4u16)
+    .map(|t| {
+        let tx = tx.clone();
+        std::thread::spawn(move || tx.send_kind(t, b"done").unwrap())
+    })
+    .collect();
+drop(tx); // the channel closes when the last clone is dropped
+for w in workers {
+    w.join().unwrap();
+}
+let mut n = 0;
+while rx.recv_batch(64, |_kind, msg| assert_eq!(msg, b"done")).is_ok() {
+    n += 1;
+}
+assert!(n >= 1);
+# Ok::<(), std::io::Error>(())
+```
+
+- **Messages** are lock-free: a sender claims its record with one CAS on a
+  shared reservation counter, copies, and publishes the record by storing
+  its header. Each thread's messages arrive in the order it sent them.
+  `try_send` / `try_reserve` never wait (`WouldBlock` when full, after which
+  the sender's descriptor becomes readable when space is freed); `send` /
+  `reserve` wait unless `set_nonblocking(true)` (shared by all clones).
+  `reserve` + `MpSendSlot::commit(n)` writes in place; a dropped slot sends
+  nothing and doesn't hold up later messages.
+- **Bulk transfers** go through `tx.bulk()`, which locks the bulk lane for
+  one transfer at a time (`send_bulk`, `bulk_writer`, ...).
+- **One process.** All clones belong to the owning process. Hand the end to
+  another process with `GkProcess::send(&tx)` and `recv_as::<GkMpSender>()`
+  there (clones left behind fail with `PermissionDenied`); after `fork`,
+  `claim()` in the process that sends and `detach()` in the other. A
+  multi-producer end received as a plain `GkSender` (or the reverse) is
+  refused with `InvalidData` and closed, so the receiver sees `BrokenPipe`
+  instead of hanging.
+- **The receiver** is an ordinary `GkReceiver`.
+
+### Event loops: readiness and `recv_batch`
+
+A receiver's descriptor follows two rules, so a level-triggered poller
+(asyncio's `add_reader`, `poll`, `epoll` without `EPOLLET`) never misses
+data:
+
+1. **It starts out waiting.** A fresh channel rings the receiver's doorbell
+   on the first message, so a receiver registered before it ever called
+   `recv` still wakes.
+2. **Only `WouldBlock` clears it.** A loop that stops early (a budget) is
+   readable again at once. When one lane returns `WouldBlock` while the
+   other still holds data, the doorbell is rung again for that data.
+
+`recv_batch(max, |kind, msg| ...)` drains up to `max` messages in place: it
+waits (or returns `WouldBlock`) only for the first one, frees the space of
+the whole batch at once, and wakes the sender at most once. That is the
+budgeted drain an event loop wants:
+
+```rust
+use adaptif_gatotkaca_eventfd::GkChannel;
+
+let (mut tx, mut rx) = GkChannel::new()?;
+rx.set_nonblocking(true);
+for i in 0..10u8 {
+    tx.send(&[i])?;
+}
+// One "readable" callback with a budget of 4: the rest stays queued and the
+// descriptor stays readable, so the loop calls back.
+let n = rx.recv_batch(4, |_kind, msg| { let _ = msg[0]; })?;
+assert_eq!(n, 4);
+# Ok::<(), std::io::Error>(())
+```
 
 ## Shared memory: `GkSharedMemory`
 
@@ -483,6 +570,54 @@ fn worker() -> std::io::Result<()> {
   `gk_shm_is_huge`, `gk_shm_fd` / `gk_shm_handle`, `gk_shm_free`,
   `gk_process_send_shm`, `gk_process_recv_shm` (see
   [`examples/c/shared_memory.c`](examples/c/shared_memory.c)).
+
+## Zero-copy buffers: `GkShmPool`
+
+A pool of shared memory that one process allocates from and lends to
+another, which reads the data in place and gives it back by dropping it.
+Only a 16-byte lease travels (e.g. in a channel message):
+
+```rust
+use adaptif_gatotkaca_eventfd::{GkChannel, GkShmPool, ShmLease};
+
+let pool = GkShmPool::new(64 << 20)?;        // allocating side
+let view = pool.view();                      // borrowing side (send it to another process)
+let (tx, mut rx) = GkChannel::new_mpsc()?;
+
+let mut block = pool.alloc(5)?;
+block.as_mut_slice()[..5].copy_from_slice(b"hello");
+tx.send(&block.lend(5).to_bytes())?;          // 16 bytes
+
+let mut lease = [0u8; 16];
+rx.recv(&mut lease)?;
+// SAFETY: the lease comes from this pool and is taken once.
+let buf = unsafe { view.take(ShmLease::from_bytes(&lease)) }?;
+assert_eq!(&buf[..], b"hello");               // read in place, no copy
+drop(buf);                                    // gives the block back
+assert_eq!(pool.stats().lent, 0);
+# Ok::<(), std::io::Error>(())
+```
+
+- **One allocator, any borrowers.** Only the creating process allocates
+  (from any thread; a buddy allocator over power-of-two runs of `granule`
+  bytes, default 4 KiB). Its bookkeeping lives in its own memory, so a peer
+  can't corrupt it. Views (`pool.view()`, `GkProcess::send(&view)` +
+  `recv_as::<GkShmPoolView>()`, or `fork`) take leases.
+- **Giving back** is dropping the `ShmBuf`: one CAS onto a return stack in
+  the shared memory, from any thread, no lock, no system call. The
+  allocator collects the stack with one swap when it next needs space.
+- **Checked returns.** A lease carries the block's generation; a stale or
+  duplicated return is refused (`stats().bad_returns`) instead of freeing a
+  block someone else holds.
+- **A dead borrower:** once you know it is gone (its channel reports
+  `BrokenPipe`), `unsafe pool.reclaim_all()` takes back what it held.
+- **Sizes:** `ShmPoolOptions { size, granule, huge_pages }`; default 64 MiB
+  (16 MiB on Windows, where it is committed up front).
+- **C:** `gk_shm_pool_new`, `gk_shm_pool_alloc`, `gk_shm_block_ptr`,
+  `gk_shm_block_lend`, `gk_shm_pool_new_view`, `gk_shm_pool_view_take`,
+  `gk_shm_buf_ptr`/`_len`/`_free`, `gk_shm_pool_get_stats`,
+  `gk_process_send_shm_pool_view` / `gk_process_recv_shm_pool_view`; see
+  [`examples/c/mpsc_pool.c`](examples/c/mpsc_pool.c).
 
 ## C usage
 

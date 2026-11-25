@@ -1439,6 +1439,623 @@ pub unsafe extern "C" fn gk_dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_
     })
 }
 
+// ---------------------------------------------------------------------------
+// Multi-producer channels, batch receive, peer liveness
+// ---------------------------------------------------------------------------
+
+use crate::GkMpSender;
+
+/// Reads `len` bytes at `buf` as a message (NULL is fine for `len == 0`).
+///
+/// # Safety
+/// `buf` must be valid for reading `len` bytes when `len > 0`.
+unsafe fn message<'a>(buf: *const c_void, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        Some(&[])
+    } else if buf.is_null() {
+        compat::set_errno(crate::error::errno::EINVAL);
+        None
+    } else {
+        // SAFETY: forwarded to the caller.
+        Some(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) })
+    }
+}
+
+/// `0` or `-1` with `errno` (channel rules: size problems are `EMSGSIZE`).
+fn channel_status(r: std::io::Result<()>) -> c_int {
+    match r {
+        Ok(()) => 0,
+        Err(e) => {
+            channel_errno(&e);
+            -1
+        }
+    }
+}
+
+/// `int gk_channel_new_mpsc(const gk_channel_options *opts, gk_mp_sender **tx, gk_receiver **rx);`
+/// (`opts` NULL: the defaults)
+///
+/// # Safety
+/// `opts` must be null or valid for reading; `tx` and `rx` valid for writing
+/// a pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_channel_new_mpsc(opts: *const GkChannelOptionsC, tx: *mut *mut GkMpSender, rx: *mut *mut GkReceiver) -> c_int {
+    guard(-1, || {
+        if tx.is_null() || rx.is_null() {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        }
+        // SAFETY: the caller guarantees `opts` is null or readable.
+        let o = match unsafe { opts.as_ref() } {
+            Some(o) => {
+                let Some(huge_pages) = huge_from_c(o.huge_pages) else {
+                    compat::set_errno(crate::error::errno::EINVAL);
+                    return -1;
+                };
+                ChannelOptions {
+                    capacity: o.capacity,
+                    max_message: o.max_message,
+                    bulk_capacity: o.bulk_capacity,
+                    chunk: o.chunk,
+                    huge_pages,
+                }
+            }
+            None => ChannelOptions::default(),
+        };
+        match GkChannel::mpsc_with_options(o) {
+            Ok((s, r)) => {
+                // SAFETY: checked non-null; the caller guarantees validity.
+                unsafe {
+                    *tx = Box::into_raw(Box::new(s));
+                    *rx = Box::into_raw(Box::new(r));
+                }
+                0
+            }
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        }
+    })
+}
+
+/// `gk_mp_sender *gk_mp_sender_clone(const gk_mp_sender *tx);`
+///
+/// # Safety
+/// `tx` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_clone(tx: *const GkMpSender) -> *mut GkMpSender {
+    guard(core::ptr::null_mut(), || with_ref(tx, core::ptr::null_mut(), |tx| Box::into_raw(Box::new(tx.clone()))))
+}
+
+/// `int gk_mp_sender_send(const gk_mp_sender *tx, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_send(tx: *const GkMpSender, buf: *const c_void, len: usize) -> c_int {
+    // SAFETY: forwarded to the caller.
+    unsafe { gk_mp_sender_send_kind(tx, 0, buf, len) }
+}
+
+/// `int gk_mp_sender_send_kind(const gk_mp_sender *tx, uint16_t kind, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_send_kind(tx: *const GkMpSender, kind: u16, buf: *const c_void, len: usize) -> c_int {
+    guard(-1, || {
+        with_ref(tx, -1, |tx| {
+            // SAFETY: the caller guarantees `len` readable bytes.
+            let Some(msg) = (unsafe { message(buf, len) }) else { return -1 };
+            channel_status(tx.send_kind(kind, msg))
+        })
+    })
+}
+
+/// `int gk_mp_sender_try_send_kind(const gk_mp_sender *tx, uint16_t kind, const void *buf, size_t len);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_try_send_kind(tx: *const GkMpSender, kind: u16, buf: *const c_void, len: usize) -> c_int {
+    guard(-1, || {
+        with_ref(tx, -1, |tx| {
+            // SAFETY: the caller guarantees `len` readable bytes.
+            let Some(msg) = (unsafe { message(buf, len) }) else { return -1 };
+            channel_status(tx.try_send_kind(kind, msg))
+        })
+    })
+}
+
+/// `int gk_mp_sender_send_bulk_kind(const gk_mp_sender *tx, uint16_t kind, const void *buf, size_t len, uint64_t *id);`
+///
+/// # Safety
+/// `tx` must be a live handle; `buf` valid for reading `len` bytes; `id`
+/// null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_send_bulk_kind(
+    tx: *const GkMpSender,
+    kind: u16,
+    buf: *const c_void,
+    len: usize,
+    id: *mut u64,
+) -> c_int {
+    guard(-1, || {
+        with_ref(tx, -1, |tx| {
+            // SAFETY: the caller guarantees `len` readable bytes.
+            let Some(data) = (unsafe { message(buf, len) }) else { return -1 };
+            match tx.bulk().send_bulk_kind(kind, data) {
+                Ok(v) => {
+                    // SAFETY: the caller guarantees `id` is null or writable.
+                    if let Some(id) = unsafe { id.as_mut() } {
+                        *id = v;
+                    }
+                    0
+                }
+                Err(e) => {
+                    channel_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+/// `int gk_mp_sender_set_nonblocking(const gk_mp_sender *tx, int nonblocking);` (every clone)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_set_nonblocking(tx: *const GkMpSender, nonblocking: c_int) -> c_int {
+    guard(-1, || {
+        with_ref(tx, -1, |tx| {
+            tx.set_nonblocking(nonblocking != 0);
+            0
+        })
+    })
+}
+
+/// `int gk_mp_sender_claim(const gk_mp_sender *tx);` (after `fork`)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_claim(tx: *const GkMpSender) -> c_int {
+    guard(-1, || {
+        with_ref(tx, -1, |tx| {
+            tx.claim();
+            0
+        })
+    })
+}
+
+/// `int gk_mp_sender_fd(const gk_mp_sender *tx);` (unix: readable when space was freed)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_fd(tx: *const GkMpSender) -> c_int {
+    guard(-1, || with_ref(tx, -1, std::os::fd::AsRawFd::as_raw_fd))
+}
+
+/// `uintptr_t gk_mp_sender_socket(const gk_mp_sender *tx);` (Windows)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_socket(tx: *const GkMpSender) -> usize {
+    guard(usize::MAX, || with_ref(tx, usize::MAX, |tx| std::os::windows::io::AsRawSocket::as_raw_socket(tx) as usize))
+}
+
+/// `int gk_mp_sender_peer_gone(const gk_mp_sender *tx);` (1: the receiver is gone)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_peer_gone(tx: *const GkMpSender) -> c_int {
+    guard(-1, || with_ref(tx, -1, |tx| c_int::from(tx.peer_gone())))
+}
+
+/// `int gk_sender_peer_gone(gk_sender *tx);` (1: the receiver is gone)
+///
+/// # Safety
+/// `tx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_sender_peer_gone(tx: *mut GkSender) -> c_int {
+    guard(-1, || with(tx, -1, |tx| c_int::from(tx.peer_gone())))
+}
+
+/// `int gk_receiver_peer_gone(gk_receiver *rx);` (1: the sender is gone)
+///
+/// # Safety
+/// `rx` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_peer_gone(rx: *mut GkReceiver) -> c_int {
+    guard(-1, || with(rx, -1, |rx| c_int::from(rx.peer_gone())))
+}
+
+/// `void gk_mp_sender_free(gk_mp_sender *tx);` (the channel closes with the last handle; NULL ok)
+///
+/// # Safety
+/// `tx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_free(tx: *mut GkMpSender) {
+    if !tx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(tx) }));
+    }
+}
+
+/// `void gk_mp_sender_detach(gk_mp_sender *tx);` (frees; no handle of this process closes the channel)
+///
+/// # Safety
+/// `tx` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_mp_sender_detach(tx: *mut GkMpSender) {
+    if !tx.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || unsafe { Box::from_raw(tx) }.detach());
+    }
+}
+
+/// `int gk_process_send_mp_sender(gk_process *p, const gk_mp_sender *tx);`
+///
+/// # Safety
+/// Both must be live handles (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_mp_sender(p: *mut GkProcess, tx: *const GkMpSender) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let Some(tx) = (unsafe { tx.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(p, -1, |p| match p.send(tx) {
+            Ok(()) => 0,
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `gk_mp_sender *gk_process_recv_mp_sender(gk_process *p);`
+///
+/// # Safety
+/// `p` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_mp_sender(p: *mut GkProcess) -> *mut GkMpSender {
+    guard(core::ptr::null_mut(), || with(p, core::ptr::null_mut(), |p| boxed(p.recv_as::<GkMpSender>())))
+}
+
+/// `gk_recv_fn`: `void (*)(void *ctx, uint16_t kind, const void *msg, size_t len)`.
+pub type GkRecvFn = unsafe extern "C" fn(ctx: *mut c_void, kind: u16, msg: *const c_void, len: usize);
+
+/// `intptr_t gk_receiver_recv_batch(gk_receiver *rx, size_t max, gk_recv_fn f, void *ctx);`
+///
+/// # Safety
+/// `rx` must be a live handle; `f` a valid function that does not unwind,
+/// called with `ctx` and a message valid only during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_receiver_recv_batch(rx: *mut GkReceiver, max: usize, f: Option<GkRecvFn>, ctx: *mut c_void) -> isize {
+    guard(-1, || {
+        let Some(f) = f else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(rx, -1, |rx| {
+            match rx.recv_batch(max, |kind, msg| {
+                // SAFETY: forwarded to the caller; `msg` lives for the call.
+                unsafe { f(ctx, kind, msg.as_ptr().cast(), msg.len()) }
+            }) {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    channel_errno(&e);
+                    -1
+                }
+            }
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory pools (zero-copy lending)
+// ---------------------------------------------------------------------------
+
+use crate::{GkShmPool, GkShmPoolView, ShmBlock, ShmBuf, ShmLease, ShmPoolOptions, ShmPoolStats};
+
+/// `gk_shm_pool_options` in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GkShmPoolOptionsC {
+    size: usize,
+    granule: usize,
+    huge_pages: c_int,
+}
+
+/// `gk_shm_lease` in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GkShmLeaseC {
+    index: u32,
+    generation: u32,
+    len: u64,
+}
+
+/// `gk_shm_pool_stats` in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GkShmPoolStatsC {
+    size: usize,
+    granule: usize,
+    free: usize,
+    allocated: usize,
+    lent: usize,
+    bad_returns: u64,
+}
+
+impl From<ShmPoolStats> for GkShmPoolStatsC {
+    fn from(s: ShmPoolStats) -> Self {
+        Self { size: s.size, granule: s.granule, free: s.free, allocated: s.allocated, lent: s.lent, bad_returns: s.bad_returns }
+    }
+}
+
+/// `void gk_shm_pool_options_default(gk_shm_pool_options *opts);`
+///
+/// # Safety
+/// `opts` must be null or valid for writing a `gk_shm_pool_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_options_default(opts: *mut GkShmPoolOptionsC) {
+    if !opts.is_null() {
+        let d = ShmPoolOptions::default();
+        // SAFETY: checked non-null; the caller guarantees validity.
+        unsafe { opts.write(GkShmPoolOptionsC { size: d.size, granule: d.granule, huge_pages: huge_to_c(d.huge_pages) }) };
+    }
+}
+
+/// `gk_shm_pool *gk_shm_pool_new(const gk_shm_pool_options *opts);` (NULL: the defaults)
+///
+/// # Safety
+/// `opts` must be null or valid for reading.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_new(opts: *const GkShmPoolOptionsC) -> *mut GkShmPool {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: the caller guarantees `opts` is null or readable.
+        let o = match unsafe { opts.as_ref() } {
+            Some(o) => {
+                let Some(huge_pages) = huge_from_c(o.huge_pages) else {
+                    compat::set_errno(crate::error::errno::EINVAL);
+                    return core::ptr::null_mut();
+                };
+                ShmPoolOptions { size: o.size, granule: o.granule, huge_pages }
+            }
+            None => ShmPoolOptions::default(),
+        };
+        boxed(GkShmPool::with_options(o))
+    })
+}
+
+/// `gk_shm_block *gk_shm_pool_alloc(const gk_shm_pool *pool, size_t len);`
+/// (NULL + `ENOMEM` when exhausted, `EINVAL` if it can never fit)
+///
+/// # Safety
+/// `pool` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_alloc(pool: *const GkShmPool, len: usize) -> *mut ShmBlock {
+    guard(core::ptr::null_mut(), || with_ref(pool, core::ptr::null_mut(), |p| boxed(p.alloc(len))))
+}
+
+/// `int gk_shm_pool_get_stats(const gk_shm_pool *pool, gk_shm_pool_stats *stats);`
+///
+/// # Safety
+/// `pool` must be a live handle; `stats` valid for writing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_get_stats(pool: *const GkShmPool, stats: *mut GkShmPoolStatsC) -> c_int {
+    guard(-1, || {
+        if stats.is_null() {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        }
+        with_ref(pool, -1, |p| {
+            // SAFETY: checked non-null; the caller guarantees validity.
+            unsafe { stats.write(p.stats().into()) };
+            0
+        })
+    })
+}
+
+/// `int gk_shm_pool_reclaim_all(const gk_shm_pool *pool);`
+///
+/// # Safety
+/// `pool` must be a live handle, and no borrower may still use a lent block.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_reclaim_all(pool: *const GkShmPool) -> c_int {
+    guard(-1, || {
+        with_ref(pool, -1, |p| {
+            // SAFETY: forwarded to the caller.
+            unsafe { p.reclaim_all() };
+            0
+        })
+    })
+}
+
+/// `void gk_shm_pool_free(gk_shm_pool *pool);` (blocks and views keep the memory; NULL ok)
+///
+/// # Safety
+/// `pool` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_free(pool: *mut GkShmPool) {
+    if !pool.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(pool) }));
+    }
+}
+
+/// `void *gk_shm_block_ptr(gk_shm_block *block);` (writable, `capacity` bytes)
+///
+/// # Safety
+/// `block` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_block_ptr(block: *mut ShmBlock) -> *mut c_void {
+    guard(core::ptr::null_mut(), || with(block, core::ptr::null_mut(), |b| b.as_mut_slice().as_mut_ptr().cast()))
+}
+
+/// `size_t gk_shm_block_capacity(const gk_shm_block *block);`
+///
+/// # Safety
+/// `block` must be a live handle (or null: returns 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_block_capacity(block: *const ShmBlock) -> usize {
+    guard(0, || with_ref(block, 0, ShmBlock::capacity))
+}
+
+/// `int gk_shm_block_lend(gk_shm_block *block, size_t len, gk_shm_lease *lease);`
+///
+/// Frees the handle on success (the block now belongs to the borrower).
+///
+/// # Safety
+/// `block` must be a live handle; `lease` valid for writing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_block_lend(block: *mut ShmBlock, len: usize, lease: *mut GkShmLeaseC) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let bad = lease.is_null() || block.is_null() || len > unsafe { (*block).capacity() };
+        if bad {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        }
+        // SAFETY: the caller hands back a box we created.
+        let l = unsafe { Box::from_raw(block) }.lend(len);
+        // SAFETY: checked non-null; the caller guarantees validity.
+        unsafe { lease.write(GkShmLeaseC { index: l.index, generation: l.generation, len: l.len }) };
+        0
+    })
+}
+
+/// `void gk_shm_block_free(gk_shm_block *block);` (frees an unlent block; NULL ok)
+///
+/// # Safety
+/// `block` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_block_free(block: *mut ShmBlock) {
+    if !block.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(block) }));
+    }
+}
+
+/// `gk_shm_pool_view *gk_shm_pool_new_view(const gk_shm_pool *pool);`
+///
+/// # Safety
+/// `pool` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_new_view(pool: *const GkShmPool) -> *mut GkShmPoolView {
+    guard(core::ptr::null_mut(), || with_ref(pool, core::ptr::null_mut(), |p| Box::into_raw(Box::new(p.view()))))
+}
+
+/// `gk_shm_buf *gk_shm_pool_view_take(const gk_shm_pool_view *view, const gk_shm_lease *lease);`
+///
+/// # Safety
+/// `view` must be a live handle; `lease` readable, lent by this pool, and
+/// taken once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_view_take(view: *const GkShmPoolView, lease: *const GkShmLeaseC) -> *mut ShmBuf {
+    guard(core::ptr::null_mut(), || {
+        // SAFETY: the caller guarantees `lease` is null or readable.
+        let Some(l) = (unsafe { lease.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return core::ptr::null_mut();
+        };
+        let l = ShmLease { index: l.index, generation: l.generation, len: l.len };
+        // SAFETY: forwarded to the caller (lent by this pool, taken once).
+        with_ref(view, core::ptr::null_mut(), |v| boxed(unsafe { v.take(l) }.map_err(|_| crate::error::invalid_input())))
+    })
+}
+
+/// `void gk_shm_pool_view_free(gk_shm_pool_view *view);` (NULL ok)
+///
+/// # Safety
+/// `view` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_pool_view_free(view: *mut GkShmPoolView) {
+    if !view.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(view) }));
+    }
+}
+
+/// `const void *gk_shm_buf_ptr(const gk_shm_buf *buf);`
+///
+/// # Safety
+/// `buf` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_buf_ptr(buf: *const ShmBuf) -> *const c_void {
+    guard(core::ptr::null(), || with_ref(buf, core::ptr::null(), |b| b.as_ptr().cast()))
+}
+
+/// `size_t gk_shm_buf_len(const gk_shm_buf *buf);`
+///
+/// # Safety
+/// `buf` must be a live handle (or null: returns 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_buf_len(buf: *const ShmBuf) -> usize {
+    guard(0, || with_ref(buf, 0, |b| b.len()))
+}
+
+/// `void gk_shm_buf_free(gk_shm_buf *buf);` (gives the block back; NULL ok)
+///
+/// # Safety
+/// `buf` must be a handle from this API, freed only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_shm_buf_free(buf: *mut ShmBuf) {
+    if !buf.is_null() {
+        // SAFETY: the caller hands back a box we created.
+        guard((), || drop(unsafe { Box::from_raw(buf) }));
+    }
+}
+
+/// `int gk_process_send_shm_pool_view(gk_process *p, const gk_shm_pool_view *view);`
+///
+/// # Safety
+/// Both must be live handles (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_send_shm_pool_view(p: *mut GkProcess, view: *const GkShmPoolView) -> c_int {
+    guard(-1, || {
+        // SAFETY: the caller guarantees a live handle (or null).
+        let Some(view) = (unsafe { view.as_ref() }) else {
+            compat::set_errno(crate::error::errno::EINVAL);
+            return -1;
+        };
+        with(p, -1, |p| match p.send(view) {
+            Ok(()) => 0,
+            Err(e) => {
+                compat::set_errno(crate::error::to_errno(&e));
+                -1
+            }
+        })
+    })
+}
+
+/// `gk_shm_pool_view *gk_process_recv_shm_pool_view(gk_process *p);`
+///
+/// # Safety
+/// `p` must be a live handle (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_process_recv_shm_pool_view(p: *mut GkProcess) -> *mut GkShmPoolView {
+    guard(core::ptr::null_mut(), || {
+        with(p, core::ptr::null_mut(), |p| {
+            boxed(p.recv_as::<GkShmPoolView>().map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => crate::error::invalid_input(),
+                _ => e,
+            }))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1807,6 +2424,106 @@ mod tests {
             assert_eq!(gk_process_send_shm(core::ptr::null_mut(), core::ptr::null()), -1);
             assert!(gk_process_recv_shm(core::ptr::null_mut()).is_null());
             gk_shm_free(core::ptr::null_mut());
+        }
+    }
+
+    unsafe extern "C" fn collect(ctx: *mut c_void, kind: u16, msg: *const c_void, len: usize) {
+        // SAFETY: `ctx` is the test's Vec; `msg` holds `len` bytes.
+        unsafe {
+            let v = &mut *ctx.cast::<Vec<(u16, Vec<u8>)>>();
+            v.push((kind, std::slice::from_raw_parts(msg.cast::<u8>(), len).to_vec()));
+        }
+    }
+
+    #[test]
+    fn mpsc_batch_and_pool_c_api() {
+        use crate::error::errno::{EAGAIN, EMSGSIZE, ENOMEM, EPIPE};
+        // SAFETY: handles from this API, each freed once; buffers valid.
+        unsafe {
+            let (mut tx, mut rx) = (core::ptr::null_mut(), core::ptr::null_mut());
+            assert_eq!(gk_channel_new_mpsc(core::ptr::null(), &mut tx, &mut rx), 0);
+            let tx2 = gk_mp_sender_clone(tx);
+            assert_eq!(gk_mp_sender_send_kind(tx, 1, b"one".as_ptr().cast(), 3), 0);
+            assert_eq!(gk_mp_sender_try_send_kind(tx2, 2, b"two".as_ptr().cast(), 3), 0);
+            assert_eq!(gk_mp_sender_send(tx2, core::ptr::null(), 0), 0);
+            assert_eq!(gk_mp_sender_send(tx, core::ptr::null(), 5), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            let big = vec![0u8; (64 << 10) + 1];
+            assert_eq!(gk_mp_sender_send(tx, big.as_ptr().cast(), big.len()), -1);
+            assert_eq!(compat::errno(), EMSGSIZE);
+            let mut id = 0;
+            assert_eq!(gk_mp_sender_send_bulk_kind(tx, 9, big.as_ptr().cast(), big.len(), &mut id), 0);
+            assert!(id != 0);
+            let mut got: Vec<(u16, Vec<u8>)> = Vec::new();
+            let ctx = (&raw mut got).cast::<c_void>();
+            assert_eq!(gk_receiver_recv_batch(rx, 10, Some(collect), ctx), 3);
+            assert_eq!(got, vec![(1, b"one".to_vec()), (2, b"two".to_vec()), (0, vec![])]);
+            assert_eq!(gk_receiver_recv_batch(rx, 10, None, ctx), -1);
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_receiver_set_nonblocking(rx, 1), 0);
+            assert_eq!(gk_receiver_recv_batch(rx, 10, Some(collect), ctx), -1);
+            assert_eq!(compat::errno(), EAGAIN, "messages drained (the bulk transfer is another lane)");
+            assert_eq!(gk_mp_sender_set_nonblocking(tx, 1), 0);
+            assert_eq!(gk_mp_sender_claim(tx), 0);
+            assert_eq!(gk_receiver_peer_gone(rx), 0);
+            gk_mp_sender_free(tx);
+            assert_eq!(gk_receiver_peer_gone(rx), 0, "a clone is left");
+            gk_mp_sender_free(tx2);
+            assert_eq!(gk_receiver_peer_gone(rx), 1);
+            assert_eq!(gk_receiver_bulk_begin(rx, core::ptr::null_mut(), core::ptr::null_mut()), 0);
+            assert_eq!(gk_receiver_bulk_end(rx), 0);
+            assert_eq!(gk_receiver_recv_batch(rx, 10, Some(collect), ctx), -1);
+            assert_eq!(compat::errno(), EPIPE);
+            gk_receiver_free(rx);
+            assert_eq!(gk_mp_sender_peer_gone(core::ptr::null()), -1);
+            assert!(gk_mp_sender_clone(core::ptr::null()).is_null());
+            gk_mp_sender_free(core::ptr::null_mut());
+            gk_mp_sender_detach(core::ptr::null_mut());
+
+            // Pools.
+            let mut o = GkShmPoolOptionsC { size: 0, granule: 0, huge_pages: 0 };
+            gk_shm_pool_options_default(&mut o);
+            assert_eq!(o.granule, 4096);
+            o.size = 64 << 10;
+            let pool = gk_shm_pool_new(&o);
+            assert!(!pool.is_null());
+            let view = gk_shm_pool_new_view(pool);
+            let b = gk_shm_pool_alloc(pool, 5000);
+            assert_eq!(gk_shm_block_capacity(b), 8192);
+            std::ptr::copy_nonoverlapping(b"zero-copy".as_ptr(), gk_shm_block_ptr(b).cast::<u8>(), 9);
+            let mut lease = GkShmLeaseC { index: 0, generation: 0, len: 0 };
+            assert_eq!(gk_shm_block_lend(b, 9000, &mut lease), -1, "more than the capacity: still ours");
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_shm_block_lend(b, 9, &mut lease), 0);
+            let buf = gk_shm_pool_view_take(view, &lease);
+            assert_eq!(gk_shm_buf_len(buf), 9);
+            assert_eq!(std::slice::from_raw_parts(gk_shm_buf_ptr(buf).cast::<u8>(), 9), b"zero-copy");
+            let mut st = GkShmPoolStatsC { size: 0, granule: 0, free: 0, allocated: 0, lent: 0, bad_returns: 0 };
+            assert_eq!(gk_shm_pool_get_stats(pool, &mut st), 0);
+            assert_eq!((st.lent, st.free), (1, (64 << 10) - 8192));
+            gk_shm_buf_free(buf);
+            assert_eq!(gk_shm_pool_get_stats(pool, &mut st), 0);
+            assert_eq!((st.lent, st.free, st.bad_returns), (0, 64 << 10, 0));
+            let all = gk_shm_pool_alloc(pool, 64 << 10);
+            assert!(gk_shm_pool_alloc(pool, 1).is_null());
+            assert_eq!(compat::errno(), ENOMEM);
+            gk_shm_block_free(all);
+            assert!(gk_shm_pool_alloc(pool, 1 << 20).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+            let bad = GkShmLeaseC { index: 1000, generation: 1, len: 1 };
+            assert!(gk_shm_pool_view_take(view, &bad).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_shm_pool_reclaim_all(pool), 0);
+            assert_eq!(gk_shm_pool_get_stats(pool, core::ptr::null_mut()), -1);
+            o.granule = 100;
+            assert!(gk_shm_pool_new(&o).is_null());
+            assert_eq!(compat::errno(), EINVAL);
+            assert_eq!(gk_process_send_shm_pool_view(core::ptr::null_mut(), view), -1);
+            assert!(gk_process_recv_shm_pool_view(core::ptr::null_mut()).is_null());
+            gk_shm_pool_view_free(view);
+            gk_shm_pool_free(pool);
+            gk_shm_buf_free(core::ptr::null_mut());
+            gk_shm_block_free(core::ptr::null_mut());
         }
     }
 

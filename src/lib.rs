@@ -17,8 +17,11 @@
 //!
 //! [`GkChannel`] builds on it: a one-way message channel between threads or
 //! processes through shared memory, with the eventfds as doorbells (see the
-//! [`channel`] module). [`GkSharedMemory`] is plain shared memory you can
-//! hand to other processes the same way (see the [`shared_memory`] module).
+//! [`channel`] module), with one sender or a [`GkMpSender`] that many threads
+//! share. [`GkSharedMemory`] is plain shared memory you can hand to other
+//! processes the same way (see the [`shared_memory`] module), and
+//! [`GkShmPool`] lends zero-copy buffers out of it (see the [`pool`]
+//! module).
 //!
 //! The [`compat`] module offers the `<sys/eventfd.h>` functions with C
 //! semantics, and the `ffi` feature exports them as a C ABI.
@@ -53,11 +56,15 @@ pub mod channel;
 pub mod compat;
 #[cfg(feature = "ffi")]
 mod ffi;
+pub mod pool;
 pub mod process;
 pub mod shared_memory;
 
-pub use channel::{BulkReader, BulkWriter, ChannelOptions, GkChannel, GkReceiver, GkSender, KIND_UNSPECIFIED, SendSlot};
+pub use channel::{
+    BulkReader, BulkWriter, ChannelOptions, GkChannel, GkMpSender, GkReceiver, GkSender, KIND_UNSPECIFIED, MpBulk, MpSendSlot, SendSlot,
+};
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
+pub use pool::{GkShmPool, GkShmPoolView, ShmBlock, ShmBuf, ShmLease, ShmPoolOptions, ShmPoolStats};
 pub use process::{GkListener, GkProcess, Shareable};
 pub use shared_memory::{GkSharedMemory, HugePages, SharedMemoryOptions};
 

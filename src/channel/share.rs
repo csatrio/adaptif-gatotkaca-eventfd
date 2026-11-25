@@ -24,10 +24,20 @@ impl End {
     }
 
     /// Builds an end received by this process, which becomes its owner.
-    fn received(ring: Ring, data_ready: GkEventFd, space_ready: GkEventFd, side: Side) -> Self {
+    /// `mpsc`: the channel mode the caller expects (`None`: either). An end
+    /// of the other mode is closed (the peer sees `BrokenPipe`) and refused
+    /// with `InvalidData`, like any object of the wrong kind.
+    fn received(ring: Ring, data_ready: GkEventFd, space_ready: GkEventFd, side: Side, mpsc: Option<bool>) -> io::Result<Self> {
         let end = Self::new(Arc::new(ring), data_ready, space_ready, side);
         end.owner().store(current_pid(), Ordering::Release);
-        end
+        match mpsc {
+            Some(m) if m != end.is_mpsc() => {
+                drop(end);
+                let want = if m { "GkMpSender" } else { "GkSender" };
+                Err(io::Error::new(io::ErrorKind::InvalidData, format!("not the expected kind of object: the channel needs a {want}")))
+            }
+            _ => Ok(end),
+        }
     }
 
     fn tag(side: Side) -> &'static str {
@@ -46,7 +56,7 @@ impl End {
 
 #[cfg(unix)]
 impl End {
-    fn send_over(&self, sock: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    pub(super) fn send_over(&self, sock: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
         let mut fds = vec![self.ring.region.fd()];
         fds.extend(self.data_ready.inner.share_fds());
         fds.extend(self.space_ready.inner.share_fds());
@@ -58,7 +68,7 @@ impl End {
         r
     }
 
-    fn recv_over(sock: std::os::fd::BorrowedFd<'_>, side: Side) -> io::Result<Self> {
+    pub(super) fn recv_over(sock: std::os::fd::BorrowedFd<'_>, side: Side, mpsc: impl Into<Option<bool>>) -> io::Result<Self> {
         use crate::sys::{Inner, SHARE_FDS};
         let mut fds = crate::sys::unix_share::recv(sock, Self::tag(side), 1 + 2 * SHARE_FDS)?;
         let space = fds.split_off(1 + SHARE_FDS);
@@ -67,7 +77,7 @@ impl End {
         let region = SharedRegion::from_owned(region_fd, DATA, Layout::accepts)?;
         let data_ready = GkEventFd { inner: Inner::from_share_fds(data)? };
         let space_ready = GkEventFd { inner: Inner::from_share_fds(space)? };
-        Ok(Self::received(Ring::with_region(region), data_ready, space_ready, side))
+        Self::received(Ring::with_region(region), data_ready, space_ready, side, mpsc.into())
     }
 }
 
@@ -75,7 +85,7 @@ impl End {
 impl End {
     /// An offer the process `pid` can take with `take` (see
     /// `GkProcess::send`): `gkch1:<S|R>u|<region>|<eventfd offer>|<eventfd offer>`.
-    fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
+    pub(super) fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
         use std::os::windows::io::AsRawHandle;
         let owner = self.hand_off();
         let r = (|| {
@@ -91,7 +101,7 @@ impl End {
         r
     }
 
-    fn take(token: &str, pid: u32, side: Side) -> io::Result<Self> {
+    pub(super) fn take(token: &str, pid: u32, side: Side, mpsc: impl Into<Option<bool>>) -> io::Result<Self> {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid channel offer");
         let mut parts = token.trim().split('|');
         if parts.next() != Some(Self::tag(side)) {
@@ -107,7 +117,7 @@ impl End {
         let region = SharedRegion::from_owned(region, DATA, Layout::accepts)?;
         let data_ready = GkEventFd { inner: crate::sys::Inner::take_offer(d, pid)? };
         let space_ready = GkEventFd { inner: crate::sys::Inner::take_offer(s, pid)? };
-        Ok(Self::received(Ring::with_region(region), data_ready, space_ready, side))
+        Self::received(Ring::with_region(region), data_ready, space_ready, side, mpsc.into())
     }
 }
 
@@ -124,7 +134,26 @@ impl GkSender {
     /// becomes its owner.
     #[cfg(unix)]
     pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Sender)?))
+        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Sender, false)?))
+    }
+}
+
+impl super::GkMpSender {
+    /// Unix: hands this end (for every clone in this process) to the process
+    /// at the other end of `stream` (`SCM_RIGHTS`), which calls
+    /// [`GkMpSender::recv_from`](super::GkMpSender::recv_from). The clones
+    /// left here are detached and fail with `PermissionDenied`.
+    #[cfg(unix)]
+    pub fn send_to(&self, stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
+        crate::process::private::Sealed::send_over(self, std::os::fd::AsFd::as_fd(stream))
+    }
+
+    /// Unix: receives a multi-producer sender passed with
+    /// [`GkMpSender::send_to`](super::GkMpSender::send_to); this process
+    /// becomes its owner.
+    #[cfg(unix)]
+    pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
+        <Self as crate::process::private::Sealed>::recv_over(std::os::fd::AsFd::as_fd(stream))
     }
 }
 
@@ -141,7 +170,7 @@ impl GkReceiver {
     /// process becomes its owner.
     #[cfg(unix)]
     pub fn recv_from(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Receiver)?))
+        Ok(Self::from_end(End::recv_over(std::os::fd::AsFd::as_fd(stream), Side::Receiver, None)?))
     }
 }
 
@@ -153,7 +182,7 @@ impl crate::process::private::Sealed for GkSender {
     }
     #[cfg(unix)]
     fn recv_over(sock: std::os::fd::BorrowedFd<'_>) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(sock, Side::Sender)?))
+        Ok(Self::from_end(End::recv_over(sock, Side::Sender, false)?))
     }
     #[cfg(windows)]
     fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
@@ -161,7 +190,7 @@ impl crate::process::private::Sealed for GkSender {
     }
     #[cfg(windows)]
     fn take(token: &str, pid: u32) -> io::Result<Self> {
-        Ok(Self::from_end(End::take(token, pid, Side::Sender)?))
+        Ok(Self::from_end(End::take(token, pid, Side::Sender, false)?))
     }
 }
 
@@ -172,7 +201,7 @@ impl crate::process::private::Sealed for GkReceiver {
     }
     #[cfg(unix)]
     fn recv_over(sock: std::os::fd::BorrowedFd<'_>) -> io::Result<Self> {
-        Ok(Self::from_end(End::recv_over(sock, Side::Receiver)?))
+        Ok(Self::from_end(End::recv_over(sock, Side::Receiver, None)?))
     }
     #[cfg(windows)]
     fn offer(&self, pid: u32) -> io::Result<(String, Vec<std::os::windows::io::OwnedHandle>)> {
@@ -180,7 +209,7 @@ impl crate::process::private::Sealed for GkReceiver {
     }
     #[cfg(windows)]
     fn take(token: &str, pid: u32) -> io::Result<Self> {
-        Ok(Self::from_end(End::take(token, pid, Side::Receiver)?))
+        Ok(Self::from_end(End::take(token, pid, Side::Receiver, None)?))
     }
 }
 

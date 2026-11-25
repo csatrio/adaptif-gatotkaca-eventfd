@@ -1,5 +1,6 @@
 //! The shared memory layout of a channel and the lock-free logic of one
-//! lane (a single-producer/single-consumer ring of records).
+//! lane (a ring of records with one consumer and one producer, or, for the
+//! message lane of a multi-producer channel, several producer threads).
 //!
 //! Layout: `Header | message ring | bulk ring`. The header holds the sizes,
 //! the owners and closed flags, and for each lane a tail line (written by
@@ -11,13 +12,32 @@
 //! always contiguous: if it doesn't fit before the end of the ring, a PAD
 //! record fills the rest and the record starts at index 0. Bulk records
 //! begin their payload with `[transfer id: u64][chunk seq: u64][total: u64]`.
+//!
+//! Multi-producer message lane (`Meta::mode == MODE_MPSC`): the tail line's
+//! position is a reservation counter that producers advance with a CAS, and
+//! each record is published by storing its 8-byte header last, as one atomic
+//! word with the `COMMIT` flag set. The receiver reads the header at its
+//! head: zero means "not written yet" (empty, or a producer still copying).
+//! So that stale bytes never look like a header, the receiver zeroes every
+//! byte it consumes before it frees the space. PAD records there carry their
+//! own span (`record_len(len)`) instead of "to the end of the ring", which
+//! also lets a producer shrink or abandon a reservation.
+//!
+//! A fresh layout starts with the receiver's waiting flags set, so the first
+//! record rings its doorbell: a receiver registered with a poller before it
+//! ever called `recv` still wakes.
 
 use std::io;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// "GKC" + layout version 3 (two lanes, 16-bit kinds).
-pub(super) const MAGIC: u32 = 0x474B_4303;
+/// "GKC" + layout version 4 (two lanes, 16-bit kinds, mode word, receiver
+/// starts waiting).
+pub(super) const MAGIC: u32 = 0x474B_4304;
+/// `Meta::mode`: one producer per lane.
+pub(super) const MODE_SPSC: u32 = 0;
+/// `Meta::mode`: the message lane takes several producer threads.
+pub(super) const MODE_MPSC: u32 = 1;
 /// Record header: `len: u32`, `flags: u16`, `kind: u16`.
 pub(super) const REC_HDR: u64 = 8;
 /// Bulk record sub-header: transfer id, chunk sequence, total length.
@@ -35,6 +55,20 @@ pub(super) mod flag {
     pub(crate) const ABORT: u32 = 8;
     /// Bulk: the `total` field is valid.
     pub(crate) const LEN_KNOWN: u32 = 16;
+    /// Multi-producer lane: the header is written (never zero once set).
+    pub(crate) const COMMIT: u32 = 0x8000;
+}
+
+/// The header of a record as one word: `len | flags << 32 | kind << 48`
+/// (the same bytes as the `[len: u32][flags: u16][kind: u16]` layout on the
+/// little-endian targets this crate supports).
+fn pack(len: u64, flags: u32, kind: u16) -> u64 {
+    debug_assert!(len <= u64::from(u32::MAX) && flags <= u32::from(u16::MAX));
+    len | u64::from(flags) << 32 | u64::from(kind) << 48
+}
+
+fn unpack(w: u64) -> (u64, u32, u16) {
+    (w & 0xffff_ffff, ((w >> 32) & 0xffff) as u32, (w >> 48) as u16)
 }
 
 /// Record size of a `len`-byte payload: header + payload rounded up to 8.
@@ -51,7 +85,8 @@ pub(super) fn valid_sizes(capacity: u64, max: u64) -> bool {
 #[derive(Debug)]
 pub(super) struct Meta {
     pub(super) magic: AtomicU32,
-    _reserved: AtomicU32,
+    /// `MODE_SPSC` or `MODE_MPSC` (the message lane's producers).
+    pub(super) mode: AtomicU32,
     pub(super) msg_capacity: AtomicU64,
     pub(super) max_message: AtomicU64,
     pub(super) bulk_capacity: AtomicU64,
@@ -105,6 +140,8 @@ pub(super) struct Lane {
     pub(super) cap: u64,
     /// Largest record payload.
     pub(super) max: u64,
+    /// Multi-producer protocol (see the module docs).
+    pub(super) mp: bool,
 }
 
 // SAFETY: a lane only points into shared memory accessed through atomics and
@@ -124,10 +161,23 @@ impl Lane {
         unsafe { self.head.as_ref() }
     }
 
-    /// True if a published record is waiting (or the ring is inconsistent).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn has_data(&self) -> bool {
-        self.tail_line().pos.load(Ordering::Acquire) != self.head_line().pos.load(Ordering::Acquire)
+    /// True if something was published after `head` (a record, or the
+    /// ring is inconsistent): what `peek(head)` would not answer `None` to,
+    /// give or take a multi-producer PAD record.
+    pub(super) fn has_data(&self, head: u64) -> bool {
+        if self.mp {
+            self.header(head & (self.cap - 1)).load(Ordering::Acquire) != 0
+        } else {
+            self.tail_line().pos.load(Ordering::Acquire) != head
+        }
+    }
+
+    /// The header word of the record at ring index `idx` (8-aligned).
+    fn header(&self, idx: u64) -> &AtomicU64 {
+        debug_assert!(idx % 8 == 0 && idx < self.cap);
+        // SAFETY: the ring is 64-byte aligned and `idx` is an 8-aligned index
+        // inside it; shared memory is accessed through atomics here.
+        unsafe { &*self.data.as_ptr().add(idx as usize).cast::<AtomicU64>() }
     }
 
     /// Where a `len`-byte payload can go, if there is room: `(pad, index)`.
@@ -180,8 +230,11 @@ impl Lane {
 
     /// The next record at `head`, or `None` if the lane is empty. Fails on
     /// a corrupted ring rather than reading out of bounds.
-    pub(super) fn peek(&self, mut head: u64) -> io::Result<Option<Rec>> {
-        let corrupt = || io::Error::new(io::ErrorKind::InvalidData, "corrupted channel ring");
+    pub(super) fn peek(&self, head: u64) -> io::Result<Option<Rec>> {
+        if self.mp { self.peek_mp(head) } else { self.peek_sp(head) }
+    }
+
+    fn peek_sp(&self, mut head: u64) -> io::Result<Option<Rec>> {
         let tail = self.tail_line().pos.load(Ordering::Acquire);
         loop {
             if head == tail {
@@ -209,10 +262,122 @@ impl Lane {
         }
     }
 
-    /// Frees everything before `new_head`.
-    pub(super) fn release(&self, new_head: u64) {
+    fn peek_mp(&self, mut head: u64) -> io::Result<Option<Rec>> {
+        loop {
+            if head % 8 != 0 {
+                return Err(corrupt());
+            }
+            let idx = head & (self.cap - 1);
+            let w = self.header(idx).load(Ordering::Acquire);
+            if w == 0 {
+                return Ok(None);
+            }
+            let (len, flags, kind) = unpack(w);
+            let rec = record_len(len);
+            // A committed record lies inside what producers reserved.
+            let reserved = self.tail_line().pos.load(Ordering::Acquire);
+            if flags & flag::COMMIT == 0 || rec > self.cap - idx || rec > reserved.wrapping_sub(head) {
+                return Err(corrupt());
+            }
+            if flags & flag::PAD != 0 {
+                head += rec;
+                continue;
+            }
+            if len > self.max {
+                return Err(corrupt());
+            }
+            return Ok(Some(Rec { ptr: self.payload(idx), len: len as usize, flags: flags & !flag::COMMIT, kind, next: head + rec }));
+        }
+    }
+
+    /// Frees everything from `old_head` (the previous head) to `new_head`.
+    /// A multi-producer lane is zeroed first (see the module docs).
+    pub(super) fn release(&self, old_head: u64, new_head: u64) {
+        if self.mp {
+            let mut pos = old_head;
+            while pos != new_head {
+                let idx = pos & (self.cap - 1);
+                let n = (new_head - pos).min(self.cap - idx);
+                // SAFETY: `[idx, idx + n)` is inside the ring and consumed:
+                // no producer writes it before the head moves past it below.
+                unsafe { std::ptr::write_bytes(self.data.as_ptr().add(idx as usize), 0, n as usize) };
+                pos += n;
+            }
+        }
         self.head_line().pos.store(new_head, Ordering::Release);
     }
+
+    /// Multi-producer: claims room for a `len`-byte payload. Returns the
+    /// record's position and ring index; a PAD up to the end of the ring is
+    /// already committed if the record wraps.
+    pub(super) fn mp_reserve(&self, len: u64) -> Option<(u64, u64)> {
+        debug_assert!(self.mp);
+        let need = record_len(len);
+        let line = &self.tail_line().pos;
+        loop {
+            // Head first: a tail loaded after it is never behind it.
+            let head = self.head_line().pos.load(Ordering::Acquire);
+            let tail = line.load(Ordering::Relaxed);
+            let free = self.cap.checked_sub(tail.wrapping_sub(head))?;
+            let idx = tail & (self.cap - 1);
+            let to_end = self.cap - idx;
+            let pad = if need <= to_end { 0 } else { to_end };
+            if pad + need > free {
+                return None;
+            }
+            match line.compare_exchange_weak(tail, tail + pad + need, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    if pad > 0 {
+                        // SAFETY: `[idx, cap)` was just reserved by us.
+                        unsafe { self.mp_pad(idx, pad) };
+                    }
+                    return Some((tail + pad, if pad > 0 { 0 } else { idx }));
+                }
+                Err(_) => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Multi-producer: true if `mp_reserve(len)` would find room now.
+    pub(super) fn mp_has_room(&self, len: u64) -> bool {
+        let need = record_len(len);
+        let head = self.head_line().pos.load(Ordering::Acquire);
+        let tail = self.tail_line().pos.load(Ordering::Acquire);
+        let Some(free) = self.cap.checked_sub(tail.wrapping_sub(head)) else { return false };
+        let to_end = self.cap - (tail & (self.cap - 1));
+        (if need <= to_end { need } else { to_end + need }) <= free
+    }
+
+    /// Multi-producer: commits a PAD record of `span` bytes at `idx`.
+    ///
+    /// # Safety
+    /// `[idx, idx + span)` must be reserved by the caller and not committed
+    /// yet; `span` a multiple of 8, at least 8.
+    pub(super) unsafe fn mp_pad(&self, idx: u64, span: u64) {
+        debug_assert!(span >= REC_HDR && span % 8 == 0);
+        self.header(idx).store(pack(span - REC_HDR, flag::PAD | flag::COMMIT, 0), Ordering::Release);
+    }
+
+    /// Multi-producer: publishes a `len`-byte payload at `idx`, already
+    /// written, in a reservation of `span` bytes (the rest becomes PAD).
+    ///
+    /// # Safety
+    /// `[idx, idx + span)` must be reserved by the caller and not committed
+    /// yet, with `record_len(len) <= span`.
+    pub(super) unsafe fn mp_commit(&self, idx: u64, span: u64, len: u64, flags: u32, kind: u16) {
+        let rec = record_len(len);
+        debug_assert!(rec <= span);
+        if rec < span {
+            // SAFETY: forwarded; the rest of the reservation, published first
+            // so the receiver finds it when it moves past this record.
+            unsafe { self.mp_pad(idx + rec, span - rec) };
+        }
+        self.header(idx).store(pack(len, flags | flag::COMMIT, kind), Ordering::Release);
+    }
+}
+
+fn corrupt() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "corrupted channel ring")
 }
 
 /// Sizes stored in a channel's header.
@@ -252,9 +417,14 @@ impl Layout {
     ///
     /// # Safety
     /// `base` must be 64-byte aligned, zeroed and `sizes.region_len()` long.
-    pub(super) unsafe fn init(base: NonNull<u8>, sizes: Sizes, pid: u32) {
+    pub(super) unsafe fn init(base: NonNull<u8>, sizes: Sizes, pid: u32, mode: u32) {
         // SAFETY: forwarded.
-        let meta = unsafe { &base.cast::<Header>().as_ref().meta };
+        let hdr = unsafe { base.cast::<Header>().as_ref() };
+        // The receiver starts out waiting: the first record rings its bell.
+        hdr.msg_head.waiting.store(1, Ordering::Relaxed);
+        hdr.bulk_head.waiting.store(1, Ordering::Relaxed);
+        let meta = &hdr.meta;
+        meta.mode.store(mode, Ordering::Relaxed);
         meta.msg_capacity.store(sizes.msg_capacity, Ordering::Relaxed);
         meta.max_message.store(sizes.max_message, Ordering::Relaxed);
         meta.bulk_capacity.store(sizes.bulk_capacity, Ordering::Relaxed);
@@ -285,8 +455,11 @@ impl Layout {
             return false;
         }
         // SAFETY: at least a header's worth of mapped, page-aligned memory.
-        let (magic, sizes) = unsafe { (ptr.cast::<Header>().as_ref().meta.magic.load(Ordering::Acquire), Self::sizes(ptr)) };
-        magic == MAGIC && sizes.valid() && sizes.region_len() <= len as u64
+        let (magic, mode, sizes) = unsafe {
+            let meta = &ptr.cast::<Header>().as_ref().meta;
+            (meta.magic.load(Ordering::Acquire), meta.mode.load(Ordering::Relaxed), Self::sizes(ptr))
+        };
+        magic == MAGIC && mode <= MODE_MPSC && sizes.valid() && sizes.region_len() <= len as u64
     }
 
     /// # Safety
@@ -296,22 +469,25 @@ impl Layout {
         // SAFETY: forwarded.
         let sizes = unsafe { Self::sizes(base) };
         let hdr = base.cast::<Header>();
+        // SAFETY: forwarded.
+        let mp = unsafe { hdr.as_ref().meta.mode.load(Ordering::Relaxed) } == MODE_MPSC;
         // SAFETY: forwarded; the rings follow the header in the mapping.
         unsafe {
             let h = hdr.as_ptr();
             let msg_data = base.add(DATA);
             let bulk_data = msg_data.add(sizes.msg_capacity as usize);
-            let lane = |tail: *mut Line, head: *mut Line, data, cap, max| Lane {
+            let lane = |tail: *mut Line, head: *mut Line, data, cap, max, mp| Lane {
                 tail: NonNull::new_unchecked(tail),
                 head: NonNull::new_unchecked(head),
                 data,
                 cap,
                 max,
+                mp,
             };
             Self {
                 hdr,
-                msg: lane(&raw mut (*h).msg_tail, &raw mut (*h).msg_head, msg_data, sizes.msg_capacity, sizes.max_message),
-                bulk: lane(&raw mut (*h).bulk_tail, &raw mut (*h).bulk_head, bulk_data, sizes.bulk_capacity, sizes.chunk + BULK_HDR),
+                msg: lane(&raw mut (*h).msg_tail, &raw mut (*h).msg_head, msg_data, sizes.msg_capacity, sizes.max_message, mp),
+                bulk: lane(&raw mut (*h).bulk_tail, &raw mut (*h).bulk_head, bulk_data, sizes.bulk_capacity, sizes.chunk + BULK_HDR, false),
             }
         }
     }
@@ -333,6 +509,10 @@ pub(super) mod tests {
     }
 
     pub(crate) fn heap_layout(sizes: Sizes) -> HeapLayout {
+        heap_layout_mode(sizes, MODE_SPSC)
+    }
+
+    pub(crate) fn heap_layout_mode(sizes: Sizes, mode: u32) -> HeapLayout {
         assert!(sizes.valid());
         let mut buf = vec![0u64; sizes.region_len() as usize / 8 + 8];
         let base = buf.as_mut_ptr().cast::<u8>();
@@ -341,7 +521,7 @@ pub(super) mod tests {
         let ptr = NonNull::new(unsafe { base.add(base.align_offset(64)) }).unwrap();
         // SAFETY: zeroed, aligned, large enough; then initialised.
         let layout = unsafe {
-            Layout::init(ptr, sizes, 1);
+            Layout::init(ptr, sizes, 1, mode);
             Layout::new(ptr)
         };
         HeapLayout { _buf: buf, layout }
@@ -369,9 +549,20 @@ pub(super) mod tests {
         let r = l.peek(*head).unwrap()?;
         // SAFETY: a published record of `len` bytes.
         let msg = unsafe { std::slice::from_raw_parts(r.ptr, r.len) }.to_vec();
+        l.release(*head, r.next);
         *head = r.next;
-        l.release(r.next);
         Some(msg)
+    }
+
+    /// Multi-producer put: reserve, copy, commit.
+    pub(crate) fn mp_put(l: &Lane, msg: &[u8], kind: u16) -> bool {
+        let Some((_, idx)) = l.mp_reserve(msg.len() as u64) else { return false };
+        // SAFETY: reserved `record_len(len)` bytes at `idx`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(msg.as_ptr(), l.payload(idx), msg.len());
+            l.mp_commit(idx, record_len(msg.len() as u64), msg.len() as u64, 0, kind);
+        }
+        true
     }
 
     #[test]
@@ -397,10 +588,10 @@ pub(super) mod tests {
         let (mut mt, mut mh, mut bt, mut bh) = (0, 0, 0, 0);
         assert!(put(&msg, &mut mt, b"msg"));
         assert!(put(&bulk, &mut bt, b"bulk"));
-        assert!(msg.has_data() && bulk.has_data());
+        assert!(msg.has_data(mh) && bulk.has_data(bh));
         assert_eq!(take(&bulk, &mut bh).unwrap(), b"bulk");
         assert_eq!(take(&msg, &mut mh).unwrap(), b"msg");
-        assert!(!msg.has_data() && !bulk.has_data());
+        assert!(!msg.has_data(mh) && !bulk.has_data(bh));
     }
 
     #[test]
@@ -455,8 +646,8 @@ pub(super) mod tests {
             tail = unsafe { l.publish(tail, pad, idx, len, flags, kind) };
             let r = l.peek(head).unwrap().expect("published");
             assert_eq!((r.len as u64, r.flags, r.kind), (len, flags, kind));
+            l.release(head, r.next);
             head = r.next;
-            l.release(head);
         }
         assert_eq!(head, tail);
     }
@@ -500,6 +691,166 @@ pub(super) mod tests {
             assert!(msg.iter().all(|&b| b == i as u8));
         }
         writer.join().unwrap();
+        drop(h);
+    }
+
+    // -- multi-producer lane -------------------------------------------------
+
+    fn mp_layout(msg: u64, max: u64) -> HeapLayout {
+        heap_layout_mode(sizes(msg, max), MODE_MPSC)
+    }
+
+    #[test]
+    fn layout_starts_with_the_receiver_waiting() {
+        let h = heap_layout(sizes(256, 64));
+        assert_eq!(h.layout.msg.head_line().waiting.load(Ordering::Relaxed), 1);
+        assert_eq!(h.layout.bulk.head_line().waiting.load(Ordering::Relaxed), 1);
+        assert_eq!(h.layout.msg.tail_line().waiting.load(Ordering::Relaxed), 0);
+        assert!(!h.layout.msg.mp && !h.layout.bulk.mp);
+        let m = mp_layout(256, 64);
+        assert!(m.layout.msg.mp && !m.layout.bulk.mp);
+    }
+
+    #[test]
+    fn mp_fifo_with_wraparound_zeroes_what_it_consumes() {
+        let h = mp_layout(256, 64);
+        let l = &h.layout.msg;
+        let mut head = 0u64;
+        let mut expect = std::collections::VecDeque::new();
+        for i in 0..2000u32 {
+            let len = (i * 7 % 65) as usize;
+            let msg: Vec<u8> = (0..len).map(|b| (b as u32 ^ i) as u8 | 1).collect();
+            while !mp_put(l, &msg, i as u16) {
+                assert!(l.has_data(head));
+                assert_eq!(take(l, &mut head).as_ref(), expect.front());
+                expect.pop_front();
+            }
+            expect.push_back(msg);
+        }
+        while let Some(m) = take(l, &mut head) {
+            assert_eq!(Some(&m), expect.front());
+            expect.pop_front();
+        }
+        assert!(expect.is_empty() && !l.has_data(head));
+        assert_eq!(head, l.tail_line().pos.load(Ordering::Relaxed));
+        // Everything consumed was zeroed: no stale byte can pass for a header.
+        // SAFETY: the whole ring of our heap layout.
+        let ring = unsafe { std::slice::from_raw_parts(l.data.as_ptr(), l.cap as usize) };
+        assert!(ring.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn mp_uncommitted_record_blocks_later_ones_until_committed() {
+        let h = mp_layout(256, 64);
+        let l = &h.layout.msg;
+        let (_, a) = l.mp_reserve(5).unwrap();
+        assert!(mp_put(l, b"second", 2));
+        assert!(!l.has_data(0) && l.peek(0).unwrap().is_none());
+        // SAFETY: `a` holds a reservation of record_len(5) bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"first".as_ptr(), l.payload(a), 5);
+            l.mp_commit(a, record_len(5), 5, 0, 1);
+        }
+        let mut head = 0;
+        assert_eq!(take(l, &mut head).unwrap(), b"first");
+        assert_eq!(take(l, &mut head).unwrap(), b"second");
+        assert!(take(l, &mut head).is_none());
+    }
+
+    #[test]
+    fn mp_shrunk_and_abandoned_reservations_become_padding() {
+        let h = mp_layout(256, 64);
+        let l = &h.layout.msg;
+        let (_, a) = l.mp_reserve(40).unwrap();
+        let (_, b) = l.mp_reserve(16).unwrap();
+        assert!(mp_put(l, b"after", 3));
+        // SAFETY: our reservations; `a` shrinks 40 -> 3 bytes, `b` is dropped.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"abc".as_ptr(), l.payload(a), 3);
+            l.mp_commit(a, record_len(40), 3, 0, 1);
+            l.mp_pad(b, record_len(16));
+        }
+        let mut head = 0;
+        let r = l.peek(head).unwrap().unwrap();
+        assert_eq!((r.len, r.kind, r.flags), (3, 1, 0));
+        assert_eq!(take(l, &mut head).unwrap(), b"abc");
+        assert_eq!(take(l, &mut head).unwrap(), b"after");
+        assert!(take(l, &mut head).is_none());
+        assert_eq!(head, l.tail_line().pos.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mp_full_ring_refuses_and_room_check_agrees() {
+        let h = mp_layout(64, 24);
+        let l = &h.layout.msg;
+        assert!(l.mp_has_room(24) && mp_put(l, &[1; 24], 0));
+        assert!(l.mp_has_room(24) && mp_put(l, &[2; 24], 0));
+        assert!(!l.mp_has_room(0) && !mp_put(l, &[], 0));
+        let mut head = 0;
+        assert_eq!(take(l, &mut head).unwrap(), vec![1; 24]);
+        assert!(l.mp_has_room(8) && mp_put(l, &[3; 8], 0));
+        assert_eq!(take(l, &mut head).unwrap(), vec![2; 24]);
+        assert_eq!(take(l, &mut head).unwrap(), vec![3; 8]);
+    }
+
+    #[test]
+    fn mp_corrupted_headers_are_rejected() {
+        let h = mp_layout(256, 64);
+        let l = &h.layout.msg;
+        assert!(mp_put(l, b"hi", 0));
+        // A header without COMMIT, then one past the reservation.
+        l.header(0).store(pack(2, 0, 0), Ordering::Relaxed);
+        assert_eq!(l.peek(0).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        l.header(0).store(pack(64, flag::COMMIT, 0), Ordering::Relaxed);
+        assert_eq!(l.peek(0).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Several producer threads, one consumer: every message arrives once,
+    /// and each producer's messages arrive in its own order.
+    #[test]
+    fn mp_threads() {
+        let h = mp_layout(1024, 200);
+        let l = h.layout.msg;
+        let producers: u32 = 4;
+        let n: u32 = if cfg!(miri) { 60 } else { 50_000 };
+        let size = |p: u32, i: u32| ((p * 31 + i).wrapping_mul(2654435761) % 193) as usize + 8;
+        let threads: Vec<_> = (0..producers)
+            .map(|p| {
+                std::thread::spawn(move || {
+                    for i in 0..n {
+                        let mut msg = vec![p as u8; size(p, i)];
+                        msg[..4].copy_from_slice(&i.to_le_bytes());
+                        while !mp_put(&l, &msg, p as u16) {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut next = vec![0u32; producers as usize];
+        let mut head = 0;
+        for _ in 0..producers * n {
+            let (kind, msg) = loop {
+                if let Some(r) = l.peek(head).unwrap() {
+                    // SAFETY: a published record of `len` bytes.
+                    let msg = unsafe { std::slice::from_raw_parts(r.ptr, r.len) }.to_vec();
+                    l.release(head, r.next);
+                    head = r.next;
+                    break (r.kind, msg);
+                }
+                std::thread::yield_now();
+            };
+            let p = u32::from(kind);
+            let i = u32::from_le_bytes(msg[..4].try_into().unwrap());
+            assert_eq!(i, next[p as usize], "producer {p} out of order");
+            assert_eq!(msg.len(), size(p, i));
+            assert!(msg[4..].iter().all(|&b| b == p as u8));
+            next[p as usize] += 1;
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(next.iter().all(|&c| c == n));
         drop(h);
     }
 }

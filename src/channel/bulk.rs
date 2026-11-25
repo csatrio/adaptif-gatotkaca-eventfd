@@ -186,7 +186,7 @@ impl GkSender {
                 return Ok(true);
             }
             let tail = self.bulk_tail;
-            match self.end.wait(BULK, nonblocking, || lane.reserve(tail, len).is_some()) {
+            match self.end.wait(BULK, nonblocking, || lane.reserve(tail, len).is_some(), || false) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) => return Err(e),
@@ -382,14 +382,15 @@ impl GkReceiver {
                 return Ok(rec);
             }
             let (lane, head, nb) = (*self.end.lane(BULK), self.bulk_head, self.end.nonblocking);
-            self.end.wait(BULK, nb, || !matches!(lane.peek(head), Ok(None)))?;
+            let (msg, msg_head) = (*self.end.lane(super::MSG), self.msg_head);
+            self.end.wait(BULK, nb, || !matches!(lane.peek(head), Ok(None)), || msg.has_data(msg_head))?;
         }
     }
 
     /// Frees the bulk record just consumed.
     fn bulk_release(&mut self, next: u64) {
+        self.end.lane(BULK).release(self.bulk_head, next);
         self.bulk_head = next;
-        self.end.lane(BULK).release(next);
         self.end.wake_peer(BULK);
     }
 

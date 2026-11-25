@@ -80,9 +80,11 @@
 
 mod bulk;
 mod lane;
+mod mpsc;
 mod share;
 
 pub use bulk::{BulkReader, BulkWriter};
+pub use mpsc::{GkMpSender, MpBulk, MpSendSlot};
 
 use std::io;
 use std::sync::Arc;
@@ -165,7 +167,7 @@ struct Ring {
 }
 
 impl Ring {
-    fn create(opts: ChannelOptions) -> io::Result<Self> {
+    fn create(opts: ChannelOptions, mode: u32) -> io::Result<Self> {
         let sizes = opts.sizes();
         if !sizes.valid() {
             return Err(io::Error::new(
@@ -177,7 +179,7 @@ impl Ring {
         let len = usize::try_from(sizes.region_len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "channel too large"))?;
         let region = SharedRegion::create_with(len, &RegionOptions { huge: opts.huge_pages, ..Default::default() })?;
         // SAFETY: fresh, zeroed, page-aligned and `region_len` long.
-        unsafe { Layout::init(region.ptr(), sizes, current_pid()) };
+        unsafe { Layout::init(region.ptr(), sizes, current_pid(), mode) };
         Ok(Self::with_region(region))
     }
 
@@ -223,6 +225,11 @@ impl End {
         Self { ring, data_ready, space_ready, side, nonblocking: false, detached: false, armed: [false; 2] }
     }
 
+    /// True for a channel whose message lane takes several producers.
+    fn is_mpsc(&self) -> bool {
+        self.ring.layout.msg.mp
+    }
+
     fn lane(&self, lane: usize) -> &Lane {
         self.ring.lane(lane)
     }
@@ -259,6 +266,11 @@ impl End {
         }
         let pid = self.peer_owner().load(Ordering::Relaxed);
         pid != 0 && !process_alive(pid)
+    }
+
+    /// The process that owns the other end (`None` while it is in transit).
+    fn peer_pid(&self) -> Option<u32> {
+        Some(self.peer_owner().load(Ordering::Relaxed)).filter(|&pid| pid != 0)
     }
 
     fn check_owner(&self) -> io::Result<()> {
@@ -314,7 +326,12 @@ impl End {
     /// Called when `lane` has nothing for us (`ready()` false): announces
     /// that we wait, then returns `WouldBlock` (`nonblocking`) or sleeps
     /// until the doorbell rings. `Ok(())` means "look again".
-    fn wait(&mut self, lane: usize, nonblocking: bool, ready: impl Fn() -> bool) -> io::Result<()> {
+    ///
+    /// `other_ready()` tells whether the other lane has something for us. Before a
+    /// non-blocking call returns `WouldBlock` it rings our own bell again if
+    /// so: the descriptor stays readable while any lane has data, so a
+    /// level-triggered poller never misses data left in the other lane.
+    fn wait(&mut self, lane: usize, nonblocking: bool, ready: impl Fn() -> bool, other_ready: impl Fn() -> bool) -> io::Result<()> {
         // Blocking: spin briefly first, so a quick reply costs no system
         // call on either side (we never announce that we sleep).
         if !nonblocking {
@@ -349,6 +366,9 @@ impl End {
         }
         if nonblocking {
             self.armed[lane] = true;
+            if other_ready() {
+                let _ = self.bell().write(1);
+            }
             return Err(crate::error::would_block());
         }
         loop {
@@ -430,12 +450,32 @@ impl GkChannel {
     /// least 64 bytes, `max_message > capacity / 2 - 8`, or
     /// `chunk > bulk_capacity / 2 - 32`.
     pub fn with_options(opts: ChannelOptions) -> io::Result<(GkSender, GkReceiver)> {
-        let ring = Arc::new(Ring::create(opts)?);
+        let (sender, receiver) = Self::ends(opts, lane::MODE_SPSC)?;
+        Ok((GkSender::from_end(sender), GkReceiver::from_end(receiver)))
+    }
+
+    /// A channel whose sender can be cloned and used by many threads of one
+    /// process at once ([`GkMpSender`]), with the default sizes.
+    pub fn new_mpsc() -> io::Result<(GkMpSender, GkReceiver)> {
+        Self::mpsc_with_options(ChannelOptions::default())
+    }
+
+    /// Like [`new_mpsc`](Self::new_mpsc), with the given sizes (see
+    /// [`with_options`](Self::with_options)).
+    pub fn mpsc_with_options(opts: ChannelOptions) -> io::Result<(GkMpSender, GkReceiver)> {
+        let (sender, receiver) = Self::ends(opts, lane::MODE_MPSC)?;
+        Ok((GkMpSender::from_sender(GkSender::from_end(sender))?, GkReceiver::from_end(receiver)))
+    }
+
+    fn ends(opts: ChannelOptions, mode: u32) -> io::Result<(End, End)> {
+        let ring = Arc::new(Ring::create(opts, mode)?);
         let bell = || GkEventFd::new(0, EfdFlags::NONBLOCK | EfdFlags::CLOEXEC);
         let (data_ready, space_ready) = (bell()?, bell()?);
         let sender = End::new(Arc::clone(&ring), data_ready.try_clone()?, space_ready.try_clone()?, Side::Sender);
-        let receiver = End::new(ring, data_ready, space_ready, Side::Receiver);
-        Ok((GkSender::from_end(sender), GkReceiver::from_end(receiver)))
+        let mut receiver = End::new(ring, data_ready, space_ready, Side::Receiver);
+        // The layout starts with the receiver waiting on both lanes.
+        receiver.armed = [true; 2];
+        Ok((sender, receiver))
     }
 }
 
@@ -506,6 +546,8 @@ impl GkSender {
 
     /// Like [`reserve`](Self::reserve), for a message of the given `kind`.
     pub fn reserve_kind(&mut self, kind: u16, len: usize) -> io::Result<SendSlot<'_>> {
+        // A multi-producer channel's lane is only written by `GkMpSender`.
+        debug_assert!(!self.end.is_mpsc());
         self.end.check_owner()?;
         if len as u64 > self.end.lane(MSG).max {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "message larger than max_message (use send_bulk)"));
@@ -518,7 +560,7 @@ impl GkSender {
                 return Ok(SendSlot { sender: self, pad, idx, len, kind });
             }
             let (lane, tail, nb) = (*self.end.lane(MSG), self.msg_tail, self.end.nonblocking);
-            self.end.wait(MSG, nb, || lane.reserve(tail, len as u64).is_some())?;
+            self.end.wait(MSG, nb, || lane.reserve(tail, len as u64).is_some(), || false)?;
         }
     }
 
@@ -564,6 +606,19 @@ impl GkSender {
     pub fn detach(mut self) {
         self.end.detached = true;
         self.bulk = bulk::TxState::default();
+    }
+
+    /// True once the receiver is gone: it was dropped, or the process that
+    /// owns it has exited. Non-blocking callers (event loops) use this to
+    /// notice a dead peer; blocking calls notice it by themselves.
+    pub fn peer_gone(&self) -> bool {
+        self.end.peer_gone()
+    }
+
+    /// The process that owns the receiver (`None` while it is being handed
+    /// to another process).
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.end.peer_pid()
     }
 }
 
@@ -612,15 +667,70 @@ impl GkReceiver {
                 return Ok(rec);
             }
             let (lane, head, nb) = (*self.end.lane(MSG), self.msg_head, self.end.nonblocking);
-            self.end.wait(MSG, nb, || !matches!(lane.peek(head), Ok(None)))?;
+            let (bulk, bulk_head) = (*self.end.lane(BULK), self.bulk_head);
+            self.end.wait(MSG, nb, || !matches!(lane.peek(head), Ok(None)), || bulk.has_data(bulk_head))?;
         }
     }
 
     /// Frees the space of the message just read.
     fn consume(&mut self, next: u64) {
+        self.end.lane(MSG).release(self.msg_head, next);
         self.msg_head = next;
-        self.end.lane(MSG).release(next);
         self.end.wake_peer(MSG);
+    }
+
+    /// Receives up to `max` messages, lending each one in place to
+    /// `f(kind, msg)`, and returns how many it received. Waits (or fails with
+    /// [`io::ErrorKind::WouldBlock`] in non-blocking mode) only for the first
+    /// one; then it takes what is already queued, up to `max`, without
+    /// waiting. The space of the whole batch is freed at once and the sender
+    /// woken at most once, which makes this cheaper per message than
+    /// [`recv_with_kind`](Self::recv_with_kind) for an event loop that
+    /// drains with a budget.
+    ///
+    /// Stopping at `max` leaves the rest queued and the receiver readable
+    /// (see "Polling" in the [module docs](self)). If `f` panics, the
+    /// messages it already returned from count as received; the one it
+    /// panicked on stays queued. Fails with
+    /// [`io::ErrorKind::BrokenPipe`] once the sender is gone and every message
+    /// was received; a corrupted ring after the first message ends the batch
+    /// and is reported by the next call.
+    pub fn recv_batch(&mut self, max: usize, mut f: impl FnMut(u16, &[u8])) -> io::Result<usize> {
+        /// Frees what was consumed, also when `f` panics.
+        struct Batch<'a> {
+            rx: &'a mut GkReceiver,
+            head: u64,
+        }
+        impl Drop for Batch<'_> {
+            fn drop(&mut self) {
+                if self.head != self.rx.msg_head {
+                    self.rx.consume(self.head);
+                }
+            }
+        }
+        if max == 0 {
+            return Ok(0);
+        }
+        let mut rec = self.next()?;
+        let lane = *self.end.lane(MSG);
+        let mut batch = Batch { head: self.msg_head, rx: self };
+        let mut n = 0;
+        loop {
+            // SAFETY: a published record of `len` bytes, not reused before
+            // the batch frees it.
+            f(rec.kind, unsafe { std::slice::from_raw_parts(rec.ptr, rec.len) });
+            batch.head = rec.next;
+            n += 1;
+            if n == max {
+                break;
+            }
+            match lane.peek(batch.head) {
+                Ok(Some(r)) => rec = r,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        drop(batch);
+        Ok(n)
     }
 
     /// Receives one message into `buf` and returns its length (0 for a
@@ -740,6 +850,19 @@ impl GkReceiver {
     /// copy a process keeps after `fork` but doesn't use).
     pub fn detach(mut self) {
         self.end.detached = true;
+    }
+
+    /// True once the sender is gone: it was dropped, or the process that
+    /// owns it has exited. Non-blocking callers (event loops) use this to
+    /// notice a dead peer; blocking calls notice it by themselves.
+    pub fn peer_gone(&self) -> bool {
+        self.end.peer_gone()
+    }
+
+    /// The process that owns the sender (`None` while it is being handed
+    /// to another process).
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.end.peer_pid()
     }
 }
 

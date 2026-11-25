@@ -551,6 +551,82 @@ gk_sender *gk_process_recv_sender(gk_process *process);
 gk_receiver *gk_process_recv_receiver(gk_process *process);
 
 /*
+ * Readiness: a receiver is readable (poll/kqueue/WSAPoll on its descriptor)
+ * while a lane may hold data it has not seen; only a call that fails with
+ * EAGAIN clears that. A fresh channel starts that way, so a receiver
+ * registered before its first receive still wakes. Stopping before EAGAIN
+ * (e.g. an event loop's budget) leaves it readable.
+ *
+ * 1 once the other end was closed or its owning process has exited, else 0
+ * (for non-blocking users; blocking calls notice it by themselves).
+ */
+int gk_sender_peer_gone(gk_sender *tx);
+int gk_receiver_peer_gone(gk_receiver *rx);
+
+/*
+ * Receives up to max messages without copying: calls f(ctx, kind, msg, len)
+ * for each (msg is valid only during the call; f must not unwind). Waits
+ * (or fails with EAGAIN) only for the first; frees the space of the whole
+ * batch at once. Returns the number received, or -1 with errno.
+ */
+typedef void (*gk_recv_fn)(void *ctx, uint16_t kind, const void *msg,
+                           size_t len);
+intptr_t gk_receiver_recv_batch(gk_receiver *rx, size_t max, gk_recv_fn f,
+                                void *ctx);
+
+/*
+ * Multi-producer channels: the sender can be cloned and used by many
+ * threads of one process at once (thread-safe, const handle). Messages are
+ * lock-free; each thread's messages arrive in its own order. Bulk sends are
+ * serialised (one transfer at a time). The receiver is a plain gk_receiver.
+ * The channel closes when the last clone is freed. Errors as for gk_sender.
+ */
+typedef struct gk_mp_sender gk_mp_sender;
+
+int gk_channel_new_mpsc(const gk_channel_options *opts, gk_mp_sender **tx,
+                        gk_receiver **rx);
+
+/* Another handle on the same sender (free each one). */
+gk_mp_sender *gk_mp_sender_clone(const gk_mp_sender *tx);
+
+/* Blocks while the ring is full (unless non-blocking). */
+int gk_mp_sender_send(const gk_mp_sender *tx, const void *buf, size_t len);
+int gk_mp_sender_send_kind(const gk_mp_sender *tx, uint16_t kind,
+                           const void *buf, size_t len);
+
+/* Never blocks: EAGAIN when full; the descriptor then becomes readable when
+ * space may have been freed. */
+int gk_mp_sender_try_send_kind(const gk_mp_sender *tx, uint16_t kind,
+                               const void *buf, size_t len);
+
+/* One bulk transfer (blocks until it is all in the ring). */
+int gk_mp_sender_send_bulk_kind(const gk_mp_sender *tx, uint16_t kind,
+                                const void *buf, size_t len, uint64_t *id);
+
+/* For every clone. Returns 0. */
+int gk_mp_sender_set_nonblocking(const gk_mp_sender *tx, int nonblocking);
+int gk_mp_sender_claim(const gk_mp_sender *tx);
+int gk_mp_sender_peer_gone(const gk_mp_sender *tx);
+
+#ifdef _WIN32
+uintptr_t gk_mp_sender_socket(const gk_mp_sender *tx);
+#else
+int gk_mp_sender_fd(const gk_mp_sender *tx);
+#endif
+
+/* Frees this handle (the last one closes the channel). NULL is ignored. */
+void gk_mp_sender_free(gk_mp_sender *tx);
+
+/* Frees this handle; no handle of this process will close the channel
+ * (after fork, in the process that doesn't send). */
+void gk_mp_sender_detach(gk_mp_sender *tx);
+
+/* Hand the sender to another process (EINVAL there if it expected a plain
+ * gk_sender: the end is then closed). */
+int gk_process_send_mp_sender(gk_process *process, const gk_mp_sender *tx);
+gk_mp_sender *gk_process_recv_mp_sender(gk_process *process);
+
+/*
  * Shared memory: zero-filled memory that can be handed to other processes
  * (the C form of the Rust GkSharedMemory). The length is rounded up to the
  * page size. Sharing gives the other process a view of the same memory;
@@ -616,6 +692,73 @@ void gk_shm_free(gk_shm *shm);
  */
 int gk_process_send_shm(gk_process *process, const gk_shm *shm);
 gk_shm *gk_process_recv_shm(gk_process *process);
+
+/*
+ * Shared memory pools: zero-copy buffers lent to another process. Only the
+ * creating process allocates (from any thread); a view in another process
+ * (or this one) takes leases, reads the data in place, and gives the block
+ * back by freeing the gk_shm_buf (lock-free, any thread). The allocator
+ * collects returns on its next allocation, and refuses stale or duplicate
+ * ones (counted in bad_returns). Send the 16-byte gk_shm_lease to the
+ * borrower in a channel message.
+ *
+ * Errors: NULL (or -1) with errno ENOMEM (no free block large enough now),
+ * EINVAL (bad options, NULL handle, a request larger than the largest
+ * block, a lease outside the pool, len > capacity).
+ */
+typedef struct gk_shm_pool gk_shm_pool;
+typedef struct gk_shm_pool_view gk_shm_pool_view;
+typedef struct gk_shm_block gk_shm_block;
+typedef struct gk_shm_buf gk_shm_buf;
+
+typedef struct gk_shm_pool_options {
+    size_t size;    /* usable bytes (default 64 MiB; 16 MiB on Windows) */
+    size_t granule; /* allocation unit: power of two, 64 B .. 1 GiB (4 KiB) */
+    int huge_pages; /* GK_HUGE_PAGES_* */
+} gk_shm_pool_options;
+
+typedef struct gk_shm_lease {
+    uint32_t index;      /* first granule of the block */
+    uint32_t generation; /* the block's generation when lent */
+    uint64_t len;        /* bytes of data */
+} gk_shm_lease;
+
+typedef struct gk_shm_pool_stats {
+    size_t size, granule, free; /* bytes */
+    size_t allocated, lent;     /* blocks */
+    uint64_t bad_returns;
+} gk_shm_pool_stats;
+
+void gk_shm_pool_options_default(gk_shm_pool_options *opts);
+gk_shm_pool *gk_shm_pool_new(const gk_shm_pool_options *opts);
+int gk_shm_pool_get_stats(const gk_shm_pool *pool, gk_shm_pool_stats *stats);
+/* Takes back every lent block (only once no borrower uses them, e.g. the
+ * borrowing process died). */
+int gk_shm_pool_reclaim_all(const gk_shm_pool *pool);
+void gk_shm_pool_free(gk_shm_pool *pool);
+
+/* A block of at least len bytes (a power of two number of granules). */
+gk_shm_block *gk_shm_pool_alloc(const gk_shm_pool *pool, size_t len);
+void *gk_shm_block_ptr(gk_shm_block *block);
+size_t gk_shm_block_capacity(const gk_shm_block *block);
+/* Lends len bytes of the block: fills *lease and frees the handle. */
+int gk_shm_block_lend(gk_shm_block *block, size_t len, gk_shm_lease *lease);
+/* Frees a block that was not lent. */
+void gk_shm_block_free(gk_shm_block *block);
+
+gk_shm_pool_view *gk_shm_pool_new_view(const gk_shm_pool *pool);
+/* Takes a lease (once): the data stays valid until gk_shm_buf_free. */
+gk_shm_buf *gk_shm_pool_view_take(const gk_shm_pool_view *view,
+                                  const gk_shm_lease *lease);
+void gk_shm_pool_view_free(gk_shm_pool_view *view);
+const void *gk_shm_buf_ptr(const gk_shm_buf *buf);
+size_t gk_shm_buf_len(const gk_shm_buf *buf);
+/* Gives the block back to the allocator. */
+void gk_shm_buf_free(gk_shm_buf *buf);
+
+int gk_process_send_shm_pool_view(gk_process *process,
+                                  const gk_shm_pool_view *view);
+gk_shm_pool_view *gk_process_recv_shm_pool_view(gk_process *process);
 
 #if !GK_EVENTFD_NATIVE && !defined(GK_EVENTFD_NO_COMPAT_NAMES)
 

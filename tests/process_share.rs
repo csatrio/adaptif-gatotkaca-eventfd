@@ -20,7 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adaptif_gatotkaca_eventfd::{
-    ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkProcess, GkReceiver, GkSender, GkSharedMemory,
+    ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkMpSender, GkProcess, GkReceiver, GkSender, GkSharedMemory, GkShmPool,
+    GkShmPoolView, ShmLease,
 };
 
 /// How the child gets the eventfd.
@@ -413,9 +414,53 @@ fn channel_child(role: &str) {
             assert_eq!(rx.recv_kind(&mut buf).unwrap(), (0xfffe, 8));
             assert_eq!(u64::from_le_bytes(buf), id);
         }
+        // Receive a multi-producer sender and write from several threads.
+        "channel_mpsc_send" => {
+            let tx: GkMpSender = parent.recv_as().expect("recv_as::<GkMpSender>");
+            let threads: Vec<_> = (0..MPSC_THREADS)
+                .map(|t| {
+                    let tx = tx.clone();
+                    thread::spawn(move || {
+                        for i in 0..MESSAGES {
+                            tx.send_kind(t, &message(i)).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+        }
+        // Borrow pool blocks named by leases on the channel; check, drop.
+        "channel_pool_borrow" => {
+            let view: GkShmPoolView = parent.recv_as().expect("recv_as::<GkShmPoolView>");
+            let mut rx: GkReceiver = parent.recv_as().expect("recv_as::<GkReceiver>");
+            let mut i = 0u32;
+            loop {
+                let mut b = [0u8; 16];
+                match rx.recv(&mut b) {
+                    Ok(16) => {}
+                    Ok(n) => panic!("lease of {n} bytes"),
+                    Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
+                    Err(e) => panic!("{e}"),
+                }
+                // SAFETY: each lease is sent once, by the pool's owner.
+                let buf = unsafe { view.take(ShmLease::from_bytes(&b)) }.unwrap();
+                assert_eq!(&buf[..], &message(i)[..], "block {i}");
+                i += 1;
+            }
+            assert_eq!(i, MESSAGES);
+        }
+        // Expect a plain sender but get a multi-producer one: refused.
+        "channel_mpsc_wrong_kind" => {
+            let r = parent.recv_as::<GkSender>();
+            assert_eq!(r.unwrap_err().kind(), ErrorKind::InvalidData);
+        }
         other => panic!("unknown role {other}"),
     }
 }
+
+const MPSC_THREADS: u16 = 4;
 
 const BULK_LEN: usize = 12 << 20;
 
@@ -549,4 +594,61 @@ fn shared_memory_with_child() {
     let mem = unsafe { shm.as_slice() };
     assert!((half..SHM_LEN).all(|i| mem[i] == !shm_byte(i)), "reply differs");
     assert!((0..half).all(|i| mem[i] == shm_byte(i)));
+}
+
+#[test]
+fn channel_mpsc_child_threads_send_parent_receives() {
+    let (tx, mut rx) = GkChannel::mpsc_with_options(ChannelOptions { capacity: 1 << 16, max_message: 4000, ..Default::default() }).unwrap();
+    let (child, mut peer) = spawn_channel_child("channel_mpsc_send");
+    peer.send(&tx).unwrap();
+    assert_eq!(tx.try_send(b"x").unwrap_err().kind(), ErrorKind::PermissionDenied);
+    drop(tx);
+    let mut next = vec![0u32; MPSC_THREADS as usize];
+    let mut buf = Vec::new();
+    for _ in 0..u32::from(MPSC_THREADS) * MESSAGES {
+        let (t, _) = rx.recv_vec_kind(&mut buf).unwrap();
+        let i = next[t as usize];
+        assert_eq!(buf, message(i), "thread {t} message {i}");
+        next[t as usize] += 1;
+    }
+    assert_eq!(rx.recv_vec(&mut buf).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    join(Spawned(child, Some(peer)));
+}
+
+#[test]
+fn channel_mpsc_sender_received_as_plain_sender_is_refused() {
+    let (tx, mut rx) = GkChannel::new_mpsc().unwrap();
+    let (child, mut peer) = spawn_channel_child("channel_mpsc_wrong_kind");
+    peer.send(&tx).unwrap();
+    drop(tx);
+    // The child closed the end it could not use: no hang here.
+    assert_eq!(rx.recv(&mut [0u8; 8]).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    join(Spawned(child, Some(peer)));
+}
+
+#[test]
+fn pool_blocks_lent_to_a_child_come_back() {
+    let pool = GkShmPool::new(1 << 20).unwrap();
+    let (tx, rx) = GkChannel::new_mpsc().unwrap();
+    let (child, mut peer) = spawn_channel_child("channel_pool_borrow");
+    peer.send(&pool.view()).unwrap();
+    peer.send(&rx).unwrap();
+    drop(rx);
+    for i in 0..MESSAGES {
+        let data = message(i);
+        let mut block = loop {
+            match pool.alloc(data.len()) {
+                Ok(b) => break b,
+                // The child gives blocks back as it reads them.
+                Err(e) if e.kind() == ErrorKind::OutOfMemory => thread::yield_now(),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        block.as_mut_slice()[..data.len()].copy_from_slice(&data);
+        tx.send(&block.lend(data.len()).to_bytes()).unwrap();
+    }
+    drop(tx);
+    join(Spawned(child, Some(peer)));
+    let s = pool.stats();
+    assert_eq!((s.lent, s.bad_returns, s.free), (0, 0, 1 << 20), "every block came back from the child");
 }
