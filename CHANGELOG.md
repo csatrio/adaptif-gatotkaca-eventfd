@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-26
+
+### Added
+
+- `GkProcess::send_bytes` / `GkProcess::recv_bytes`: small framed byte
+  messages (0 to `process::BYTES_MAX` = 64 KiB; more is `InvalidInput`) on
+  the same connection as objects, in order, for handshakes and bootstraps.
+  Receiving the wrong kind (bytes where an object is expected, or the
+  reverse) is `InvalidData` and consumes the message, so the connection
+  stays in sync.
+- `GkProcess::peer_pid()` on every OS: `SO_PEERCRED` (Linux, Android,
+  OpenBSD), `LOCAL_PEERPID` (macOS, iOS), `LOCAL_PEERCRED` (FreeBSD 13+),
+  `LOCAL_PEEREID` (NetBSD), `getpeerucred` (illumos), the named pipe's
+  client/server pid (Windows); `None` where unknown (DragonFly, or not
+  connected yet). Read when the connection is made.
+- Unix: `AsFd` and `AsRawFd` for `GkProcess`, so the connection can be
+  polled: readable on a message, and at EOF once the peer exits (a
+  lifeline).
+- C: `gk_process_send_bytes`, `gk_process_recv_bytes` (`EMSGSIZE` keeps a
+  message that doesn't fit), `GK_PROCESS_BYTES_MAX`, `gk_process_peer_pid`,
+  `gk_process_fd` (unix). `examples/c/process.c` shows them.
+
+### Changed
+
+- Windows: `GkProcess::pid()` is now the same as `peer_pid()` (kept for
+  compatibility).
+
 ## [0.3.0] - 2026-11-26
 
 ### Added
@@ -198,7 +225,8 @@ First release.
 - `force-shim` feature: use the unix shim on native platforms, for testing
   the shim against the kernel eventfd.
 
-[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/releases/tag/v0.1.0
