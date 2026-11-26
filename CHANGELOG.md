@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-26
+
+### Added
+
+- `GkListener::bind_with(name, ListenerAccess)` and the `ListenerAccess`
+  enum (`Default`, `CurrentUser`; non-exhaustive). `CurrentUser` on
+  Windows creates every named-pipe instance (the first and each later one)
+  with the protected DACL `D:P(A;;FA;;;<user SID>)`, so only the current
+  user can connect, with no window of default security; on unix it makes
+  the socket file `0600` and `accept` closes connections whose peer's
+  effective uid differs. `GkListener::bind` is unchanged
+  (`ListenerAccess::Default`).
+- C: `gk_listener_bind_ex(name, access)` with `GK_LISTENER_ACCESS_DEFAULT`
+  and `GK_LISTENER_ACCESS_CURRENT_USER` (other values `EINVAL`).
+  `examples/c/process.c` uses it.
+
+### Fixed
+
+- A process that has exited but not been reaped by its parent (a zombie)
+  now counts as dead wherever the crate checks another process's liveness:
+  `peer_gone()` on channel ends, blocking channel calls noticing a dead
+  peer, and the shims' takeover of a cross-process lock whose holder died.
+  Before, `kill(pid, 0)` kept a zombie alive, so a lock held by a killed,
+  unreaped process (e.g. a sibling whose parent had not called `wait` yet)
+  made the other processes spin until it was reaped. Detected cheaply and
+  without allocating: Linux/Android `/proc/<pid>/stat` (state `Z` with one
+  thread, or `X`), macOS/iOS `proc_pidinfo` (which no longer finds an
+  exited process), FreeBSD `kinfo_proc.ki_stat == SZOMB`, NetBSD
+  `kinfo_proc2.p_stat == SZOMB`. Own children were already handled
+  (`waitid(WNOWAIT)`); OpenBSD, DragonFly and illumos are unchanged (a
+  zombie counts as alive until reaped); Windows was already right.
+
 ## [0.3.1] - 2026-11-26
 
 ### Added
