@@ -9,7 +9,8 @@
  * Then they exchange byte messages on the same connection (a handshake:
  * "hello" / "welcome"), check each other's process id, and on unix the
  * parent watches the connection's descriptor turn readable (EOF) once the
- * child has exited: the connection doubles as a lifeline.
+ * child has exited: the connection doubles as a lifeline. gk_process_alive
+ * (since 0.3.3) sees the child exited before the parent reaps it.
  *
  * Finally a listener only this user may connect to (gk_listener_bind_ex,
  * since 0.3.2): connect to it and accept, on one thread.
@@ -127,9 +128,16 @@ int main(int argc, char **argv) {
     CHECK(gk_process_peer_pid(kid) > 0);
 #endif
 
+    /* gk_process_alive (since 0.3.3): this process runs; the child counts
+     * as exited once it has exited, before anyone reaps it, and the check
+     * never reaps it (waitpid below still gets its status). */
 #ifdef _WIN32
+    CHECK(gk_process_alive((uint32_t)_getpid()) == 1);
     CHECK(_cwait(&status, h, 0) != -1);
 #else
+    CHECK(gk_process_alive((uint32_t)getpid()) == 1);
+    for (int i = 0; i < 5000 && gk_process_alive((uint32_t)pid) == 1; i++) poll(NULL, 0, 1);
+    CHECK(gk_process_alive((uint32_t)pid) == 0);
     CHECK(waitpid(pid, &status, 0) == pid);
     status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     /* The child is gone: its end of the connection reads as EOF. */

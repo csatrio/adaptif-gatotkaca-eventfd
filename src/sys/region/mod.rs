@@ -259,9 +259,11 @@ pub(crate) fn current_pid() -> u32 {
 /// that has not been reaped yet (a zombie) counts as exited: our own
 /// children everywhere on unix, other processes' on Linux, Android, macOS,
 /// iOS, FreeBSD and NetBSD (since 0.3.2; `zombie.rs`). On Windows an
-/// exited process is exited even while handles keep its object.
+/// exited process is exited even while handles keep its object. Pid 0 is
+/// not looked up (true). Public as `crate::process::process_alive` (0.3.3),
+/// which documents the contract.
 pub(crate) fn process_alive(pid: u32) -> bool {
-    os::process_alive(pid)
+    pid == 0 || os::process_alive(pid)
 }
 
 #[cfg(test)]

@@ -280,6 +280,34 @@ fn main() -> std::io::Result<()> {
   GK_LISTENER_ACCESS_CURRENT_USER)` (`GK_LISTENER_ACCESS_DEFAULT`; other
   values fail with `EINVAL`).
 
+#### Is that process still running? (0.3.3)
+
+```rust
+use adaptif_gatotkaca_eventfd::process_alive;
+
+assert!(process_alive(std::process::id()));
+```
+
+`process_alive(pid)` is the check the crate itself uses (`peer_gone()`,
+blocking channel calls, the shims' lock takeover). It returns `false` only
+on evidence that the process has exited or does not exist, and `true`
+while it runs **and whenever the OS can't tell** (another user's process
+whose state the OS won't show, a sandbox), so freeing a process's
+resources on `false` never frees a live one's.
+
+- A process that has exited but not been reaped yet (a zombie) counts as
+  exited. Unix, own children: `waitid(WNOWAIT)`, which never reaps them
+  (your `wait` still gets the status). Other processes: `kill(pid, 0)`
+  (`ESRCH` = gone; `EPERM` = exists), then the zombie check on Linux,
+  Android (`/proc/<pid>/stat`), macOS, iOS (`proc_pidinfo`), FreeBSD and
+  NetBSD (`sysctl`); on OpenBSD, DragonFly and illumos a zombie counts as
+  alive until reaped. Windows: `OpenProcess` and a zero-timeout wait;
+  exited even while handles keep the process, access denied = alive.
+- Pid 0, and on unix a pid above `i32::MAX`, is not looked up (`true`).
+- A pid names whatever process carries it now: on unix a reaped pid may be
+  reused, on Windows a pid stays reserved while a handle is open.
+- C: `int gk_process_alive(uint32_t pid)` (1 or 0).
+
 In C the same API uses opaque handles: `gk_listener_bind`,
 `gk_listener_accept`, `gk_listener_free`, `gk_process_connect`,
 `gk_process_from_parent`, `gk_process_send`, `gk_process_recv`,
@@ -460,7 +488,8 @@ fn worker() -> std::io::Result<()> {
   dies is detected by blocking calls within about a quarter second.
 - **Liveness:** `peer_gone()` tells a non-blocking user (an event loop)
   that the other end was closed or its process died; `peer_pid()` names
-  that process. A process that has exited but not been reaped yet (a
+  that process (`process_alive(pid)`, since 0.3.3, is the same check for
+  any pid). A process that has exited but not been reaped yet (a
   zombie) counts as dead (since 0.3.2) on Linux, Android, macOS, iOS,
   FreeBSD and NetBSD, and always for your own children; on OpenBSD,
   DragonFly and illumos only once its parent reaps it.

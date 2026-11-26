@@ -438,6 +438,22 @@ intptr_t gk_process_recv_bytes(gk_process *process, void *buf, size_t cap);
  */
 int64_t gk_process_peer_pid(const gk_process *process);
 
+/*
+ * Whether process `pid` still runs (since 0.3.3): 1 while it runs and
+ * whenever the OS can't tell (another user's process that the OS won't
+ * describe, pid 0, a pid above INT32_MAX on unix), 0 once it has exited or
+ * if no such process exists. Never blocks; no error return (errno may
+ * change). The crate's own liveness check (peer_gone, lock takeover).
+ *
+ * An exited process that its parent has not reaped yet (a zombie) counts
+ * as exited: own children everywhere on unix (waitid with WNOWAIT: the
+ * check never reaps them, waitpid still gets the status), other processes
+ * on Linux, Android, macOS, iOS, FreeBSD and NetBSD (OpenBSD, DragonFly,
+ * illumos: alive until reaped). Windows: 0 once the process has exited,
+ * even while handles keep it; access denied is 1.
+ */
+int gk_process_alive(uint32_t pid);
+
 #ifndef _WIN32
 /*
  * The connection's unix socket, to poll for readable: a message arrived,

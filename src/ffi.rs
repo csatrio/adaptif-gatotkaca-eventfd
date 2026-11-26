@@ -602,6 +602,18 @@ pub unsafe extern "C" fn gk_process_peer_pid(process: *const GkProcess) -> i64 {
     guard(-1, || with_ref(process, -1, |p| p.peer_pid().map_or(0, i64::from)))
 }
 
+/// `int gk_process_alive(uint32_t pid);` (since 0.3.3)
+///
+/// `1` while process `pid` runs and whenever the OS can't tell (another
+/// user's process, pid 0), `0` once it has exited (an unreaped zombie
+/// counts as exited; an own child is never reaped by the check) or does
+/// not exist. There is no error return (`errno` may change). See
+/// [`crate::process::process_alive`].
+#[unsafe(no_mangle)]
+pub extern "C" fn gk_process_alive(pid: u32) -> c_int {
+    guard(1, || c_int::from(crate::process::process_alive(pid)))
+}
+
 // ---------------------------------------------------------------------------
 // Channels (GkSender / GkReceiver as opaque C handles)
 // ---------------------------------------------------------------------------
@@ -2476,6 +2488,28 @@ mod tests {
             assert!(gk_listener_bind_ex(name.as_ptr(), 2).is_null());
             assert_eq!(compat::errno(), crate::error::errno::EINVAL);
             assert!(gk_listener_bind_ex(core::ptr::null(), GK_LISTENER_ACCESS_DEFAULT).is_null());
+        }
+    }
+
+    #[test]
+    fn process_api_alive() {
+        assert_eq!(gk_process_alive(std::process::id()), 1);
+        assert_eq!(gk_process_alive(0), 1, "pid 0 is not looked up");
+        // An own child: 1 while it runs, 0 once it exited (unreaped), and
+        // the check leaves it for our `wait`.
+        #[cfg(unix)]
+        {
+            let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let pid = child.id();
+            assert_eq!(gk_process_alive(pid), 1);
+            child.kill().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while gk_process_alive(pid) == 1 {
+                assert!(std::time::Instant::now() < deadline, "killed child still alive");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(child.wait().is_ok(), "the check reaped our child");
+            assert_eq!(gk_process_alive(i32::MAX as u32), 0, "no such process");
         }
     }
 

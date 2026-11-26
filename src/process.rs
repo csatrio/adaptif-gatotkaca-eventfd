@@ -6,7 +6,9 @@
 //! ends and shared memory travel the same way ([`GkProcess::recv_as`]).
 //! Small byte messages (a handshake, a bootstrap) travel on the same
 //! connection with [`GkProcess::send_bytes`] / [`GkProcess::recv_bytes`],
-//! and [`GkProcess::peer_pid`] names the process at the other end.
+//! and [`GkProcess::peer_pid`] names the process at the other end;
+//! [`process_alive`] tells whether a process still runs (a zombie counts
+//! as exited).
 //!
 //! | | unix (Linux, macOS, BSDs, ...) | Windows |
 //! |---|---|---|
@@ -126,6 +128,60 @@ pub enum ListenerAccess {
     ///   is refused. The directory holding the socket is the caller's
     ///   business: for a private one, create it `0700` and pass a path.
     CurrentUser,
+}
+
+/// Whether process `pid` is still running (since 0.3.3).
+///
+/// Answers `false` only on evidence that the process has exited or does not
+/// exist, and `true` otherwise, **including when the OS won't tell**
+/// (another user's process, a sandbox, an OS without a zombie check): a
+/// caller that frees a dead process's resources on `false` never frees a
+/// live one's. This is the check the crate itself uses for `peer_gone()`
+/// on channel ends, for blocking channel calls noticing a dead peer and for
+/// the shims' takeover of a lock whose holder died. It never blocks, never
+/// allocates and takes no lock.
+///
+/// A process that has exited but not been reaped by its parent yet (a
+/// zombie) counts as exited:
+///
+/// * **unix, your own children**: `waitid(P_PID, WEXITED | WNOHANG |
+///   WNOWAIT)`. `false` once the child has exited, reaped or not. The query
+///   never reaps it (`WNOWAIT`): its exit status stays for your own
+///   `wait` / [`Child::wait`](std::process::Child::wait).
+/// * **unix, other processes**: `kill(pid, 0)`. `ESRCH` is `false`. A
+///   process that exists, or exists but may not be signalled (`EPERM`:
+///   another user's), is `true` unless it is a zombie, which is recognised
+///   on Linux and Android (`/proc/<pid>/stat` state `X`, or `Z` with at most
+///   one thread: a process whose main thread exited while other threads
+///   run is alive), macOS and iOS (`proc_pidinfo` no longer finds it),
+///   FreeBSD (`kinfo_proc.ki_stat`) and NetBSD (`kinfo_proc2.p_stat`); this
+///   works for other users' processes too where the OS shows their state
+///   (not under Linux `hidepid`, for example). On OpenBSD, DragonFly and
+///   illumos a zombie counts as alive until its parent reaps it.
+/// * **Windows**: `OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)`
+///   and a zero-timeout wait. `false` once the process has exited, even
+///   while handles keep its object, and when no such process exists
+///   (`ERROR_INVALID_PARAMETER`); `true` on any other failure (access
+///   denied).
+/// * `pid == 0`, and on unix a `pid` above `i32::MAX`, is not looked up:
+///   `true`.
+///
+/// A pid names whatever process carries it at the time of the call. On unix
+/// a zombie keeps its pid until it is reaped, after which the pid may be
+/// reused; on Windows a pid stays reserved while any handle to the process
+/// is open. To ask about one particular process reliably, keep it from
+/// being reaped (your own child: ask before you `wait` for it) or hold a
+/// handle to it (Windows).
+///
+/// ```
+/// use adaptif_gatotkaca_eventfd::process_alive;
+///
+/// assert!(process_alive(std::process::id()));
+/// ```
+///
+/// C: `int gk_process_alive(uint32_t pid)` (1 or 0).
+pub fn process_alive(pid: u32) -> bool {
+    crate::sys::process_alive(pid)
 }
 
 impl GkListener {

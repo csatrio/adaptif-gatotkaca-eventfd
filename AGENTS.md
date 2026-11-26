@@ -284,6 +284,15 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   NetBSD (`kinfo_proc2.p_stat`). OpenBSD, DragonFly, illumos: a zombie
   still counts as alive until reaped, so reap children promptly there.
   Windows: an exited process is dead even while handles keep it.
+- **`process_alive(pid) -> bool` (0.3.3)** is that check, public
+  (`adaptif_gatotkaca_eventfd::process_alive`; C `int
+  gk_process_alive(uint32_t pid)`, 1/0). `false` only on evidence of exit
+  or non-existence; `true` while running **and whenever the OS can't
+  tell** (`EPERM` for another user's process whose state the OS won't
+  show, Windows access denied, pid 0, unix pid > `i32::MAX`). Own children
+  are never reaped by it (`WNOWAIT`). Use it instead of your own
+  `kill(pid, 0)` / `waitid` / `OpenProcess` code; a pid may be reused once
+  its process is reaped (Windows: once no handle is open).
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 

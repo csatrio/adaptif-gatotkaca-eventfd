@@ -388,9 +388,11 @@ pub(crate) fn current_pid() -> u32 {
 /// False if process `pid` no longer exists, or has exited but not been
 /// reaped yet (a zombie: `kill(pid, 0)` still succeeds for it). Our own
 /// children are asked with `waitid(WNOWAIT)`; other processes' zombies are
-/// recognised where the OS can tell cheaply (see `super::zombie`).
+/// recognised where the OS can tell cheaply (see `super::zombie`). A `pid`
+/// above `pid_t::MAX` is not looked up (true): cast, it would name a
+/// process group for `kill`.
 pub(crate) fn process_alive(pid: u32) -> bool {
-    let pid = pid as libc::pid_t;
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
     // SAFETY: an all-zero siginfo_t is a valid value.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a live siginfo_t. WNOWAIT leaves the child
