@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-26
+
+### Added
+
+- `process_alive(pid: u32) -> bool` (`adaptif_gatotkaca_eventfd::process_alive`,
+  also `process::process_alive`): the crate's own liveness check, the one
+  behind `peer_gone()`, blocking channel calls noticing a dead peer and the
+  shims' lock takeover, now public. `false` only on evidence that the
+  process has exited or does not exist; `true` while it runs and whenever
+  the OS can't tell (e.g. `EPERM` for another user's process whose state
+  the OS won't show, Windows access denied). An unreaped zombie counts as
+  exited as in 0.3.2: own children via `waitid(WNOWAIT)` (never reaped by
+  the check), others on Linux, Android, macOS, iOS, FreeBSD and NetBSD;
+  Windows `OpenProcess` + a zero-timeout wait (exited even while handles
+  keep the process). Pid 0, and on unix a pid above `i32::MAX`, is not
+  looked up (`true`).
+- C: `int gk_process_alive(uint32_t pid)` (1 or 0). `examples/c/process.c`
+  uses it.
+
+### Changed
+
+- The internal liveness check no longer looks up pid 0 or (unix) a pid
+  above `i32::MAX`, which cast to `pid_t` named a process group for
+  `kill(2)`; it answers `true` for them. No internal caller passed such a
+  pid.
+
 ## [0.3.2] - 2026-11-26
 
 ### Added
@@ -257,7 +283,9 @@ First release.
 - `force-shim` feature: use the unix shim on native platforms, for testing
   the shim against the kernel eventfd.
 
-[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/csatrio/adaptif-gatotkaca-eventfd/compare/v0.1.0...v0.2.0
