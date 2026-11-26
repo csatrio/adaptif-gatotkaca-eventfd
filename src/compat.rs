@@ -1621,5 +1621,7 @@ pub(crate) mod tests {
         assert_eq!(value("GK_EFD_NONBLOCK"), nb);
         assert_eq!(value("GK_EFD_CLOEXEC"), cloexec);
         assert_eq!(value("GK_PROCESS_BYTES_MAX") as usize, crate::process::BYTES_MAX);
+        assert_eq!(value("GK_LISTENER_ACCESS_DEFAULT"), 0);
+        assert_eq!(value("GK_LISTENER_ACCESS_CURRENT_USER"), 1);
     }
 }

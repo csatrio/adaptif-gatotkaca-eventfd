@@ -97,6 +97,37 @@ pub struct GkProcess {
 #[derive(Debug)]
 pub struct GkListener(imp::Listener);
 
+/// Who may connect to a [`GkListener`]: the second argument of
+/// [`GkListener::bind_with`] (since 0.3.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ListenerAccess {
+    /// What [`GkListener::bind`] does: the OS default. Unix: the socket
+    /// file gets the mode the process's umask leaves (typically `0755`, so
+    /// only the owner can connect on most systems, but not guaranteed).
+    /// Windows: the default security descriptor of the process token: full
+    /// control for the creator, SYSTEM and Administrators, read access for
+    /// Everyone and anonymous.
+    #[default]
+    Default,
+    /// Only processes running as the current user may connect.
+    ///
+    /// * Windows: every pipe instance (the first and each later one) is
+    ///   created with the protected DACL `D:P(A;;FA;;;<user SID>)`: full
+    ///   access for the user of this process's token, nobody else, nothing
+    ///   inherited. Other users' `connect` fails with
+    ///   [`io::ErrorKind::PermissionDenied`].
+    /// * Unix: the socket file is made `0600` right after it is created, and
+    ///   [`accept`](GkListener::accept) closes (and skips) any connection
+    ///   whose peer's effective user id is not this process's (read with
+    ///   `SO_PEERCRED` / `getpeereid` / `getpeerucred`), which also covers
+    ///   a connection made before the mode changed, and `root`. Where the
+    ///   peer's user can't be read (no such call on the OS) every connection
+    ///   is refused. The directory holding the socket is the caller's
+    ///   business: for a private one, create it `0700` and pass a path.
+    CurrentUser,
+}
+
 impl GkListener {
     /// Listens under `name`: a unix socket path (`$TMPDIR/gkefd-<name>.sock`
     /// unless `name` contains `/`), or the named pipe
@@ -106,8 +137,29 @@ impl GkListener {
     /// a socket file left by a dead listener is replaced, and a live listener
     /// under the same name makes this fail with
     /// [`io::ErrorKind::AddrInUse`]. Both files are removed on drop.
+    ///
+    /// Who may connect is left to the OS defaults; see
+    /// [`bind_with`](Self::bind_with) to restrict it.
     pub fn bind(name: &str) -> io::Result<Self> {
-        Ok(Self(imp::Listener::bind(name)?))
+        Self::bind_with(name, ListenerAccess::Default)
+    }
+
+    /// Like [`bind`](Self::bind), with control over who may connect (see
+    /// [`ListenerAccess`]). With [`ListenerAccess::CurrentUser`] no
+    /// process of another user can connect at any point: on Windows the
+    /// pipe exists only with the restricted DACL (no window between
+    /// creating it and securing it), on unix connections of other users are
+    /// refused by `accept`.
+    ///
+    /// ```no_run
+    /// use adaptif_gatotkaca_eventfd::process::{GkListener, ListenerAccess};
+    ///
+    /// let listener = GkListener::bind_with("doorbell", ListenerAccess::CurrentUser)?;
+    /// let peer = listener.accept()?; // a process of this user
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn bind_with(name: &str, access: ListenerAccess) -> io::Result<Self> {
+        Ok(Self(imp::Listener::bind(name, access)?))
     }
 
     /// Waits for the next process to [`connect`](GkProcess::connect).
@@ -400,7 +452,7 @@ fn unique_name() -> String {
 #[cfg(unix)]
 mod imp {
     use super::private::Sealed;
-    use super::unique_name;
+    use super::{ListenerAccess, unique_name};
     use std::io;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
@@ -416,6 +468,9 @@ mod imp {
         lock_path: PathBuf,
         /// Holds a write lock on `lock_path` for the listener's lifetime.
         _lock: std::fs::File,
+        /// `ListenerAccess::CurrentUser`: the only effective user id
+        /// `accept` lets through.
+        only_uid: Option<libc::uid_t>,
     }
 
     /// Takes the lock that marks `path` as owned by a live listener. The
@@ -440,7 +495,7 @@ mod imp {
     }
 
     impl Listener {
-        pub(super) fn bind(name: &str) -> io::Result<Self> {
+        pub(super) fn bind(name: &str, access: ListenerAccess) -> io::Result<Self> {
             let path = path_for(name);
             let mut lock_path = path.clone().into_os_string();
             lock_path.push(".lock");
@@ -453,11 +508,28 @@ mod imp {
                 Err(e) => return Err(e),
             }
             let sock = UnixListener::bind(&path)?;
-            Ok(Self { sock, path, lock_path, _lock: lock })
+            let mut listener = Self { sock, path, lock_path, _lock: lock, only_uid: None };
+            if access == ListenerAccess::CurrentUser {
+                use std::os::unix::fs::PermissionsExt;
+                // On failure dropping `listener` removes both files.
+                std::fs::set_permissions(&listener.path, std::fs::Permissions::from_mode(0o600))?;
+                // SAFETY: geteuid has no preconditions.
+                listener.only_uid = Some(unsafe { libc::geteuid() });
+            }
+            Ok(listener)
         }
 
         pub(super) fn accept(&self) -> io::Result<Process> {
-            Ok(Process::ready(self.sock.accept()?.0))
+            loop {
+                let stream = self.sock.accept()?.0;
+                if let Some(uid) = self.only_uid {
+                    if crate::sys::unix_share::peer_euid(std::os::fd::AsFd::as_fd(&stream)) != Some(uid) {
+                        // Another user (or unknown): closed, wait for the next.
+                        continue;
+                    }
+                }
+                return Ok(Process::ready(stream));
+            }
         }
     }
 
@@ -491,7 +563,7 @@ mod imp {
         }
 
         pub(super) fn for_child() -> io::Result<(Self, String)> {
-            let listener = Listener::bind(&unique_name())?;
+            let listener = Listener::bind(&unique_name(), ListenerAccess::Default)?;
             let name = listener.path.to_string_lossy().into_owned();
             Ok((Self::Pending(listener), name))
         }
@@ -541,6 +613,36 @@ mod imp {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Listener, ListenerAccess, path_for};
+        use std::io;
+        use std::os::unix::net::UnixStream;
+
+        /// `CurrentUser`: a connection from another effective user is closed
+        /// by `accept`, which goes on waiting. Simulated by expecting another
+        /// uid.
+        #[test]
+        fn current_user_listener_drops_other_users() {
+            let name = format!("unit-cu-{}", std::process::id());
+            let mut listener = Listener::bind(&name, ListenerAccess::CurrentUser).unwrap();
+            // SAFETY: geteuid has no preconditions.
+            let me = unsafe { libc::geteuid() };
+            assert_eq!(listener.only_uid, Some(me));
+            listener.only_uid = Some(me.wrapping_add(1));
+            listener.sock.set_nonblocking(true).unwrap();
+            let mut client = UnixStream::connect(path_for(&name)).unwrap();
+            // The queued connection is refused, then nothing is left.
+            assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            let mut buf = [0u8; 1];
+            assert_eq!(io::Read::read(&mut client, &mut buf).unwrap(), 0, "the refused connection must be closed");
+            // The right user gets through.
+            listener.only_uid = Some(me);
+            let _client = UnixStream::connect(path_for(&name)).unwrap();
+            assert!(listener.accept().is_ok());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +652,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::private::Sealed;
-    use super::{BYTES_MAX, BYTES_TAG, unique_name};
+    use super::{BYTES_MAX, BYTES_TAG, ListenerAccess, unique_name};
     use crate::compat::TOKEN_MAX;
     use std::fs::File;
 
@@ -564,8 +666,15 @@ mod imp {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::Mutex;
 
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Foundation::{
         ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -574,6 +683,7 @@ mod imp {
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
     };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     fn pipe_name(name: &str) -> String {
         if name.starts_with(r"\\") { name.to_owned() } else { format!(r"\\.\pipe\gkefd-{name}") }
@@ -583,12 +693,22 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// A new, unconnected instance of the pipe `name`.
-    fn instance(name: &[u16], first: bool) -> io::Result<OwnedHandle> {
+    /// A new, unconnected instance of the pipe `name`, with the security
+    /// descriptor `sd` (a self-relative one, see `current_user_only`) or the
+    /// default one.
+    fn instance(name: &[u16], first: bool, sd: Option<&[u64]>) -> io::Result<OwnedHandle> {
         let first_instance = first;
         let first = if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
-        // SAFETY: `name` is NUL-terminated; default security (this user),
-        // local clients only.
+        let attrs = sd.map(|sd| SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            // Only read by the call; `sd` outlives it.
+            lpSecurityDescriptor: sd.as_ptr().cast_mut().cast(),
+            bInheritHandle: 0,
+        });
+        let attrs_ptr = attrs.as_ref().map_or(std::ptr::null(), |a| a as *const SECURITY_ATTRIBUTES);
+        // SAFETY: `name` is NUL-terminated; `attrs_ptr` is null (default
+        // security) or points to live attributes whose descriptor is a valid
+        // self-relative one; local clients only.
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -598,7 +718,7 @@ mod imp {
                 4096,
                 4096,
                 0,
-                std::ptr::null(),
+                attrs_ptr,
             )
         };
         if h == INVALID_HANDLE_VALUE {
@@ -614,19 +734,92 @@ mod imp {
         Ok(unsafe { OwnedHandle::from_raw_handle(h) })
     }
 
+    /// The current user's SID as a string (`S-1-5-21-...`), from this
+    /// process's token.
+    fn current_user_sid() -> io::Result<String> {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: the current process's pseudo-handle; `token` receives a
+        // handle we own.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh handle we own.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut len = 0u32;
+        // SAFETY: a size query (no buffer); fails with
+        // ERROR_INSUFFICIENT_BUFFER and sets `len`.
+        unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // u64 words: aligned for `TOKEN_USER`.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: `buf` holds at least `len` writable bytes.
+        if unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, buf.as_mut_ptr().cast(), len, &mut len) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: filled by the call above with a `TOKEN_USER` (and the SID
+        // it points to, inside `buf`).
+        let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+        let mut s = std::ptr::null_mut();
+        // SAFETY: a valid SID; `s` receives a `LocalAlloc`ed wide string,
+        // freed below.
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut s) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `s` is NUL-terminated (the conversion succeeded); read up
+        // to the NUL.
+        let sid = unsafe {
+            let n = (0..).take_while(|&i| *s.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(s, n))
+        };
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(s.cast()) };
+        Ok(sid)
+    }
+
+    /// A self-relative security descriptor with the protected DACL
+    /// `D:P(A;;FA;;;<user SID>)` (full access for the current user only),
+    /// copied into words we own (self-relative descriptors hold no
+    /// pointers, so the copy is valid wherever it lives).
+    fn current_user_only() -> io::Result<Vec<u64>> {
+        let sddl = wide(&format!("D:P(A;;FA;;;{})", current_user_sid()?));
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut len = 0u32;
+        // SAFETY: `sddl` is NUL-terminated; `sd` receives a `LocalAlloc`ed
+        // self-relative descriptor of `len` bytes, freed below.
+        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, &mut len) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut words = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: `sd` holds `len` readable bytes and `words` at least `len`
+        // writable ones; they don't overlap.
+        unsafe { std::ptr::copy_nonoverlapping(sd.cast::<u8>(), words.as_mut_ptr().cast::<u8>(), len as usize) };
+        // SAFETY: allocated by the conversion above, freed once.
+        unsafe { LocalFree(sd) };
+        Ok(words)
+    }
+
     #[derive(Debug)]
     pub(super) struct Listener {
         name: Vec<u16>,
+        /// `ListenerAccess::CurrentUser`: the self-relative security
+        /// descriptor every instance is created with.
+        sd: Option<Vec<u64>>,
         /// The instance the next client will connect to.
         next: Mutex<OwnedHandle>,
     }
 
     impl Listener {
-        pub(super) fn bind(name: &str) -> io::Result<Self> {
+        pub(super) fn bind(name: &str, access: ListenerAccess) -> io::Result<Self> {
             let name = wide(&pipe_name(name));
+            let sd = match access {
+                ListenerAccess::Default => None,
+                ListenerAccess::CurrentUser => Some(current_user_only()?),
+            };
             // FIRST_PIPE_INSTANCE: fail if someone else already owns the name.
-            let next = Mutex::new(instance(&name, true)?);
-            Ok(Self { name, next })
+            let next = Mutex::new(instance(&name, true, sd.as_deref())?);
+            Ok(Self { name, sd, next })
         }
 
         pub(super) fn accept(&self) -> io::Result<Process> {
@@ -643,7 +836,7 @@ mod imp {
             if unsafe { GetNamedPipeClientProcessId(next.as_raw_handle(), &mut pid) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let conn = std::mem::replace(&mut *next, instance(&self.name, false)?);
+            let conn = std::mem::replace(&mut *next, instance(&self.name, false, self.sd.as_deref())?);
             Ok(Process::ready(conn, pid))
         }
     }
@@ -719,7 +912,7 @@ mod imp {
 
         pub(super) fn for_child() -> io::Result<(Self, String)> {
             let name = pipe_name(&unique_name());
-            let listener = Listener::bind(&name)?;
+            let listener = Listener::bind(&name, ListenerAccess::Default)?;
             let state = State::Pending { listener, child: None };
             Ok((Self { state, offered: Vec::new() }, name))
         }

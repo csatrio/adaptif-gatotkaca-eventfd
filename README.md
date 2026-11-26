@@ -250,6 +250,36 @@ In C: `gk_process_send_bytes`, `gk_process_recv_bytes(p, buf, cap)`
 unknown) and, on unix, `gk_process_fd` (completes a pending child
 connection first). See `examples/c/process.c`.
 
+#### Only the current user may connect (0.3.2)
+
+```rust,no_run
+use adaptif_gatotkaca_eventfd::{GkListener, ListenerAccess};
+
+fn main() -> std::io::Result<()> {
+    let listener = GkListener::bind_with("doorbell", ListenerAccess::CurrentUser)?;
+    let peer = listener.accept()?; // a process of this user
+    Ok(())
+}
+```
+
+- Windows: every instance of the named pipe (the first one and each one
+  created after an `accept`) is created with the protected DACL
+  `D:P(A;;FA;;;<user SID>)`: full access for the user of the process's
+  token and nobody else (the default descriptor also lets Everyone and
+  anonymous read). There is no moment when the pipe exists with the
+  default security. Other users' `connect` fails with `PermissionDenied`.
+- Unix: the socket file is made `0600` right after `bind`, and `accept`
+  closes and skips connections whose peer runs as another effective user
+  (`SO_PEERCRED` / `getpeereid` / `getpeerucred`), which also covers a
+  connection made before the mode changed, and `root`. Where the OS can't
+  tell the peer's user, every connection is refused. The directory is
+  yours to choose: pass a path inside a `0700` directory to hide the
+  socket too.
+- `GkListener::bind(name)` is `bind_with(name, ListenerAccess::Default)`
+  (the OS defaults, unchanged). C: `gk_listener_bind_ex(name,
+  GK_LISTENER_ACCESS_CURRENT_USER)` (`GK_LISTENER_ACCESS_DEFAULT`; other
+  values fail with `EINVAL`).
+
 In C the same API uses opaque handles: `gk_listener_bind`,
 `gk_listener_accept`, `gk_listener_free`, `gk_process_connect`,
 `gk_process_from_parent`, `gk_process_send`, `gk_process_recv`,
@@ -430,7 +460,10 @@ fn worker() -> std::io::Result<()> {
   dies is detected by blocking calls within about a quarter second.
 - **Liveness:** `peer_gone()` tells a non-blocking user (an event loop)
   that the other end was closed or its process died; `peer_pid()` names
-  that process.
+  that process. A process that has exited but not been reaped yet (a
+  zombie) counts as dead (since 0.3.2) on Linux, Android, macOS, iOS,
+  FreeBSD and NetBSD, and always for your own children; on OpenBSD,
+  DragonFly and illumos only once its parent reaps it.
 - **Sharing:** `GkProcess::send(&end)` / `recv_as::<GkSender>()` /
   `recv_as::<GkReceiver>()` on every OS, `send_to`/`recv_from` over a
   `UnixStream` on unix, and `fork()` (the process that keeps an end calls
@@ -822,7 +855,9 @@ DragonFly, Windows, and any platform built with `force-shim`):
 - **Not async-signal-safe.** Operations take a short cross-process lock, so
   calling into an eventfd from a signal handler that interrupted an
   operation on the same eventfd deadlocks. (A process that dies holding the
-  lock is detected and the lock is taken over.)
+  lock is detected and the lock is taken over, also while it is an
+  unreaped zombie: since 0.3.2, except on OpenBSD and DragonFly, where it
+  must be reaped first.)
 - **No write readiness.** `POLLOUT` and writability are not reported in a
   meaningful way. Only readability (counter > 0) is supported.
 - **Duplicate through the crate.** Use `GkEventFd::try_clone` in Rust and

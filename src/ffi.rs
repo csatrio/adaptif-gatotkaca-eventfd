@@ -264,7 +264,7 @@ pub extern "C" fn gk_eventfd_recv(sock: c_int) -> c_int {
 // Process API (GkProcess / GkListener as opaque C handles)
 // ---------------------------------------------------------------------------
 
-use crate::{GkListener, GkProcess};
+use crate::{GkListener, GkProcess, ListenerAccess};
 use core::ffi::{CStr, c_char};
 
 /// Reads a NUL-terminated UTF-8 name, or sets `errno` (`EFAULT`/`EINVAL`).
@@ -302,6 +302,35 @@ pub unsafe extern "C" fn gk_listener_bind(name: *const c_char) -> *mut GkListene
         // SAFETY: forwarded to the caller.
         match unsafe { c_name(name) } {
             Some(name) => boxed(GkListener::bind(name)),
+            None => core::ptr::null_mut(),
+        }
+    })
+}
+
+/// `GK_LISTENER_ACCESS_*` in C.
+const GK_LISTENER_ACCESS_DEFAULT: c_int = 0;
+const GK_LISTENER_ACCESS_CURRENT_USER: c_int = 1;
+
+/// `gk_listener *gk_listener_bind_ex(const char *name, int access);`
+/// (`GK_LISTENER_ACCESS_DEFAULT` = `gk_listener_bind`,
+/// `GK_LISTENER_ACCESS_CURRENT_USER`; anything else is `EINVAL`).
+///
+/// # Safety
+/// `name` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gk_listener_bind_ex(name: *const c_char, access: c_int) -> *mut GkListener {
+    guard(core::ptr::null_mut(), || {
+        let access = match access {
+            GK_LISTENER_ACCESS_DEFAULT => ListenerAccess::Default,
+            GK_LISTENER_ACCESS_CURRENT_USER => ListenerAccess::CurrentUser,
+            _ => {
+                compat::set_errno(crate::error::errno::EINVAL);
+                return core::ptr::null_mut();
+            }
+        };
+        // SAFETY: forwarded to the caller.
+        match unsafe { c_name(name) } {
+            Some(name) => boxed(GkListener::bind_with(name, access)),
             None => core::ptr::null_mut(),
         }
     })
@@ -2411,6 +2440,42 @@ mod tests {
             gk_process_free(p);
             gk_process_free(q);
             gk_listener_free(l);
+        }
+    }
+
+    /// `gk_listener_bind_ex`: both access values work for this user; an
+    /// unknown one is `EINVAL`. (That other users are kept out can't be
+    /// tested from one account.)
+    #[test]
+    fn process_api_listener_access() {
+        let _g = compat::tests::lock();
+        for access in [GK_LISTENER_ACCESS_DEFAULT, GK_LISTENER_ACCESS_CURRENT_USER] {
+            let name = std::ffi::CString::new(format!("ffi-access-{}-{access}", std::process::id())).unwrap();
+            // SAFETY: valid C string; handles from this API.
+            unsafe {
+                let l = gk_listener_bind_ex(name.as_ptr(), access);
+                assert!(!l.is_null(), "bind_ex({access}): errno {}", compat::errno());
+                let l_addr = l as usize;
+                let accepting = std::thread::spawn(move || gk_listener_accept(l_addr as *mut GkListener) as usize);
+                let q = gk_process_connect(name.as_ptr());
+                assert!(!q.is_null(), "connect({access}): errno {}", compat::errno());
+                let p = accepting.join().unwrap() as *mut GkProcess;
+                assert!(!p.is_null());
+                let msg = b"same user";
+                assert_eq!(gk_process_send_bytes(p, msg.as_ptr().cast(), msg.len()), 0);
+                let mut buf = [0u8; 16];
+                assert_eq!(gk_process_recv_bytes(q, buf.as_mut_ptr().cast(), buf.len()), msg.len() as isize);
+                gk_process_free(p);
+                gk_process_free(q);
+                gk_listener_free(l);
+            }
+        }
+        let name = std::ffi::CString::new(format!("ffi-access-bad-{}", std::process::id())).unwrap();
+        // SAFETY: valid C string; null and unknown values are rejected.
+        unsafe {
+            assert!(gk_listener_bind_ex(name.as_ptr(), 2).is_null());
+            assert_eq!(compat::errno(), crate::error::errno::EINVAL);
+            assert!(gk_listener_bind_ex(core::ptr::null(), GK_LISTENER_ACCESS_DEFAULT).is_null());
         }
     }
 

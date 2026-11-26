@@ -209,7 +209,9 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   code on every OS. Parent: `let (child, mut peer) = GkProcess::spawn(&mut cmd)?;
   peer.send(&efd)?;` Child: `let efd = GkProcess::from_parent()?.recv()?;`
   Unrelated processes: `GkListener::bind(name)?.accept()?` /
-  `GkProcess::connect(name)?`, then `send`/`recv`. Unix: unix socket
+  `GkProcess::connect(name)?`, then `send`/`recv` (to keep other users
+  out: `GkListener::bind_with(name, ListenerAccess::CurrentUser)`, below).
+  Unix: unix socket
   (`$TMPDIR/gkefd-<name>.sock`); Windows: named pipe `\\.\pipe\gkefd-<name>`
   with the peer's pid recorded. `recv` is safe (no `unsafe import`). On
   Windows keep the sending `GkProcess` alive until the peer has received.
@@ -260,6 +262,28 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   small, message kept; `GK_PROCESS_BYTES_MAX`; `EINVAL` wrong kind; `EIO`
   at EOF), `gk_process_peer_pid(p)` (0 = unknown), `gk_process_fd(p)`
   (unix; completes a pending child connection first).
+- **Restricting who may connect (0.3.2):**
+  `GkListener::bind_with(name, ListenerAccess::CurrentUser)` (`bind` is
+  `bind_with(name, ListenerAccess::Default)`, the OS defaults). Windows:
+  every pipe instance, the first and each later one, is created with the
+  protected DACL `D:P(A;;FA;;;<user SID>)` (no window where the pipe is
+  open to others; other users' `connect` gets `PermissionDenied`). Unix:
+  the socket file becomes `0600` and `accept` closes connections whose
+  peer's effective uid differs (also `root`; all of them where the OS
+  can't tell the peer's uid). Put the socket in a `0700` directory of
+  yours if the directory matters too. C: `gk_listener_bind_ex(name,
+  GK_LISTENER_ACCESS_CURRENT_USER)` (`GK_LISTENER_ACCESS_DEFAULT`; other
+  values `EINVAL`).
+- **Liveness and zombies (0.3.2):** wherever the crate asks whether another
+  process is alive (`peer_gone()`, blocking channel calls noticing a dead
+  peer, the shims' takeover of a lock whose holder died), a process that
+  has exited but not been reaped by its parent (a zombie) counts as dead:
+  own children via `waitid(WNOWAIT)` (as before), others on Linux/Android
+  (`/proc/<pid>/stat` state `Z` with one thread, or `X`), macOS/iOS
+  (`proc_pidinfo` no longer sees it), FreeBSD (`kinfo_proc.ki_stat`),
+  NetBSD (`kinfo_proc2.p_stat`). OpenBSD, DragonFly, illumos: a zombie
+  still counts as alive until reaped, so reap children promptly there.
+  Windows: an exited process is dead even while handles keep it.
 - mio on Windows: each process should read (drain) its own registered handle;
   use one eventfd per waiting side.
 
@@ -441,7 +465,9 @@ link `target/release/libadaptif_gatotkaca_eventfd.a`
   writes, blocking reads wake across processes, and `set_nonblocking` is
   shared (as `O_NONBLOCK` is on Linux).
 - If a process dies while holding that lock (only possible mid-operation, e.g.
-  `SIGKILL`), the next caller takes it over and repairs readiness.
+  `SIGKILL`), the next caller takes it over and repairs readiness, also
+  while the dead holder is an unreaped zombie (since 0.3.2; on macOS and
+  iOS; on OpenBSD and DragonFly only once its parent reaps it).
 - After `exec` or for unrelated processes, share explicitly (section 6):
   plain inherited fds without a token don't carry the counter.
 - Not async-signal-safe: don't call into an eventfd from a signal handler

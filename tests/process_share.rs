@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use adaptif_gatotkaca_eventfd::{
     ChannelOptions, EfdFlags, GkChannel, GkEventFd, GkListener, GkMpSender, GkProcess, GkReceiver, GkSender, GkSharedMemory, GkShmPool,
-    GkShmPoolView, ShmLease,
+    GkShmPoolView, ListenerAccess, ShmLease,
 };
 
 /// How the child gets the eventfd.
@@ -360,6 +360,40 @@ fn listener_and_connect() {
     let back = peer.recv().unwrap();
     back.write(8).unwrap();
     assert_eq!(client.join().unwrap(), 8);
+}
+
+/// `bind_with(CurrentUser)` (0.3.2): processes of this user connect, to
+/// the first pipe instance and to later ones (Windows creates each with
+/// the restricted DACL); on unix the socket file is `0600`. That other
+/// users are kept out can't be tested from one account.
+#[test]
+fn listener_current_user_only() {
+    let name = format!("test-cu-{}", std::process::id());
+    let listener = GkListener::bind_with(&name, ListenerAccess::CurrentUser).unwrap();
+    assert_eq!(GkListener::bind_with(&name, ListenerAccess::CurrentUser).unwrap_err().kind(), ErrorKind::AddrInUse);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("gkefd-{name}.sock"));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    for round in 0..3u8 {
+        let client_name = name.clone();
+        let client = thread::spawn(move || {
+            let mut peer = GkProcess::connect(&client_name).unwrap();
+            peer.send_bytes(&[round]).unwrap();
+            let mut back = Vec::new();
+            peer.recv_bytes(&mut back).unwrap();
+            back
+        });
+        let mut peer = listener.accept().unwrap();
+        assert_eq!(peer.peer_pid(), Some(std::process::id()));
+        let mut got = Vec::new();
+        peer.recv_bytes(&mut got).unwrap();
+        assert_eq!(got, [round]);
+        peer.send_bytes(b"ok").unwrap();
+        assert_eq!(client.join().unwrap(), b"ok");
+    }
 }
 
 #[test]

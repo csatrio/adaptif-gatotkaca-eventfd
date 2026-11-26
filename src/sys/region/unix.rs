@@ -385,9 +385,10 @@ pub(crate) fn current_pid() -> u32 {
     pid
 }
 
-/// False if process `pid` no longer exists, or is our child that has
-/// exited but not been reaped yet (`kill(pid, 0)` still succeeds for
-/// such zombies).
+/// False if process `pid` no longer exists, or has exited but not been
+/// reaped yet (a zombie: `kill(pid, 0)` still succeeds for it). Our own
+/// children are asked with `waitid(WNOWAIT)`; other processes' zombies are
+/// recognised where the OS can tell cheaply (see `super::zombie`).
 pub(crate) fn process_alive(pid: u32) -> bool {
     let pid = pid as libc::pid_t;
     // SAFETY: an all-zero siginfo_t is a valid value.
@@ -402,10 +403,12 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     }
     // Not our child (ECHILD): ask the kernel whether it exists.
     // SAFETY: signal 0 only checks for existence and permission.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
+    if unsafe { libc::kill(pid, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
     }
-    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    // It exists (or exists and we may not signal it: EPERM). A zombie
+    // exists for kill(2) but is dead (since 0.3.2).
+    !super::zombie::is_zombie(pid)
 }
 
 #[cfg(test)]

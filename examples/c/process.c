@@ -11,6 +11,9 @@
  * parent watches the connection's descriptor turn readable (EOF) once the
  * child has exited: the connection doubles as a lifeline.
  *
+ * Finally a listener only this user may connect to (gk_listener_bind_ex,
+ * since 0.3.2): connect to it and accept, on one thread.
+ *
  * Run it without arguments; it re-runs itself with "child".
  * Exits 0 on success; otherwise prints the failed check and exits 1.
  */
@@ -140,6 +143,34 @@ int main(int argc, char **argv) {
     CHECK(v == 7);
     CHECK(gk_eventfd_close(efd) == 0);
     gk_process_free(kid);
+
+    /* A listener for this user only (Windows: DACL D:P(A;;FA;;;<user>) on
+     * every pipe instance; unix: socket 0600, other users' connections
+     * closed by accept). Connecting before accepting works on one thread. */
+    char name[64];
+#ifdef _WIN32
+    snprintf(name, sizeof name, "process-example-%d", _getpid());
+#else
+    snprintf(name, sizeof name, "process-example-%d", (int)getpid());
+#endif
+    CHECK(gk_listener_bind_ex(name, 7) == NULL); /* unknown access value */
+    CHECK(errno == EINVAL);
+    gk_listener *mine = gk_listener_bind_ex(name, GK_LISTENER_ACCESS_CURRENT_USER);
+    CHECK(mine != NULL);
+    if (mine != NULL) {
+        gk_process *client = gk_process_connect(name);
+        CHECK(client != NULL);
+        gk_process *server = gk_listener_accept(mine);
+        CHECK(server != NULL);
+        if (client != NULL && server != NULL) {
+            CHECK(gk_process_send_bytes(client, "me", 2) == 0);
+            CHECK(gk_process_recv_bytes(server, reply, sizeof reply) == 2);
+            CHECK(memcmp(reply, "me", 2) == 0);
+        }
+        gk_process_free(client);
+        gk_process_free(server);
+        gk_listener_free(mine);
+    }
 
     if (failures != 0) {
         fprintf(stderr, "process: %d check(s) failed\n", failures);

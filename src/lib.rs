@@ -65,7 +65,7 @@ pub use channel::{
 };
 pub use flags::{EFD_CLOEXEC, EFD_MAX, EFD_NONBLOCK, EFD_SEMAPHORE, EfdFlags, eventfd_t};
 pub use pool::{GkShmPool, GkShmPoolView, ShmBlock, ShmBuf, ShmLease, ShmPoolOptions, ShmPoolStats};
-pub use process::{GkListener, GkProcess, Shareable};
+pub use process::{GkListener, GkProcess, ListenerAccess, Shareable};
 pub use shared_memory::{GkSharedMemory, HugePages, SharedMemoryOptions};
 
 /// A cross-platform eventfd. See the [crate docs](crate).

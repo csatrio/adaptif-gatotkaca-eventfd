@@ -441,6 +441,94 @@ mod tests {
         unsafe { libc::waitpid(child, &mut status, 0) };
     }
 
+    /// Kills (SIGKILL) the given processes when dropped, also on a failed
+    /// assertion, and reaps the first (our child; the others are its
+    /// children and get reaped by init once it is gone).
+    #[cfg(unix)]
+    struct KillOnDrop(Vec<libc::pid_t>);
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            for &pid in self.0.iter().filter(|&&p| p > 0) {
+                // SAFETY: signals a process this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            if let Some(&child) = self.0.first() {
+                // SAFETY: reaps our own child.
+                unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+            }
+        }
+    }
+
+    /// A process killed or exited but not reaped by its parent (a zombie
+    /// that is not our child) is dead, and a lock it held is taken over
+    /// (multiprocessing GOTCHAS 16; before 0.3.2 `kill(pid, 0)` kept it
+    /// alive until its parent reaped it). A live process that is not our
+    /// child is alive.
+    #[cfg(unix)]
+    #[test]
+    fn unix_zombie_of_another_parent_is_dead() {
+        let page = SharedPage::new(0, EfdFlags::NONE).unwrap();
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the middle process and its children only take the lock,
+        // write to the pipe, pause and _exit.
+        let middle = unsafe { libc::fork() };
+        if middle == 0 {
+            // SAFETY: as above.
+            let holder = unsafe { libc::fork() };
+            if holder == 0 {
+                // Dies holding the lock.
+                std::mem::forget(page.lock_raw());
+                // SAFETY: async-signal-safe exit in the forked child.
+                unsafe { libc::_exit(0) };
+            }
+            // SAFETY: as above.
+            let live = unsafe { libc::fork() };
+            if live == 0 {
+                loop {
+                    // SAFETY: waits for a signal (SIGKILL ends it).
+                    unsafe { libc::pause() };
+                }
+            }
+            let pids = [holder, live];
+            // SAFETY: writes the two pids from a live local array.
+            unsafe { libc::write(fds[1], pids.as_ptr().cast(), size_of_val(&pids)) };
+            // Never reaps them.
+            loop {
+                // SAFETY: as above.
+                unsafe { libc::pause() };
+            }
+        }
+        assert!(middle > 0);
+        let mut guard = KillOnDrop(vec![middle]);
+        // SAFETY: closes our copy of the write end, once.
+        unsafe { libc::close(fds[1]) };
+        let mut pids = [0 as libc::pid_t; 2];
+        // SAFETY: reads into a live local array of that size.
+        let n = unsafe { libc::read(fds[0], pids.as_mut_ptr().cast(), size_of_val(&pids)) };
+        // SAFETY: closes the read end, once.
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(n as usize, size_of_val(&pids));
+        let [holder, live] = pids;
+        guard.0.push(live);
+        assert!(process_alive(middle as u32));
+        assert!(process_alive(live as u32), "a live non-child process must be alive");
+        wait_exited_unreaped(holder);
+        assert_eq!(page.holder(), holder as u32);
+        let (g, recovered) = page.lock_raw();
+        assert!(recovered, "lock not taken over from the unreaped holder");
+        drop(g);
+        // Killed, and its parent does not reap it.
+        // SAFETY: signals a process this test started.
+        unsafe { libc::kill(live, libc::SIGKILL) };
+        wait_exited_unreaped(live);
+        drop(guard);
+        assert!(!process_alive(middle as u32));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_liveness_of_children() {

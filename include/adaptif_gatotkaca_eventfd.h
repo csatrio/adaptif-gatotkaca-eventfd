@@ -341,6 +341,19 @@ typedef struct gk_listener gk_listener;
  */
 gk_listener *gk_listener_bind(const char *name);
 
+/*
+ * Like gk_listener_bind, choosing who may connect (since 0.3.2):
+ * GK_LISTENER_ACCESS_DEFAULT is gk_listener_bind (the OS defaults);
+ * GK_LISTENER_ACCESS_CURRENT_USER admits only processes of the current
+ * user. Windows: every pipe instance is created with the protected DACL
+ * D:P(A;;FA;;;<user SID>). Unix: the socket file is made 0600 and
+ * gk_listener_accept closes connections whose peer runs as another
+ * effective user. Any other value fails with EINVAL.
+ */
+#define GK_LISTENER_ACCESS_DEFAULT 0
+#define GK_LISTENER_ACCESS_CURRENT_USER 1
+gk_listener *gk_listener_bind_ex(const char *name, int access);
+
 /* Waits for the next process to gk_process_connect. */
 gk_process *gk_listener_accept(gk_listener *listener);
 

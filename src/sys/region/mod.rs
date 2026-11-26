@@ -24,6 +24,8 @@ mod os;
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod os;
+#[cfg(unix)]
+mod zombie;
 
 pub(crate) use crate::shared_memory::HugePages;
 
@@ -253,8 +255,11 @@ pub(crate) fn current_pid() -> u32 {
     os::current_pid()
 }
 
-/// False if process `pid` has exited (or never existed). On unix an exited
-/// but unreaped child of ours counts as exited.
+/// False if process `pid` has exited (or never existed). An exited process
+/// that has not been reaped yet (a zombie) counts as exited: our own
+/// children everywhere on unix, other processes' on Linux, Android, macOS,
+/// iOS, FreeBSD and NetBSD (since 0.3.2; `zombie.rs`). On Windows an
+/// exited process is exited even while handles keep its object.
 pub(crate) fn process_alive(pid: u32) -> bool {
     os::process_alive(pid)
 }

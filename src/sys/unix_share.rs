@@ -294,6 +294,66 @@ fn skip_bytes_body(sock: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// The effective user id of the peer of the connected unix socket `sock`
+/// (recorded when the connection was made); `None` where the OS can't tell.
+/// Linux/Android `SO_PEERCRED`, the BSDs and Apple `getpeereid`, illumos
+/// `getpeerucred`.
+pub(crate) fn peer_euid(sock: BorrowedFd<'_>) -> Option<libc::uid_t> {
+    peer_euid_os(sock.as_raw_fd())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_euid_os(fd: RawFd) -> Option<libc::uid_t> {
+    /// `struct ucred` (declared here: the libc crate lacks it on Android).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Ucred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    // SO_PEERCRED reports the effective ids at connect time.
+    sockopt::<Ucred>(fd, libc::SOL_SOCKET, libc::SO_PEERCRED).map(|c| c.uid)
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+fn peer_euid_os(fd: RawFd) -> Option<libc::uid_t> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: plain query on a socket descriptor; both out pointers are live.
+    (unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0).then_some(uid)
+}
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn peer_euid_os(fd: RawFd) -> Option<libc::uid_t> {
+    let mut cred: *mut libc::ucred_t = std::ptr::null_mut();
+    // SAFETY: getpeerucred allocates a ucred_t for us on success.
+    if unsafe { libc::getpeerucred(fd, &mut cred) } == -1 || cred.is_null() {
+        return None;
+    }
+    // SAFETY: `cred` is the live ucred_t getpeerucred returned.
+    let uid = unsafe { libc::ucred_geteuid(cred) };
+    // SAFETY: freed once, as getpeerucred(3C) requires.
+    unsafe { libc::ucred_free(cred) };
+    // ucred_geteuid returns (uid_t)-1 when the id is not available.
+    (uid != libc::uid_t::MAX).then_some(uid)
+}
+
+/// Other unix: no way to learn the peer's user.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "illumos",
+    target_os = "solaris"
+)))]
+fn peer_euid_os(_fd: RawFd) -> Option<libc::uid_t> {
+    None
+}
+
 /// The process id of the peer of the connected unix socket `sock`, as the
 /// kernel recorded it when the connection was made; `None` where the OS
 /// can't tell.
